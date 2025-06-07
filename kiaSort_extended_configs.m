@@ -1,0 +1,79 @@
+function cfg = kiaSort_extended_configs(cfg)
+
+extra_cfg = struct(...
+    'batch_ch_size',            64, ...               % Max number of channels in each batch
+    'spikeDuration',            2, ...               % Spike duration (ms) used for clustering
+    'spikeDistance',            0.375, ...           % Minimum distance between spikes (ms)
+    'sampleChunkDuration',      1, ...               % Duration (s) of each sample chunk
+    'maxSampleSpan',            Inf, ...             % Maximum sample span (min)
+    'modelType',                'svm', ...           % Model type for clustering/classification
+    'usePCA',                   true, ...            % Use PCA for training (if applicable)
+    'nPCAcomp',                 30, ...              % Number of PCA components
+    'clusteringSpikeDuration',  1, ...               % Spike duration used specifically for clustering
+    'corrThresholdHigh',        0.9, ...             % High correlation threshold for merging clusters
+    'corrThresholdMisAlign',    0.85, ...            % Realignment correlation threshold
+    'corrThresholdSpkDensity',  -0.8, ...            % Negative correlation threshold (spike density based)
+    'ampVarThreshold',          0.05, ...             % Amplitude variance threshold
+    'ampXcorrVarThreshold',     0.15, ...             % Amplitude variance threshold
+    'refrac_threshold',         0.1, ...             % refractory threshold for clustering
+    'numParallelWorker',        'auto', ...          % Number of parallel workers ('auto' uses max available)
+    'badChannel_factor',        3, ...               % Factor for flagging bad channels    
+    'qualityCheckLength',       3, ...              % Duration (ms) for quality check    
+    'minRate',                  0.25, ...            % Minimum spike rate (spikes/sec)
+    'maxClusteringRate',        0.5, ...              % Maximum points for clustering (dbScan)
+    'umapNComp',                6, ...               % Number of UMAP components
+    'testFraction',             0.01 ...             % Fraction of data used for classifier testing
+    );
+
+% Append any missing fields from extra_cfg to cfg
+extra_fields = fieldnames(extra_cfg);
+for i = 1:length(extra_fields)
+    field = extra_fields{i};
+    if ~isfield(cfg, field)
+        cfg.(field) = extra_cfg.(field);
+    end
+end
+
+extra_varName = struct(...
+    'batch_ch_size',           'Channel Batch Size', ...         
+    'spikeDuration',           'Spike Dur. (ms)', ...
+    'spikeDistance',           'Spike Distance (ms)', ...
+    'sampleChunkDuration',     'Sample Chunk Dur. (ms)', ...
+    'maxSampleSpan',           'Max Sample Span (min)', ...
+    'modelType',               'Sorting: Model Type', ...
+    'usePCA',                  'Sorting: Use PCA', ...
+    'nPCAcomp',                'Sorting: # PCA Comp.', ...
+    'clusteringSpikeDuration', 'Clustering Spike Dur', ...
+    'corrThresholdHigh',       'High Corr Thr', ...
+    'corrThresholdMisAlign',   'Realign Corr Thr', ...    
+    'corrThresholdSpkDensity', 'Spike Density Corr Thr', ...
+    'ampVarThreshold',         'Amp. Var. Thr', ...
+    'ampXcorrVarThreshold',    'Amp. Var. Thr XCorr', ...
+    'refrac_threshold',        'Refractory Thr',...
+    'numParallelWorker',       'Num. Parallel Workers', ...    
+    'badChannel_factor',       'Bad Ch. Factor', ...    
+    'qualityCheckLength',      'Quality Check Dur (ms)',...
+    'minRate',                 'Min Clust Rate',...
+    'maxClusteringRate',       'Max Clust Rate', ...
+    'umapNComp',               '# UMAP Components', ...
+    'testFraction',            'Test Fraction' ...
+);
+
+if ~isfield(cfg, 'varName')
+    cfg.varName = struct();
+end
+
+% Append varName fields to cfg.varName
+extra_var_fields = fieldnames(extra_varName);
+for i = 1:length(extra_var_fields)
+    key = extra_var_fields{i};
+    if ~isfield(cfg.varName, key)
+        cfg.varName.(key) = extra_varName.(key);
+    end
+end
+
+allFields = fieldnames(cfg);
+fieldsWithoutVarName = setdiff(allFields, {'varName'}, 'stable');
+cfg = orderfields(cfg, [fieldsWithoutVarName; {'varName'}]);
+
+end
