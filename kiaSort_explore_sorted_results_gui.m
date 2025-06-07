@@ -1387,9 +1387,11 @@ refreshLabels();
         % Find which radio is selected
         selIdx = [];
         for i = 1:numGroups
-            if isvalid(groupRadioButtons(i)) && groupRadioButtons(i).Value
-                selIdx = i;
-                break;
+            if isvalid(groupRadioButtons(i)) && isprop(groupRadioButtons(i),'Value')
+                if groupRadioButtons(i).Value
+                    selIdx = i;
+                    break;
+                end
             end
         end
 
@@ -3723,17 +3725,18 @@ disimlarityScore(15,14)
                             else
                                 similarityScore = nan;
                             end
-                            maxAmp = max(abs([mw1; mw2]),[],3);
-                            maxAmpP = abs(max(([mw1; mw2]),[],3));
-                            maxAmpN = abs(min(([mw1; mw2]),[],3));
+                            maxAmp = max(abs([mw1; mw2]),[],2);
+                            maxAmpP = abs(max(([mw1; mw2]),[],2));
+                            maxAmpN = abs(min(([mw1; mw2]),[],2));
                             ampDiffP = (maxAmpP(1,:) - maxAmpP(2,:))./(max([maxAmp(1,:) , maxAmp(2,:)],[],'all'));
                             ampDiffN = (maxAmpN(1,:) - maxAmpN(2,:))./(max([maxAmp(1,:) , maxAmp(2,:)],[],'all'));
-                            ampDiff = abs(ampDiffP + ampDiffN)/2;
+                            ampDiff = (abs(ampDiffP) + abs(ampDiffN))/2;
                             ampDiff(ampDiff==0) = nan;
                             ampVar{channels(g1), channels(g2)} = ...
                                 [ampVar{channels(g1), channels(g2)}; ampDiff];
                             groupSimScore{channels(g1), channels(g2)} = ...
                                 [groupSimScore{channels(g1), channels(g2)}; similarityScore ];
+
 
                         end
 
