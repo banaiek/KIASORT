@@ -5,7 +5,12 @@ KIASort is a spike sorting platform developed by Kianoush Banaie Boroujeni desig
 Conventional one-dimensional drift correction methods cannot address heterogeneous neuron-specific drift and nonlinear waveform changes. KIASORT geometry-free, per-neuron tracking approach overcomes these limitations without assumptions about cluster shape or probe motion.
 The multi-tab graphical user interface (GUI) provides high degree of control over each stage, from initial configuration and channel inspection through detailed clustering analyses and classification performance assessments. Post-sorting, users can easily curate and validate spike sorting quality through advanced visualization tools implemented, including cross-correlograms, inter-spike interval (ISI) histograms, density analyses, similarity detection, and waveform and feature explorations. KIASort is a flexible, user-friendly, and geometry-free spike sorting approach, which can be uses for high density laminar recordings as well as different probe geometry.
 
-**** You can navigate to "Instruction" folder for installation mannual and a brief tutorial. 
+**** You can navigate to "Instructions" folder for installation mannual and a brief tutorial. 
+
+*** For a quick viedo tour of the GUI you can check
+
+https://www.dropbox.com/scl/fi/ump3pa6qb7vxcq97empd7/Suppl_Video_1.MOV?rlkey=rjt2em7i1vr54yruji2lzz5vi&st=utd55k70&dl=0
+
 
 For any questions contact:
 
