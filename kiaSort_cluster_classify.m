@@ -121,9 +121,11 @@ minPtsEnd      = min( max( maxClusterPoints, maxPctDefault ), maxPctLimit);
 
 numPt = max([min([ numPt, minPtsEnd]),minPtsStart, nDims+1]);
 
-
+numPt = round(numPt*.5);
 % cluster data using dbscan clustering  
-initialLabels = noise_exclude_dbscan(dataAll, ampVals, data.channel_thresholds_pos(midChannel), epsilon, numPt);
+   initialLabels = noise_exclude_dbscan(dataAll, ampVals, data.channel_thresholds_pos(midChannel), epsilon, numPt);
+  % initialLabels = noise_Ex_adaptive_dbscan(dataAll, ampVals, data.channel_thresholds_pos(midChannel), 'MinPts',numPt);
+% initialLabels = adaptive_density_clustering(dataAll, 'MinPts',numPt);
 
 labels = -ones(size(initialLabels));
 globalCluster = 0;
@@ -173,7 +175,7 @@ end
 
 
 % process clusters and find clusters to be merged.
-[clusterRelabeling]  = kiaSort_process_clusters(meanClusterWaveform, clusterSpikeDensity, ...
+[clusterRelabeling]  = kiaSort_process_clusters_2(meanClusterWaveform, clusterSpikeDensity, ...
                     uniqueLabels, labels, PCA, spk_idx_full, mean_side_waveforms, cfg);
 
 
@@ -390,11 +392,14 @@ end
 function [labels, globalCluster] = processCluster(idx, labels, fs, globalCluster, dataAll, spk_idx_full, cfg, depth, maxClusterPoints, minClusterPoints, sample_dur, numPt, initNumClasses, snr_vals)
 [~,~,isi_viol] = getISIViolations(spk_idx_full(idx), fs, 2);
 factor = length(idx)/size(dataAll,1);
-if ((isi_viol<= 0.1 && depth >= 0) && (factor<0.25 || depth > 0) && (initNumClasses>10 || depth > 0)) || depth >= 3
+ % if ((isi_viol<= 0.1 && depth >= 0) && (factor<0.25 || depth > 0) && (initNumClasses>10 || depth > 0)) || depth >= 4
+if ((isi_viol<= 0.1 && depth >= 0)  && (initNumClasses>10 || depth > 0)) || depth >= 3
     globalCluster = globalCluster + 1;
     labels(idx) = globalCluster;
-elseif isi_viol> 2 && length(idx) < minClusterPoints/2 && depth > 1
+elseif isi_viol> 1 && length(idx) < minClusterPoints/2 && depth > 1
     labels(idx) = -1;
+% elseif isi_viol> .5 && depth >= 3
+%     labels(idx) = -1;
 else
     [epsilon, ~] = estimate_dbscan_par(dataAll(idx,:));
     numPt = max(min([ max(factor*numPt,size(dataAll,2)) , factor*maxClusterPoints+5]),factor*minClusterPoints+5);
@@ -405,7 +410,7 @@ else
     highSNR = prctile(snr_vals(idx),97.5);
     medSNR = median(snr_vals(idx));
 
-    if depth < 1 && factor > .49 && (length(idx)/sample_dur) > .5 && initNumClasses < 5 && medSNR<1.5
+    if depth < 1 && factor > .25 && (length(idx)/sample_dur) > .5 && initNumClasses < 5 && medSNR<1.5
         try
             % tempLabels = kiaSort_comp_clustering(subLabels, dataAll(idx,:));
              tempLabels = kiaSort_graph_clustering(dataAll(idx,:), 'existingLabels', subLabels, 'qualityThreshold', .8);
@@ -414,7 +419,7 @@ else
             end
         catch
         end
-    elseif depth < 1 && factor > .25 && (length(idx)/sample_dur) > .25 && initNumClasses < 5 && medSNR<1.5
+    elseif depth < 1 && factor > .15 && (length(idx)/sample_dur) > .25 && initNumClasses < 5 && medSNR<1.5
         try
             % tempLabels = kiaSort_comp_clustering(subLabels, dataAll(idx,:));
              tempLabels = kiaSort_graph_clustering(dataAll(idx,:), 'existingLabels', subLabels, 'qualityThreshold', .8);
@@ -425,7 +430,7 @@ else
         end
 
         %this part is added 
-    elseif depth < 1  && (length(idx)/sample_dur) > .25 && ((medSNR-lowSNR) < (highSNR-medSNR)/1.25 || (medSNR-lowSNR) > 1.25 * (highSNR-medSNR)) 
+    elseif depth < 1  && (length(idx)/sample_dur) > .15 && ((medSNR-lowSNR) < (highSNR-medSNR)/1.25 || (medSNR-lowSNR) > 1.25 * (highSNR-medSNR)) 
         try
             tempLabels = kiaSort_graph_clustering(dataAll(idx,:), 'existingLabels', subLabels, 'qualityThreshold', .8);
             if (sum(tempLabels == -1) / length(idx)) < .1
@@ -433,6 +438,17 @@ else
             end
         catch
         end
+
+        elseif depth >2
+        try
+            tempLabels = kiaSort_graph_clustering(dataAll(idx,:), 'existingLabels', subLabels, 'qualityThreshold', .8);
+            if (sum(tempLabels == -1) / length(idx)) < .1
+                subLabels = tempLabels;
+            end
+        catch
+        end
+
+        
     end
     
     uniqueSub = unique(subLabels);
