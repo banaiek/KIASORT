@@ -19,9 +19,9 @@ extra_cfg = struct(...
     'numParallelWorker',        'auto', ...          % Number of parallel workers ('auto' uses max available)
     'badChannel_factor',        3, ...               % Factor for flagging bad channels    
     'qualityCheckLength',       3, ...              % Duration (ms) for quality check    
-    'minRate',                  0.25, ...            % Minimum spike rate (spikes/sec)
-    'maxClusteringRate',        0.5, ...              % Maximum points for clustering (dbScan)
-    'umapNComp',                6, ...               % Number of UMAP components
+    'minRate',                  0.15, ...            % Minimum spike rate (spikes/sec)
+    'maxClusteringRate',        0.25, ...              % Maximum points for clustering (dbScan)
+    'umapNComp',                9, ...               % Number of UMAP components
     'testFraction',             0.01 ...             % Fraction of data used for classifier testing
     );
 

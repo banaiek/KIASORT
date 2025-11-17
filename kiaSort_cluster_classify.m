@@ -122,10 +122,10 @@ minPtsEnd      = min( max( maxClusterPoints, maxPctDefault ), maxPctLimit);
 numPt = max([min([ numPt, minPtsEnd]),minPtsStart, nDims+1]);
 
 numPt = round(numPt*.5);
+
 % cluster data using dbscan clustering  
-   initialLabels = noise_exclude_dbscan(dataAll, ampVals, data.channel_thresholds_pos(midChannel), epsilon, numPt);
-  % initialLabels = noise_Ex_adaptive_dbscan(dataAll, ampVals, data.channel_thresholds_pos(midChannel), 'MinPts',numPt);
-% initialLabels = adaptive_density_clustering(dataAll, 'MinPts',numPt);
+initialLabels = noise_exclude_dbscan(dataAll, ampVals, data.channel_thresholds_pos(midChannel), epsilon, numPt);
+
 
 labels = -ones(size(initialLabels));
 globalCluster = 0;
@@ -175,7 +175,7 @@ end
 
 
 % process clusters and find clusters to be merged.
-[clusterRelabeling]  = kiaSort_process_clusters_2(meanClusterWaveform, clusterSpikeDensity, ...
+[clusterRelabeling]  = kiaSort_process_clusters(meanClusterWaveform, clusterSpikeDensity, ...
                     uniqueLabels, labels, PCA, spk_idx_full, mean_side_waveforms, cfg);
 
 

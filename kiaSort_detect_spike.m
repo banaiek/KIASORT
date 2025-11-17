@@ -47,9 +47,9 @@ function out = kiaSort_detect_spike(inputSignal, cfg, sample)
         end
 
     bp_rms_adj = std_exclude(bandpass_signal, [bp_Loc; bp_Loc_r], spk_Distance);
-    mad_Thresh = min_thr * bp_rms_adj;
+    mad_Thresh = mad_Thresh_init;%min_thr * bp_rms_adj;
     else
-        mad_Thresh = inputSignal.mad_Thresh;
+        mad_Thresh = .9*inputSignal.mad_Thresh;
         snr_status = "N/A"; inclusion_flag = 1;
     end
     
@@ -60,6 +60,10 @@ function out = kiaSort_detect_spike(inputSignal, cfg, sample)
     spk_Loc_r = Loc_r(Loc_r >= border_Margin & Loc_r <= trial_length - border_Margin);
 
     if sample
+
+        spk_Loc = spk_Loc(~ismember(spk_Loc,cfg.edge_exclusion));
+        spk_Loc_r = spk_Loc_r(~ismember(spk_Loc_r,cfg.edge_exclusion));
+
         spike_Vals = abs(bandpass_signal(spk_Loc));
         spike_Vals_r = abs(bandpass_signal(spk_Loc_r));
 

@@ -29,10 +29,22 @@ if ~isfield(hp, 'BoxConstraint'),   hp.BoxConstraint   = 1;   end
 if ~isfield(hp, 'KernelScale'),     hp.KernelScale     = 'auto'; end
 if ~isfield(hp, 'Solver'), hp.Solver = 'SMO'; end 
 if ~isfield(hp, 'OutlierFraction'), hp.OutlierFraction = 0.1; end
-
+if ~isfield(hp, 'UseBalancedWeights'), hp.UseBalancedWeights = false; end
 
 classLabels = unique(Y);
 numClasses  = numel(classLabels);
+
+% balanced observation weights (inverse class frequency)
+if hp.UseBalancedWeights
+    classCounts = arrayfun(@(c) sum(ismember(Y,c)), classLabels);
+    invFreq     = sqrt(1 ./ classCounts);
+    obsWeights  = zeros(size(Y));
+    for ii = 1:numClasses
+        obsWeights(ismember(Y, classLabels(ii))) = invFreq(ii);
+    end
+else
+    obsWeights = ones(size(Y));
+end
 
 switch lower(modelType)
 
@@ -86,7 +98,7 @@ switch lower(modelType)
 
 
         if numClasses > 2
-            model = fitcecoc(X, Y, 'Learners', svmTemplate, 'Options',options);
+            model = fitcecoc(X, Y, 'Learners', svmTemplate, 'Options',options, 'Weights', obsWeights);
         else
             if strcmp(hp.KernelFunction,'polynomial')
                 model = fitcsvm( ...

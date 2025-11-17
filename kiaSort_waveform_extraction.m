@@ -118,7 +118,7 @@ if num_spikes > 0
     end
 
 
-if cancel_overlap
+if cancel_overlap 
     % sigmoid window to the main channel
     spike_distance = diff(main_spk_inds);
     overlap_id = find(spike_distance < 0.75 * spikeDuration & spike_distance > jitter_gap);

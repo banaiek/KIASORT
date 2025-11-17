@@ -31,10 +31,30 @@ window_start = max(1, midpoint - jitter_gap);
 window_end = min(n_timepoints, midpoint + jitter_gap);
 middle_channel = ceil(n_channels/2);
 %
+if sample
 mask = gaussianMask(n_channels, n_timepoints, jitter_gap + 1, 3);
 mMask(1,:,:) = mask;
 waveforms = waveforms .* mMask;
+end
 waveform_window = waveforms(:, :, window_start:window_end);
+
+W = waveform_window;
+T = size(W, 3);
+if T >= 3
+    d = diff(W, 1, 3);
+    
+    % Combine isMax and isMin in one operation (no d1, d2 copies)
+    isExtrema = (d(:,:,1:end-1) > 0 & d(:,:,2:end) <= 0) | ...
+                (d(:,:,1:end-1) < 0 & d(:,:,2:end) >= 0);
+    
+    % Build mask with cat (faster than indexing)
+    mask = cat(3, W(:,:,1) ~= W(:,:,2), isExtrema, W(:,:,T) ~= W(:,:,T-1));
+    
+    waveform_window = W .* cast(mask, 'like', W);
+    waveform_window(:,middle_channel,midpoint) = waveforms(:,middle_channel,midpoint);
+end
+ 
+
 max_w = max(waveform_window, [], 3);
 min_w = min(waveform_window, [], 3);
 pos_deviation = max_w - threshold_pos';
@@ -87,8 +107,8 @@ for i = 1:n
     d = abs(i - centerRow);
     halfWidth = ceil(jitterGap * exp(-(d ^ 2) / (2 * sigma ^ 2)));
     if halfWidth > 0
-        colStart = max(1, centerCol - halfWidth) - 1;
-        colEnd = min(m, centerCol + halfWidth) + 1;
+        colStart = max(1, centerCol - halfWidth) ;
+        colEnd = min(m, centerCol + halfWidth) ;
         mask(i, colStart:colEnd) = 1;
     end
 end

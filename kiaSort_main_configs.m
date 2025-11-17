@@ -5,14 +5,14 @@ cfg = struct(...
     'numChannels',              128, ...             % Number of channels
     'samplingFrequency',        3E4, ...             % Sampling frequency (Hz)
     'commonRef',               'none', ...           % Type of common referencing
-    'denoising',                true, ...            % remove shared noise if true
+    'denoising',                false, ...            % remove shared noise if true
     'noisePrctile',             60,...               % perctile of channels showing similar noise pattern
     'noiseCorr',                0.4,...              % noise correlation threshold
     'extremeNoise',             false,...
     'num_channel_extract',      7, ...               % Number of channels to extract before and after each channel
-    'bandpass',                 [300 6000], ...      % Bandpass frequency range (Hz)
+    'bandpass',                 [500 6000], ...      % Bandpass frequency range (Hz)
     'min_threshold',            6, ...               % Minimum threshold (based on RMS after one round of spike exclusion)
-    'numSampleChunks',          180, ...              % Number of sample chunks
+    'numSampleChunks',          300, ...              % Number of sample chunks
     'sortingChunkDuration',     120, ...             % Duration (in seconds) for sorting each chunk of signal
     'sort_only',                false,...
     'useGPU',                   true, ...            % Use GPU acceleration if available

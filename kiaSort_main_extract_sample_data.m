@@ -143,7 +143,7 @@ try
         chunk_limits(i,:) = [start_sample, end_sample];
         edge_exclusion = [edge_exclusion, i*num_chunk_pts-edge_length:i*num_chunk_pts+edge_length];
     end
-
+    cfg.edge_exclusion = edge_exclusion;
     % Generate indices for batches
     channel_idx = [1:batch_ch_size:(num_channels-1),num_channels];
 

@@ -213,7 +213,6 @@ merge_overlap = (merge_overlap+merge_overlap'>0);
 corrMerge = (maxXcorrVal > adj_corrThresholdHigh);
 XcorrMerge = (maxXcorrVal > adj_corrThresholdMisAlign & abs(maxXcorrLag) > 2 & abs(maxXcorrLag) <= 1.5 * spike_distance);
 drift_based_Xcorr = maxXcorrVal > adj_corrThresholdMisAlign & spikeDensityCorrVal < corrThresholdSpkDensity;
-% ampMerge = ((ampVar + (1-maxXcorrVal)) < 2 * ampVarThreshold) & midChannelVar;
 ampMerge = ampVar < ampVarThreshold & midChannelVar & ampVar2 < ampVarThreshold;
 ampMergeXcorr = ampVar < ampXcorrVarThreshold & ampVar2 < ampXcorrVarThreshold;
 ampMergeFeat = ampMedVar < ampXcorrVarThreshold/2 & ampMedVar2 < ampXcorrVarThreshold/2;
@@ -222,7 +221,8 @@ d = diag(isi_violation);
 isi_merge = (isi_violation - max(d, d') < refrac_threshold);
 isRefr = refractoryMatrix(spike_idx, labels, cfg.samplingFrequency, initLabels);
 
-merge1 = rank_merge & (~isRefr | isi_merge)  & ((corrMerge & ampMerge)  |  (XcorrMerge & ampMergeXcorr));
+merge_matrix = multiCond_Merge(meanWaveform);
+merge1 =  (~isRefr | isi_merge) & (merge_matrix |(XcorrMerge & ampMergeXcorr));
 merge2 = rank_merge & (~isRefr | isi_merge)  & ((merge_overlap  & similarKept & midChannelVar) | (merge_feat & ampMergeFeat & counts_merge  & similarKept & full_classes & midChannelVar) | (drift_based_Xcorr & ameMergeDrift));
 
 [newLabels, changeType, timeLagChanged] = kiaSort_merge_cluster(merge1, merge2, maxXcorrLag, initLabels, counts, 1-maxXcorrVal);
