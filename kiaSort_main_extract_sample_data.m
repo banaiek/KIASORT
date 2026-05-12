@@ -135,6 +135,14 @@ try
     Ns_seq = qualityOut.Ns_seq;
     clear qualityCheckSignal
 
+    opt_bp = qualityOut.optimal_bandpass;
+    input_bp = cfg.bandpass;
+    final_lower = min(max(opt_bp(1), input_bp(1)), 650);
+    final_upper = input_bp(2);
+    cfg.bandpass = [final_lower, final_upper];
+    final_bandpass = cfg.bandpass;
+    fprintf(fid, 'Final bandpass: [%d %d] Hz\n', final_lower, final_upper);
+
     % Generate random start indices for the chunks
     chunk_limits = zeros(num_sample_chunks,2);
     for i = 1:num_sample_chunks
@@ -362,7 +370,7 @@ try
                     if length(side_inds) > cfg.nPCAcomp
                         side_inputWF = inputWF;
                         side_inputWF.spk_idx_all_channels{current_channel_idx, 1} = side_inds;
-                        side_waveOut = kiaSort_waveform_extraction(cfg, side_inputWF, 0, 1);
+                        side_waveOut = kiaSort_waveform_extraction(cfg, side_inputWF, 1, 1);
                     else
                         side_waveOut = [];
                     end
@@ -389,14 +397,15 @@ try
             
             valid_idx_edg  = ~ismember(tmp_idx, edge_exclusion);
             neighbor_Spk_Idx = cell2mat(inputWF.spk_idx_all_channels);
-            [d1, d2] = nearest_distances_nz(tmp_idx, neighbor_Spk_Idx, 1 * spk_Distance);
-            valid_idx      = valid_idx_edg & d1>sample_spike_distance & d2>sample_spike_distance ;
-                        
+            [d1, d2] = nearest_distances_nz(tmp_idx, neighbor_Spk_Idx, 3 * spk_Distance);
+             valid_idx      = valid_idx_edg & d1>sample_spike_distance & d2>sample_spike_distance ;
+
             dist_temp       = tmp_idx;
             left_diff       = [Inf; diff(dist_temp)];
             right_diff      = [diff(dist_temp); Inf];
-            
-            valid_idx  = (left_diff > sample_spike_distance) & (right_diff > sample_spike_distance) & valid_idx;            
+
+            valid_idx  = (left_diff > sample_spike_distance) & (right_diff > sample_spike_distance);
+
 
             out.spk_Val_full            = tmp_val(valid_idx);
             out.spk_ID_full             = tmp_id(valid_idx);
@@ -411,7 +420,7 @@ try
             out.side_waveforms          = side_waveOut;
             out.waveform_bp_full        = waveOut.waveform(valid_idx, :, :);
             waveOut.waveform        = waveOut.waveform(valid_idx, :, :);
-            [out_bestChannel]     = best_channel_detection(waveOut, 5, cfg, 0);
+            [out_bestChannel]     = best_channel_detection(waveOut, 0, cfg, 0);
             
             if sum(out_bestChannel.keep) > cfg.nPCAcomp
                 out.spk_Val_full            = out.spk_Val_full(out_bestChannel.keep);
@@ -482,7 +491,7 @@ try
     try
         channelInfo_filename = fullfile(outputFolder, 'channel_info.mat');
         save(channelInfo_filename, 'channel_inclusion', 'num_samples', 'channel_locations', 'chan_wave_inclusion', 'channel_mapping',...
-            'snr_status_channels', 'rms_bands_channels', 'scale_factor', 'adj_distant', 'thresh_MAD', 'mad_Thresh', 'Ns_seq','band_pairs', '-v7.3');
+            'snr_status_channels', 'rms_bands_channels', 'scale_factor', 'adj_distant', 'thresh_MAD', 'mad_Thresh', 'Ns_seq','band_pairs', 'final_bandpass', '-v7.3');
         fprintf(fid, 'Saved channel info to %s.\n', channelInfo_filename);
     catch ME
         fprintf(fid, 'ERROR: Failed to save channel info: %s\n', ME.message);
@@ -555,22 +564,71 @@ function selected_data = batch_extract(m, chunk_limits, start_ch, end_ch, channe
 
 num_sample_chunks   = cfg.numSampleChunks;
 chunk_duration      = cfg.sampleChunkDuration;
-num_chunk_pts       = chunk_duration * cfg.samplingFrequency; % Number of samples per chunk
+num_chunk_pts       = chunk_duration * cfg.samplingFrequency;
 
-selected_data = zeros(end_ch-start_ch+1,num_chunk_pts*num_sample_chunks);
+needWhitening = (isfield(cfg,'extremeNoise') && cfg.extremeNoise) ...
+             || (isfield(cfg,'denoising')    && cfg.denoising);
+
+if ~needWhitening
+    selected_data = zeros(end_ch-start_ch+1, num_chunk_pts*num_sample_chunks);
+    for i = 1:num_sample_chunks
+        selected_data(:, (i-1)*num_chunk_pts + 1:i*num_chunk_pts) = ...
+            double(m.Data.data(channel_mapping(start_ch:end_ch), chunk_limits(i,1):chunk_limits(i,2)));
+    end
+    return;
+end
+
+% Default margin = 0 -> overlap path is opt-in via cfg.denoising_margin_ch.
+if isfield(cfg, 'denoising_margin_ch') && ~isempty(cfg.denoising_margin_ch)
+    margin = max(0, round(cfg.denoising_margin_ch));
+else
+    margin = 0;
+end
+
+maxCh     = min(numel(channel_mapping), numel(channel_inclusion));
+ext_start = max(1, start_ch - margin);
+ext_end   = min(maxCh, end_ch + margin);
+
+if ext_start >= start_ch && ext_end <= end_ch
+    selected_data = zeros(end_ch-start_ch+1, num_chunk_pts*num_sample_chunks);
+    for i = 1:num_sample_chunks
+        selected_data(:, (i-1)*num_chunk_pts + 1:i*num_chunk_pts) = ...
+            double(m.Data.data(channel_mapping(start_ch:end_ch), chunk_limits(i,1):chunk_limits(i,2)));
+    end
+    if cfg.extremeNoise
+        selected_data(channel_inclusion(start_ch:end_ch), :) = ...
+            remove_res_shared_noise(selected_data(channel_inclusion(start_ch:end_ch), :), cfg);
+    end
+    if cfg.denoising
+        selected_data(channel_inclusion(start_ch:end_ch), :) = ...
+            remove_shared_noise(selected_data(channel_inclusion(start_ch:end_ch), :), cfg);
+    end
+    return;
+end
+
+ext_len = ext_end - ext_start + 1;
+ext_data = zeros(ext_len, num_chunk_pts*num_sample_chunks);
 for i = 1:num_sample_chunks
-    selected_data(:, (i-1)*num_chunk_pts + 1:i*num_chunk_pts) = double(m.Data.data(channel_mapping(start_ch:end_ch), chunk_limits(i,1):chunk_limits(i,2)));
+    ext_data(:, (i-1)*num_chunk_pts + 1:i*num_chunk_pts) = ...
+        double(m.Data.data(channel_mapping(ext_start:ext_end), chunk_limits(i,1):chunk_limits(i,2)));
 end
 
-if cfg.extremeNoise
-    selected_data(channel_inclusion(start_ch:end_ch),:) = remove_res_shared_noise(selected_data(channel_inclusion(start_ch:end_ch),:), cfg);
+ext_inclusion = channel_inclusion(ext_start:ext_end);
+incl_idx = find(ext_inclusion);
+if ~isempty(incl_idx)
+    sub = ext_data(incl_idx, :);
+    if cfg.extremeNoise
+        sub = remove_res_shared_noise(sub, cfg);
+    end
+    if cfg.denoising
+        sub = remove_shared_noise(sub, cfg);
+    end
+    ext_data(incl_idx, :) = sub;
 end
 
-if cfg.denoising
-    selected_data(channel_inclusion(start_ch:end_ch),:) = remove_shared_noise(selected_data(channel_inclusion(start_ch:end_ch),:), cfg);
-end
-
-
+central_offset = start_ch - ext_start + 1;
+central_len    = end_ch - start_ch + 1;
+selected_data  = ext_data(central_offset : central_offset + central_len - 1, :);
 
 end
 

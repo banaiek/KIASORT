@@ -111,7 +111,7 @@ if cfg.parallelProcessing
 
             if ~isempty(data) && channel_inclusion(ch)
                 try
-                    [out, out_sampleFeatures] = kiaSort_cluster_classify(data, cfg, hp);
+                    [out, out_sampleFeatures] = kiaSort_cluster_classify_Temp(data, cfg, hp);
                     sortedSamples{ch,1} = out;
                     sampleFeatures{ch,1} = out_sampleFeatures;
                 catch ME
@@ -164,7 +164,7 @@ else
 
             if ~isempty(data) && channel_inclusion(ch)
                 try
-                    [out, out_sampleFeatures] = kiaSort_cluster_classify(data, cfg, hp);
+                    [out, out_sampleFeatures] = kiaSort_cluster_classify_Temp(data, cfg, hp);
                     sortedSamples{ch,1} = out;
                     sampleFeatures{ch,1} = out_sampleFeatures;
                 catch ME

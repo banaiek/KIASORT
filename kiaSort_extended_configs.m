@@ -2,11 +2,11 @@ function cfg = kiaSort_extended_configs(cfg)
 
 extra_cfg = struct(...
     'batch_ch_size',            64, ...               % Max number of channels in each batch
-    'spikeDuration',            2, ...               % Spike duration (ms) used for clustering
+    'spikeDuration',            1, ...               % Spike duration (ms) used for clustering
     'spikeDistance',            0.375, ...           % Minimum distance between spikes (ms)
     'sampleChunkDuration',      1, ...               % Duration (s) of each sample chunk
     'maxSampleSpan',            Inf, ...             % Maximum sample span (min)
-    'modelType',                'svm', ...           % Model type for clustering/classification
+    'modelType',                'template', ...      % Model type for clustering/classification
     'usePCA',                   true, ...            % Use PCA for training (if applicable)
     'nPCAcomp',                 30, ...              % Number of PCA components
     'clusteringSpikeDuration',  1, ...               % Spike duration used specifically for clustering
@@ -17,11 +17,11 @@ extra_cfg = struct(...
     'ampXcorrVarThreshold',     0.15, ...             % Amplitude variance threshold
     'refrac_threshold',         0.1, ...             % refractory threshold for clustering
     'numParallelWorker',        'auto', ...          % Number of parallel workers ('auto' uses max available)
-    'badChannel_factor',        3, ...               % Factor for flagging bad channels    
+    'badChannel_factor',        4, ...               % Factor for flagging bad channels    
     'qualityCheckLength',       3, ...              % Duration (ms) for quality check    
     'minRate',                  0.15, ...            % Minimum spike rate (spikes/sec)
     'maxClusteringRate',        0.25, ...              % Maximum points for clustering (dbScan)
-    'umapNComp',                9, ...               % Number of UMAP components
+    'umapNComp',                20, ...               % Number of UMAP components
     'testFraction',             0.01 ...             % Fraction of data used for classifier testing
     );
 

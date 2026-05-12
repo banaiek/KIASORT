@@ -1,9 +1,11 @@
 function [out] = kiaSort_filter_signal(inputSignal, cfg)
 
 
-passband = cfg.bandpass;
 fs = cfg.samplingFrequency;
 
+
+designUpper = min(1.05 * cfg.bandpass(2), 0.95 * (fs / 2));
+passband = [cfg.bandpass(1), designUpper];
 
 % Check for GPU usage.
 useGPU = cfg.useGPU && (gpuDeviceCount > 0);

@@ -4,6 +4,7 @@ function out = kiaSort_evaluate_labels(predLabels, clusterSelection, altMaxChann
 % those not kept
 
 classLabels = clusterSelection.classLabels;
+clusterStatus = clusterSelection.clusterStatus;
 keep = clusterSelection.keep;
 keep(classLabels==-1) = 0;
 numClasses = length(classLabels);
@@ -23,7 +24,7 @@ for iClass = 1 : numClasses
 
         not_kept_idx = find(predLabels == classLabels(iClass));
         kept_idx(not_kept_idx) = false;
-        if  classLabels(iClass) ~=-1
+        if  classLabels(iClass) ~=-1 && clusterStatus(iClass)>-1
             count = count + 1;
             not_kept_idx_temp{count, 1} = not_kept_idx;
             lookUpChannel_temp(count,1) = max_channel_idx(iClass);
@@ -42,19 +43,20 @@ for i = 1:length(unique_channels)
 end
 
 out.keep = kept_idx & validKeep;
-
+[~, idxPredInClass] = ismember(predLabels, classLabels);
 for i = 1:count
-    not_kept_idx_alt = find(predLabels > 0 & ~out.keep & altMaxChannel == out.lookUpChannel(i,1));
+    not_kept_idx_alt = find(predLabels > 0 & clusterStatus(idxPredInClass)>-1 & ~out.keep & altMaxChannel == out.lookUpChannel(i,1));
     if any(not_kept_idx_alt)
         all_not_kept = [out.not_kept_idx{i, 1}; not_kept_idx_alt];
         out.not_kept_idx{i, 1} = unique(all_not_kept);
     end
 end
 
-not_assigned = (predLabels > 0 & ~out.keep & ~ismember(altMaxChannel,included_channels));
+not_assigned = (predLabels > 0 & clusterStatus(idxPredInClass)>-1 & ~out.keep & ~ismember(altMaxChannel,included_channels));
 
 if any(not_assigned)
     uniqe_Alt = unique(altMaxChannel(not_assigned));
+    uniqe_Alt = uniqe_Alt(uniqe_Alt>0);
     for i = 1:length(uniqe_Alt)
         not_kept_idx = find(predLabels > 0 & ~out.keep & altMaxChannel==uniqe_Alt(i));
         count = count + 1;

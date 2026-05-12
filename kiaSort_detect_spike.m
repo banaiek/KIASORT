@@ -47,9 +47,10 @@ function out = kiaSort_detect_spike(inputSignal, cfg, sample)
         end
 
     bp_rms_adj = std_exclude(bandpass_signal, [bp_Loc; bp_Loc_r], spk_Distance);
-    mad_Thresh = mad_Thresh_init;%min_thr * bp_rms_adj;
+    mad_Thresh = mad_Thresh_init*0.9;%min_thr * bp_rms_adj;
     else
-        mad_Thresh = .9*inputSignal.mad_Thresh;
+        mad_Thresh_full = inputSignal.mad_Thresh;
+        mad_Thresh = 0.5 * mad_Thresh_full;
         snr_status = "N/A"; inclusion_flag = 1;
     end
     
@@ -134,6 +135,20 @@ function out = kiaSort_detect_spike(inputSignal, cfg, sample)
         [spk_All_adj, spk_Val_adj, spk_ID_adj] = keep_highest_value([spk_Loc;spk_Loc_r], abs(bandpass_signal([spk_Loc; spk_Loc_r])), spk_Distance, spk_ID, original_spk_Distance);
     end
 
+    if ~sample
+        main_mask = spk_Val_adj >= mad_Thresh_full;
+        out.reserve_spk_idx = spk_All_adj(~main_mask);
+        out.reserve_spk_Val = spk_Val_adj(~main_mask);
+        out.reserve_spk_ID  = spk_ID_adj(~main_mask);
+        spk_All_adj = spk_All_adj(main_mask);
+        spk_Val_adj = spk_Val_adj(main_mask);
+        spk_ID_adj  = spk_ID_adj(main_mask);
+    else
+        out.reserve_spk_idx = [];
+        out.reserve_spk_Val = [];
+        out.reserve_spk_ID  = [];
+    end
+
     rms_values = struct(...
         "bandpass_min_threshold", mad_Thresh, ...
         "bandpass_init_threshold", mad_Thresh_init ...
@@ -182,4 +197,7 @@ function out = set_null_output(scale_factor, SNR_status, inclusion_flag, waveInc
     out.inclusion     = inclusion_flag;
     out.waveInclusion = waveInc_flag;
     out.adj_distant   = 0;
+    out.reserve_spk_idx = [];
+    out.reserve_spk_Val = [];
+    out.reserve_spk_ID  = [];
 end

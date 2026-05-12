@@ -1,73 +1,98 @@
 function merge_matrix = multiCond_Merge(A, options)
-    % Robust comparison with temporal alignment (±2 samples)
-    % A: N×Nch×T matrix (N groups, Nch channels, T time points)
-    
+% Robust waveform comparison with temporal alignment.
+% A: N×Nch×T matrix (N groups, Nch channels, T time points)
+%
+% OPTIMIZATIONS:
+%   - Shape similarity is shift-invariant (circular shift preserves max/min
+%     over time) — computed once per pair, not per shift.
+%   - Correlation computed via FFT cross-correlation across all shifts at
+%     once, replacing the inner shift loop entirely.
+
     if nargin < 2
-        options.corr_weight = 0.5;
+        options.corr_weight  = 0.5;
         options.shape_weight = 0.5;
-        options.threshold = 0.9;
-        options.max_shift = 15;  % Check shifts from -2 to +2
+        options.threshold    = 0.9;
+        options.max_shift    = 15;
     end
-    
-    N = size(A, 1);
+
+    N   = size(A, 1);
     Nch = size(A, 2);
-    T = size(A, 3);
-    shifts = -options.max_shift:options.max_shift;  % [-2, -1, 0, 1, 2]
-    
-    % Initialize similarity matrices
-    max_corr_sim = zeros(N, N);
+    T   = size(A, 3);
+
+    % ------------------------------------------------------------------
+    % 1. Shape similarity: shift-invariant, precompute per cluster
+    %    circshift preserves max/min over dim-3, so peak-to-peak is constant.
+    % ------------------------------------------------------------------
+    peaks = squeeze(max(A,[],3) - min(A,[],3));   % N × Nch
+    if N == 1, peaks = peaks(:)'; end              % force row
+
+    peakNorms = sqrt(sum(peaks.^2, 2));            % N × 1
+
     max_shape_sim = zeros(N, N);
-    
-    % Compare all pairs with temporal shifts
     for i = 1:N
         for j = i:N
-            % Initialize temporary similarity scores for all shifts
-            corr_scores = zeros(length(shifts), 1);
-            shape_scores = zeros(length(shifts), 1);
-            
-            % Try all circular shifts
-            for s_idx = 1:length(shifts)
-                shift = shifts(s_idx);
-                
-                % Shift waveform j in time dimension
-                A_j_shifted = circshift(A(j, :, :), shift, 3);
-                
-                % 1. Correlation similarity
-                A_i_flat = reshape(A(i, :, :), 1, []);
-                A_j_flat = reshape(A_j_shifted, 1, []);
-                
-                % Normalize
-                A_i_norm = (A_i_flat - mean(A_i_flat)) / std(A_i_flat);
-                A_j_norm = (A_j_flat - mean(A_j_flat)) / std(A_j_flat);
-                
-                % Correlation
-                corr_scores(s_idx) = (A_i_norm * A_j_norm') / (Nch * T);
-                
-                % 2. Shape similarity (peak-to-peak ratios)
-                peaks_i = squeeze(max(A(i,:,:), [], 3) - min(A(i,:,:), [], 3));
-                peaks_j = squeeze(max(A_j_shifted, [], 3) - min(A_j_shifted, [], 3));
-                
-                if norm(peaks_i) + norm(peaks_j) > 0
-                    shape_scores(s_idx) = 1 - norm(peaks_i - peaks_j) / (norm(peaks_i) + norm(peaks_j));
-                else
-                    shape_scores(s_idx) = 1;  % Both are zero
-                end
+            denom = peakNorms(i) + peakNorms(j);
+            if denom > 0
+                max_shape_sim(i,j) = 1 - norm(peaks(i,:) - peaks(j,:)) / denom;
+            else
+                max_shape_sim(i,j) = 1;
             end
-            
-            % Take maximum similarity across all shifts
-            max_corr_sim(i, j) = max(corr_scores);
-            max_corr_sim(j, i) = max_corr_sim(i, j);
-            
-            max_shape_sim(i, j) = max(shape_scores);
-            max_shape_sim(j, i) = max_shape_sim(i, j);
+            max_shape_sim(j,i) = max_shape_sim(i,j);
         end
     end
-    
-    % Combine metrics using weights
-    combined_sim = options.corr_weight * max_corr_sim + ...
-                   options.shape_weight * max_shape_sim;
-    
-    % Generate merge matrix
+
+    % ------------------------------------------------------------------
+    % 2. Correlation via FFT — all lags at once
+    %    For circular shift s:
+    %      score(s) = Σ_ch Σ_t a_norm(ch,t) · b_norm(ch, (t-s) mod T)
+    %    which is the sum-of-channels circular cross-correlation, computed
+    %    efficiently with fft/ifft.
+    % ------------------------------------------------------------------
+
+    % Pre-normalise each cluster (global zero-mean, unit-std across all
+    % channels and time points — same as original code).
+    A_norm2D = zeros(N, Nch, T);
+    A_fft    = zeros(N, Nch, T);   % will hold complex FFTs
+
+    for i = 1:N
+        flat  = reshape(A(i,:,:), 1, []);
+        mu    = mean(flat);
+        sigma = std(flat);
+        if sigma < eps, sigma = 1; end
+        normed = (A(i,:,:) - mu) / sigma;
+        A_norm2D(i,:,:) = normed;
+        for ch = 1:Nch
+            A_fft(i, ch, :) = fft(squeeze(normed(1, ch, :)));
+        end
+    end
+
+    % Allowed shift indices in the FFT output vector (length T).
+    %   shift s >= 0  →  index s + 1
+    %   shift s <  0  →  index T + s + 1
+    shifts   = -options.max_shift : options.max_shift;
+    shiftIdx = mod(shifts, T) + 1;
+
+    max_corr_sim = zeros(N, N);
+    for i = 1:N
+        fi = squeeze(A_fft(i,:,:));          % Nch × T  (complex)
+        for j = i:N
+            fj = squeeze(A_fft(j,:,:));      % Nch × T  (complex)
+
+            % Cross-correlation summed over channels
+            xc = sum(real(ifft(fi .* conj(fj), [], 2)), 1);   % 1 × T
+            xc = xc / (Nch * T);
+
+            max_corr_sim(i,j) = max(xc(shiftIdx));
+            max_corr_sim(j,i) = max_corr_sim(i,j);
+        end
+    end
+
+    % ------------------------------------------------------------------
+    % 3. Combine & threshold
+    % ------------------------------------------------------------------
+    combined_sim = options.corr_weight  * max_corr_sim ...
+                 + options.shape_weight * max_shape_sim;
+
     merge_matrix = combined_sim > options.threshold;
-    merge_matrix(logical(eye(N))) = 0;  % Don't merge with self
+    merge_matrix(logical(eye(N))) = 0;
 end

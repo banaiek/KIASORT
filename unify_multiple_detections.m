@@ -12,6 +12,7 @@ for i = 1:numChannels
         clust_sel = sortedSamples{i,1}.clusteringInfo.clusterSelection;
         keep_idx = find(clust_sel.keep);
         for k = 1:length(keep_idx)
+
             idx = keep_idx(k);
             lbl = clust_sel.classLabels(idx);
             spk = spk_idx(spk_lbl == lbl);

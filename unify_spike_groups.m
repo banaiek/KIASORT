@@ -17,15 +17,23 @@ for i = 1:N
     uLabs_i     = sortedSamples{i}.clusteringInfo.clusterRelabeling.newUniqueLabels;
     keepVec_i   = sortedSamples{i}.clusteringInfo.clusterSelection.keep;
     maxChIdx_i  = sortedSamples{i}.clusteringInfo.clusterSelection.max_channelIdx;
+    clusterStatus_i = sortedSamples{i}.clusteringInfo.clusterSelection.clusterStatus;
     spk_idx_i   = sampleFeatures{i}.spk_idx;
     
     badMask_i   = ~keepVec_i;
     badLabs_i   = uLabs_i(badMask_i);
     badMCh_i    = maxChIdx_i(badMask_i);
+    badStatus_i = clusterStatus_i(badMask_i);
     
-    fractionsCell{i}    = cell(sum(badMask_i),1); 
-    maxClusLabelCell{i} = cell(sum(badMask_i),1);    
-    numMatchCell{i}     = cell(sum(badMask_i),1);
+    % Filter out negative-status clusters from not-kept clusters
+    % Only normal (status=0) positive-labeled not-kept clusters should be checked
+    normalStatusMask = (badStatus_i == 0) & (badLabs_i > 0);
+    badLabs_i = badLabs_i(normalStatusMask);
+    badMCh_i = badMCh_i(normalStatusMask);
+    
+    fractionsCell{i}    = cell(numel(badLabs_i),1); 
+    maxClusLabelCell{i} = cell(numel(badLabs_i),1);    
+    numMatchCell{i}     = cell(numel(badLabs_i),1);
     
     for bc = 1:numel(badLabs_i)
         thisLab = badLabs_i(bc);
@@ -62,13 +70,14 @@ for i = 1:N
     if isempty(sortedSamples{i}), continue; end
     
     uLabs_i       = sortedSamples{i}.clusteringInfo.clusterRelabeling.newUniqueLabels;
+    clusterStatus_i       = sortedSamples{i}.clusteringInfo.clusterSelection.clusterStatus;
     waveform_i    = sortedSamples{i}.clusteringInfo.clusterRelabeling.newMeanWaveforms;
     keepVec_i     = sortedSamples{i}.clusteringInfo.clusterSelection.keep;
     detectblity_i = sortedSamples{i}.clusteringInfo.clusterSelection.detectblity_val;
     mainNegativePolarity_i = sortedSamples{i}.clusteringInfo.clusterSelection.mainNegativePolarity;
     sideNegativePolarity_i = sortedSamples{i}.clusteringInfo.clusterSelection.sideNegativePolarity;
 
-    idxKept    = find(keepVec_i==1 & uLabs_i~=-1);
+    idxKept    = find(keepVec_i==1 & uLabs_i~=-1 & clusterStatus_i>-1);
     keptClus   = uLabs_i(idxKept);
     keptWaveforms = waveform_i(idxKept, :, :);
     keptDetect = detectblity_i(idxKept);

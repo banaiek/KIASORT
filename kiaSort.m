@@ -14,7 +14,7 @@ function kiaSort
     choiceMap.dataType             = {'int16','int32','float32','unit16'};
     choiceMap.method               = {'direct','indirect'};
     choiceMap.commonRef            = {'median','mean','none'};
-    choiceMap.modelType            = {'mlp','cnn','svm'};
+    choiceMap.modelType            = {'mlp','cnn','svm','template'};
 
     hpChoiceMap = struct();
     hpChoiceMap.mlpLossFcn           = {'mse','mae'};
@@ -380,7 +380,7 @@ function kiaSort
             colIndex=1;
             rowIndex=rowIndex+1;
 
-        elseif colIndex==3 && rowIndex == 13
+        elseif colIndex==1 && rowIndex == 14
             rowIndex=rowIndex+1;
             textLbl = sprintf(' \n                _______________________________ Options __________________________\n');
             lbl = uilabel(bottomleftGrid, 'Text',textLbl,...
@@ -1125,7 +1125,7 @@ nodeField = uitreenode(nodeExtConfig, 'Text', 'Max Sample Span (min)'); % was 'm
 nodeField.UserData = 'Maximum time span (min) for sample extraction.';
 
 nodeField = uitreenode(nodeExtConfig, 'Text', 'Sorting: Model Type'); % was 'modelType'
-nodeField.UserData = 'Sorting model type (e.g., svm, mlp, cnn, etc.). SVM is fastest, most accurate, and recommended.';
+nodeField.UserData = 'Sorting model type (e.g., svm, mlp, cnn, etc.). Default is Template matching. Then SVM is fastest, most accurate, and recommended.';
 
 nodeField = uitreenode(nodeExtConfig, 'Text', 'Sorting: Use PCA'); % was 'usePCA'
 nodeField.UserData = 'Whether to use PCA during training (true/false).';
@@ -1812,6 +1812,7 @@ applyColorScheme(img2, figColor);
         end
         executionControl = 'Running';
         channel_inclusion = getappdata(fig, 'channel_inclusion');
+        runCfg = make_run_cfg(cfg, channel_locations);
         progressBar.Value = 0;
         progressLabel.Text = 'Sorting in progress. Extraction: 0%';
         progressBar.ScaleColors = [.9 .9 .9];
@@ -1819,7 +1820,7 @@ applyColorScheme(img2, figColor);
         drawnow;
         progressFcn = @(pct, msg) updateProgress(pct, msg);
         try
-           kiaSort_main_extract_sample_data(cfg.fullFilePath, cfg.outputFolder, cfg, 'channel_mapping',channel_mapping,...
+           kiaSort_main_extract_sample_data(runCfg.fullFilePath, runCfg.outputFolder, runCfg, 'channel_mapping',channel_mapping,...
                 'channel_inclusion', channel_inclusion, 'channel_locations', channel_locations,...
                 'progressfcn', progressFcn);
             progressBar.Value = 100;
@@ -1832,7 +1833,7 @@ applyColorScheme(img2, figColor);
         drawnow;
 
         progressBar.Value = 0;
-        if cfg.parallelProcessing
+        if runCfg.parallelProcessing
             progressBar.ScaleColors = [.9 .9 .9];
             progressLabel.Text = 'Sorting samples in parallel. No progress report';
         else
@@ -1843,7 +1844,7 @@ applyColorScheme(img2, figColor);
         drawnow;
 
         try
-            kiaSort_main_sort_samples(cfg.outputFolder, cfg, hp,...
+            kiaSort_main_sort_samples(runCfg.outputFolder, runCfg, hp,...
                 'progressfcn', progressFcn);
             progressBar.Value = 100;
             progressLabel.Text = 'All samples are sorted';
@@ -1860,7 +1861,7 @@ applyColorScheme(img2, figColor);
         drawnow;
 
         try
-            kiaSort_main_sortData(cfg.fullFilePath, cfg.outputFolder, cfg,...
+            kiaSort_main_sortData(runCfg.fullFilePath, runCfg.outputFolder, runCfg,...
                 'progressfcn', progressFcn);
             progressBar.Value = 100;
             progressLabel.Text = 'All chunks are sorted';
@@ -1875,7 +1876,7 @@ applyColorScheme(img2, figColor);
     end
 
 
-    function onExtractSamples() 
+    function onExtractSamples()
         if ~isfield(cfg,'outputFolder')
             if isfield(cfg,'inputFolder')
                 cfg.outputFolder = cfg.inputFolder;
@@ -1883,14 +1884,15 @@ applyColorScheme(img2, figColor);
         end
         executionControl = 'Running';
         channel_inclusion = getappdata(fig, 'channel_inclusion');
+        runCfg = make_run_cfg(cfg, channel_locations);
         progressBar.Value = 0;
         progressLabel.Text = 'Extraction: 0%';
-        progressBar.ScaleColors = [.9 .9 .9];    
+        progressBar.ScaleColors = [.9 .9 .9];
         progressBar.ScaleColorLimits = [0 100];
         drawnow;
         progressFcn = @(pct, msg) updateProgress(pct, msg);
         try
-            kiaSort_main_extract_sample_data(cfg.fullFilePath, cfg.outputFolder, cfg, 'channel_mapping',channel_mapping,...
+            kiaSort_main_extract_sample_data(runCfg.fullFilePath, runCfg.outputFolder, runCfg, 'channel_mapping',channel_mapping,...
                 'channel_inclusion', channel_inclusion, 'channel_locations', channel_locations,...
                 'progressfcn', progressFcn);
             progressBar.Value = 100;
@@ -1910,18 +1912,19 @@ applyColorScheme(img2, figColor);
             end
         end
         executionControl = 'Running';
+        runCfg = make_run_cfg(cfg, channel_locations);
         progressBar.Value = 0;
-        if cfg.parallelProcessing
+        if runCfg.parallelProcessing
             progressLabel.Text = 'Sorting samples in parallel. No progress report';
         else
         progressLabel.Text = 'Sorting samples: 0%';
-        end      
+        end
         progressBar.ScaleColors = [.9 .9 .9];
         progressBar.ScaleColorLimits = [0 100];
         drawnow;
         progressFcn = @(pct, msg) updateProgress(pct, msg);
         try
-            kiaSort_main_sort_samples(cfg.outputFolder, cfg, hp,...
+            kiaSort_main_sort_samples(runCfg.outputFolder, runCfg, hp,...
                 'progressfcn', progressFcn);
             progressBar.Value = 100;
             progressLabel.Text = 'All samples are sorted';
@@ -1941,6 +1944,7 @@ applyColorScheme(img2, figColor);
             end
         end
         executionControl = 'Running';
+        runCfg = make_run_cfg(cfg, channel_locations);
         progressBar.Value = 0;
         progressLabel.Text = 'Sorting in progress: 0%';
         progressBar.ScaleColors = [.9 .9 .9];
@@ -1948,7 +1952,7 @@ applyColorScheme(img2, figColor);
         drawnow;
         progressFcn = @(pct, msg) updateProgress(pct, msg);
         try
-            kiaSort_main_sortData(cfg.fullFilePath, cfg.outputFolder, cfg,...
+            kiaSort_main_sortData(runCfg.fullFilePath, runCfg.outputFolder, runCfg,...
                 'progressfcn', progressFcn);
             progressBar.Value = 100;
             progressLabel.Text = 'All chunks are sorted';
@@ -1961,8 +1965,19 @@ applyColorScheme(img2, figColor);
         drawnow;
     end
 
+    function rcfg = make_run_cfg(srcCfg, chLocs)
+        % Local cfg copy for a sorting run. The radius-based override
+        % stays out of the closure cfg so the GUI's "Half Channels Extract"
+        % field continues to reflect the user's max value across runs.
+        rcfg = srcCfg;
+        if isfield(rcfg, 'waveform_radius')
+            rcfg.num_channel_extract = derive_num_channel_extract( ...
+                chLocs, rcfg.waveform_radius, rcfg.num_channel_extract);
+        end
+    end
+
     function updateProgress(pct, msg)
-        
+
         if strcmp(executionControl, 'stopped')
             error('Execution stopped by user.');
         end

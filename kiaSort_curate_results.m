@@ -62,12 +62,46 @@ plotType = [];
 selected_order = [];
 selected_order_last = [];
 
+% Cache of waveform line handles + the unscaled data behind them so that
+% scale / alpha / line-width sliders can update the existing plot in
+% place instead of triggering a full plotWaveforms redraw. The cache
+% is populated in plotWaveforms (single-plot mode) and consumed by the
+% updateScale / updateAlphaLevel / updateLineWidth fast paths.
+wfPlotCache = struct('lines', {{}}, 'unscaledY', {{}}, ...
+                     'yOff', [], 'isMain', logical([]), ...
+                     'rgb', zeros(0,3), 'axis', []);
+
+% Most recent uitable handle from plotTable. paintSelectedTableRows
+% repaints per-row background colours on this handle whenever the
+% selection changes (table-click toggle, walker step, etc.) so the
+% user can see at a glance which row is currently selected.
+tableHandle = [];
+
+% Standalone "curation table" window. Lives in a separate uifigure
+% so a per-unit selection doesn't clear / re-render it (which is
+% what used to happen when Table was a plot type). Click "Open
+% table" to launch; the window persists across selection changes,
+% preserves its column sort, and can be refreshed on demand.
+tableFigure       = [];   % uifigure handle, or empty when closed
+tableContentPanel = [];   % uipanel inside the figure that hosts the uitable
+
 % Initialize sparse matrices/cells for large data structures to improve memory usage
 xcorr_vals = cell(numGroups,numGroups);
 isiCounts = cell(numGroups,numGroups);
 isiCenters = cell(numGroups,numGroups);
 isiViolations = zeros(numGroups,numGroups);
 unitIsolation = repmat({'NA'},[numGroups,1]);
+% Free-text note per unit. Lives in memory while the GUI is open and
+% gets serialised into curated_sample.mat / curated_metrics.csv on
+% Save. A user can type "good FS interneuron, layer 5, drifted"
+% etc.
+unitNotes     = repmat({''}, [numGroups, 1]);
+
+% Split-button options. The dropdown / edit field next to the Split
+% button mirror these closure variables; onSplit reads them whenever
+% the user triggers a split.
+splitMethod      = 'K-means';
+splitNumClusters = 2;
 DenCenters = cell(numGroups,numGroups);
 DenCounts = cell(numGroups,numGroups);
 presence_ratio = zeros(numGroups,numGroups);
@@ -103,6 +137,105 @@ originalUnifiedLabels = sortedRes.unifiedLabels;
 originalChannelNum = sortedRes.channelNum;
 originalSpikeIdx = sortedRes.spike_idx;
 
+% --- Resume the last saved curation, if any ----------------------
+% The Save button writes RES_Sorted/curated_sample.mat with a
+% .session sub-struct that captures every per-unit and per-spike
+% array we need. On launch we check for that file and apply the
+% session on top of the freshly-loaded raw sort data; the
+% original* vars above are left as the true pre-curation state
+% so Reset / Undo still walk back to the sorter output.
+%
+% The restore is best-effort: a missing, corrupt, or dimension-
+% mismatched file is silently ignored (with a console hint) and
+% the GUI starts on the raw data. A fresh dataset that hasn't
+% been saved yet just hits the "no file" branch.
+try
+    curatedSampleFile = fullfile(cfg.outputFolder, 'RES_Sorted', 'curated_sample.mat');
+    if exist(curatedSampleFile, 'file')
+        loaded = load(curatedSampleFile, 'curatedSamples');
+        if isfield(loaded, 'curatedSamples') && ...
+                isfield(loaded.curatedSamples, 'session')
+            sess = loaded.curatedSamples.session;
+            nSpikeFile  = numel(sortedRes.unifiedLabels);
+            nSpikeSaved = 0;
+            if isfield(sess,'spikeLabels')
+                nSpikeSaved = numel(sess.spikeLabels);
+            end
+            nUnitSaved = 0;
+            if isfield(sess,'groupList')
+                nUnitSaved = numel(sess.groupList);
+            end
+
+            % We can apply per-unit state when nUnitSaved >= numGroups.
+            % nUnitSaved > numGroups happens when the saved session
+            % had Split-created units; we extend the per-unit arrays
+            % with the same NaN-original markers onSplit uses.
+            if nUnitSaved >= numGroups
+                if nUnitSaved > numGroups
+                    extra = nUnitSaved - numGroups;
+                    wfShape = size(originalSampleWaveform);
+                    originalGroupList(end+1:nUnitSaved,1)   = NaN;
+                    originalChannelList(end+1:nUnitSaved,1) = NaN;
+                    originalSampleWaveform(end+1:nUnitSaved,:,:) = ...
+                        nan(extra, wfShape(2), wfShape(3));
+                    sampleWaveform(end+1:nUnitSaved,:,:) = ...
+                        nan(extra, wfShape(2), wfShape(3));
+                    detectblity(end+1:nUnitSaved,1)  = 0;
+                    mainPolarity(end+1:nUnitSaved,1) = false;
+                    sidePolarity(end+1:nUnitSaved,1) = false;
+                    mergedFlag(end+1:nUnitSaved,1)   = false;
+                    unitIsolation(end+1:nUnitSaved,1) = {'NA'};
+                    unitNotes(end+1:nUnitSaved,1)    = {''};
+                    stable_length(end+1:nUnitSaved,:) = ...
+                        repmat([1, trialLength], extra, 1);
+                    chkBoxSelect(end+1:nUnitSaved,1) = false;
+                    chkBoxVis(end+1:nUnitSaved,1)    = false;
+                    selectUnits = [selectUnits; nan(extra,1)];
+                    numGroups   = nUnitSaved;
+                    totalPages  = ceil(numGroups / PAGE_SIZE);
+                    % Per-pair caches grow on demand so just size them now.
+                    xcorr_vals(numGroups,numGroups)   = {[]};
+                    isiCounts(numGroups,numGroups)    = {[]};
+                    isiCenters(numGroups,numGroups)   = {[]};
+                    isiViolations(numGroups,numGroups)= 0;
+                    DenCenters(numGroups,numGroups)   = {[]};
+                    DenCounts(numGroups,numGroups)    = {[]};
+                    presence_ratio(numGroups,numGroups)= 0;
+                end
+
+                % Apply per-unit arrays. Each isfield + length match
+                % so a partial save (older format) doesn't crash.
+                if numel(sess.groupList)     == numGroups, groupList     = sess.groupList(:);     end
+                if isfield(sess,'channelList')   && numel(sess.channelList)   == numGroups, channelList   = sess.channelList(:);   end
+                if isfield(sess,'unitIsolation') && numel(sess.unitIsolation) == numGroups, unitIsolation = sess.unitIsolation(:); end
+                if isfield(sess,'stable_length') && size(sess.stable_length,1) == numGroups, stable_length = sess.stable_length;    end
+                if isfield(sess,'mainPolarity')  && numel(sess.mainPolarity)  == numGroups, mainPolarity  = sess.mainPolarity(:);  end
+                if isfield(sess,'sidePolarity')  && numel(sess.sidePolarity)  == numGroups, sidePolarity  = sess.sidePolarity(:);  end
+                if isfield(sess,'mergedFlag')    && numel(sess.mergedFlag)    == numGroups, mergedFlag    = sess.mergedFlag(:);    end
+                if isfield(sess,'unitNotes')     && numel(sess.unitNotes)     == numGroups, unitNotes     = sess.unitNotes(:);     end
+                if isfield(sess,'detectblity')   && numel(sess.detectblity)   == numGroups, detectblity   = sess.detectblity(:);   end
+                % channelPlot is derived from channelList -- recompute.
+                channelPlot = channelList + [-numChannelPlot:numChannelPlot];
+            else
+                fprintf('Saved curation has %d units, current sort has %d -- skipping per-unit restore.\n', nUnitSaved, numGroups);
+            end
+
+            % Apply per-spike arrays only when the spike count
+            % matches exactly. A re-sort would change spike count,
+            % in which case we keep the freshly-loaded sortedRes.
+            if nSpikeSaved == nSpikeFile && nSpikeSaved > 0
+                sortedRes.unifiedLabels = sess.spikeLabels;
+                if isfield(sess,'spikeIdx')      && numel(sess.spikeIdx)      == nSpikeFile, sortedRes.spike_idx  = sess.spikeIdx;      end
+                if isfield(sess,'spikeChannels') && numel(sess.spikeChannels) == nSpikeFile, sortedRes.channelNum = sess.spikeChannels; end
+            elseif nSpikeSaved > 0
+                fprintf('Saved curation has %d spikes, current sort has %d -- skipping spike-level restore.\n', nSpikeSaved, nSpikeFile);
+            end
+        end
+    end
+catch ME
+    fprintf('Could not restore saved curation: %s\n', ME.message);
+end
+
 colorMapAll = generate_cluster_colors(numGroups);
 
 disimlarityScore = sparse(numGroups, numGroups);
@@ -116,7 +249,56 @@ multiplePlotOrder = [];
 multiPlotPanels = gobjects(7,1);
 lastMultiPlotOrder = multiplePlotOrder;
 
+% Interactive cell drag state: gridMultiple is the uigridlayout that
+% hosts the multi-plot panels (assigned inside plotMultiple). The
+% swap button click pattern is two-step: click cell A's grip, then
+% click cell B's grip and they swap. The resize grip enters a
+% mouse-tracking mode -- click once to start dragging the cell
+% boundaries, click again (or release) to commit.
+gridMultiple        = [];
+multiSwapPendingK   = 0;
+multiResizeDrag     = struct('active',false,'k',0,'startMouse',[0 0], ...
+    'startRH',{{}},'startCW',{{}},'rowIdx',0,'colIdx',0, ...
+    'cellW',0,'cellH',0,'origMotionFcn',[],'origDownFcn',[]);
+
 parentFig.WindowKeyPressFcn = @keyPressHandler;
+
+% Best-effort persistent user prefs. Loaded here (defaults applied
+% later when the relevant widgets exist), saved on Save button
+% press AND on figure close. Lives next to the curated outputs
+% (cfg.outputFolder/RES_Sorted/kiaSort_curate_prefs.mat) so the
+% tuning is per-dataset; the legacy home-directory file is still
+% read as a fallback so older installs migrate cleanly the first
+% time they hit Save.
+projectPrefsDir  = fullfile(cfg.outputFolder, 'RES_Sorted');
+projectPrefsFile = fullfile(projectPrefsDir, 'kiaSort_curate_prefs.mat');
+legacyPrefsFile  = fullfile(getKiaPrefsDir(), 'kiaSort_curate_prefs.mat');
+loadedPrefs = struct();
+prefsFile = '';
+if exist(projectPrefsFile, 'file')
+    prefsFile = projectPrefsFile;
+elseif exist(legacyPrefsFile, 'file')
+    prefsFile = legacyPrefsFile;
+end
+if ~isempty(prefsFile)
+    try
+        loadedPrefs = load(prefsFile);
+        if isfield(loadedPrefs, 'prefs')
+            loadedPrefs = loadedPrefs.prefs;
+        end
+    catch
+        loadedPrefs = struct();
+    end
+end
+
+% Wire up an idempotent save-on-close hook. The previous CloseRequestFcn
+% is preserved and chained, so we don't accidentally swallow another
+% caller's logic.
+try
+    prevCloseFcn = parentFig.CloseRequestFcn;
+    parentFig.CloseRequestFcn = @(src,evt) onParentClose(src, evt, prevCloseFcn);
+catch
+end
 
 % Cache for frequently accessed data
 persistent cachedFilteredData cachedFilteredRange
@@ -138,8 +320,8 @@ leftPanel.Layout.Column = [1 5];
 leftPanel.Layout.Row    = [2 3];
 applyColorScheme(leftPanel, figColor);
 
-leftGrid = uigridlayout(leftPanel, [4 1], ...
-    'RowHeight',{'fit','fit','fit','1x'}, ...
+leftGrid = uigridlayout(leftPanel, [5 1], ...
+    'RowHeight',{'fit','fit','fit','fit','1x'}, ...
     'ColumnWidth',{'1x'}, ...
     'Padding',10, ...
     'RowSpacing',10);
@@ -151,48 +333,114 @@ topPanel.Layout.Row = 1;
 topPanel.Layout.Column = 1;
 applyColorScheme(topPanel, figColor);
 
+% topButtonLayout: 2 rows x 9 cols.
+%   Cols 1-4 hold the eight action buttons in a 2x4 grid:
+%       Row 1: Remove   Merge   Split   Limit
+%       Row 2: Isolation Undo   Reset   Notes
+%   Cols 5-6 are the compact Split options (Method + #Clust), sized
+%   to their label widths.
+%   Col 7  Drop Rate label / edit (slimmer than before).
+%   Col 8  Realign label (left of slider), col 9 Realign slider --
+%   the slider spans both rows so it has room to breathe.
 topButtonLayout = uigridlayout(topPanel,[2 9], ...
-    'ColumnWidth',{'fit','fit','fit','fit','fit','fit','1.75x','1.5x','2x'}, ...
+    'ColumnWidth',{'fit','fit','fit','fit',60,55,'1.25x','fit','2x'}, ...
     'ColumnSpacing',7.5, ...
     'Padding',[0 0 0 0]);
 applyColorScheme(topButtonLayout, figColor);
 
+% Row 1 buttons.
 btnRemove = uibutton(topButtonLayout,'Text','Remove',...
-    'ButtonPushedFcn',@(btn,ev)onRemove(), 'Tooltip', sprintf('Delete units: \n Ctrl+Shift+D or Cmd+Shift+D'));
-btnRemove.Layout.Row = [1 2];
+    'ButtonPushedFcn',@(btn,ev)onRemove(), ...
+    'Tooltip','Remove the selected units. Ctrl+D');
+btnRemove.Layout.Row = 1;
 btnRemove.Layout.Column = 1;
 applyColorScheme(btnRemove, figColor);
 
 btnMerge = uibutton(topButtonLayout,'Text','Merge',...
-    'ButtonPushedFcn',@(btn,ev)onMerge(), 'Tooltip', sprintf('Merge units: \n Ctrl+Shift+M or Cmd+Shift+M'));
-btnMerge.Layout.Row = [1 2];
+    'ButtonPushedFcn',@(btn,ev)onMerge(), ...
+    'Tooltip','Merge selected units into the radio-button choice. Ctrl+M');
+btnMerge.Layout.Row = 1;
 btnMerge.Layout.Column = 2;
 applyColorScheme(btnMerge, figColor);
 
+btnSplit = uibutton(topButtonLayout,'Text','Split',...
+    'ButtonPushedFcn',@(btn,ev)onSplit(), ...
+    'Tooltip','Split the selected unit(s). Ctrl+T');
+btnSplit.Layout.Row = 1;
+btnSplit.Layout.Column = 3;
+applyColorScheme(btnSplit, figColor);
+
+btnAutoCut = uibutton(topButtonLayout,'Text','Limit',...
+    'ButtonPushedFcn',@(btn,ev)onAutoCut(), ...
+    'Tooltip','Trim selected units to their stable interval. Ctrl+L');
+btnAutoCut.Layout.Row = 1;
+btnAutoCut.Layout.Column = 4;
+applyColorScheme(btnAutoCut, figColor);
+
+% Row 2 buttons.
 btnMUA = uibutton(topButtonLayout,'Text','Isolation',...
-    'ButtonPushedFcn',@(btn,ev)onMUA(), 'Tooltip', sprintf('Isolation type: \n Ctrl+Shift+I or Cmd+Shift+I'));
-btnMUA.Layout.Row = [1 2];
-btnMUA.Layout.Column = 3;
+    'ButtonPushedFcn',@(btn,ev)onMUA(), ...
+    'Tooltip','Cycle isolation label (SUA+/SUA/MUA+/MUA). Ctrl+K');
+btnMUA.Layout.Row = 2;
+btnMUA.Layout.Column = 1;
 applyColorScheme(btnMUA, figColor);
 
 btnUndo = uibutton(topButtonLayout,'Text','Undo',...
-    'ButtonPushedFcn',@(btn,ev)onUndo(), 'Tooltip', sprintf('Undo selected units: \n Ctrl+Shift+U or Cmd+Shift+U'));
-btnUndo.Layout.Row = [1 2];
-btnUndo.Layout.Column = 4;
+    'ButtonPushedFcn',@(btn,ev)onUndo(), ...
+    'Tooltip','Revert selected units to their pre-edit state. Ctrl+U');
+btnUndo.Layout.Row = 2;
+btnUndo.Layout.Column = 2;
 applyColorScheme(btnUndo, figColor);
 
 btnReset = uibutton(topButtonLayout,'Text','Reset',...
-    'ButtonPushedFcn',@(btn,ev)onReset(), 'Tooltip', sprintf('Reset all units: \n Ctrl+Shift+R or Cmd+Shift+R'));
-btnReset.Layout.Row = [1 2];
-btnReset.Layout.Column = 5;
+    'ButtonPushedFcn',@(btn,ev)onReset(), ...
+    'Tooltip','Reset all edits. Ctrl+R');
+btnReset.Layout.Row = 2;
+btnReset.Layout.Column = 3;
 applyColorScheme(btnReset, figColor);
 
-btnAutoCut = uibutton(topButtonLayout,'Text','Limit',...
-    'ButtonPushedFcn',@(btn,ev)onAutoCut(), 'Tooltip', sprintf('Auto limit and crop the dropped rate: \n Ctrl+Shift+L or Cmd+Shift+L'));
-btnAutoCut.Layout.Row = [1 2];
-btnAutoCut.Layout.Column = 6;
-applyColorScheme(btnAutoCut, figColor);
+btnNotes = uibutton(topButtonLayout,'Text','Notes',...
+    'ButtonPushedFcn',@(btn,ev)onEditNotes(), ...
+    'Tooltip','Edit the unit''s note. Ctrl+E');
+btnNotes.Layout.Row = 2;
+btnNotes.Layout.Column = 4;
+applyColorScheme(btnNotes, figColor);
 
+% Split options: clustering method + number of sub-clusters. Sit
+% right next to the Split button. Sized via fixed pixel widths so
+% they take only as much space as their labels need.
+lblSplitMethod = uilabel(topButtonLayout,'Text','Method:',...
+    'FontWeight','bold','HorizontalAlignment','Center');
+lblSplitMethod.Layout.Row = 1;
+lblSplitMethod.Layout.Column = 5;
+applyColorScheme(lblSplitMethod, figColor);
+
+ddSplitMethod = uidropdown(topButtonLayout, ...
+    'Items',{'K-means','GMM','Graph'}, ...
+    'Value', splitMethod, ...
+    'Tooltip','Clustering method used by Split.', ...
+    'ValueChangedFcn', @(dd,ev) setSplitMethod(dd.Value));
+ddSplitMethod.Layout.Row = 2;
+ddSplitMethod.Layout.Column = 5;
+applyColorScheme(ddSplitMethod, figColor);
+
+lblSplitN = uilabel(topButtonLayout,'Text','#Clust:',...
+    'FontWeight','bold','HorizontalAlignment','Center');
+lblSplitN.Layout.Row = 1;
+lblSplitN.Layout.Column = 6;
+applyColorScheme(lblSplitN, figColor);
+
+uiSplitN = uieditfield(topButtonLayout,'numeric','Value', splitNumClusters, ...
+    'Limits',[2 10], 'LowerLimitInclusive','on', 'UpperLimitInclusive','on', ...
+    'RoundFractionalValues','on', ...
+    'Tooltip','Number of sub-clusters for Split (2-10).', ...
+    'ValueChangedFcn', @(ui,ev) setSplitNumClusters(ui.Value));
+uiSplitN.Layout.Row = 2;
+uiSplitN.Layout.Column = 6;
+applyColorScheme(uiSplitN, figColor);
+
+% Right-hand side: Drop Rate (col 7) + Realign label/slider stacked
+% in col 8 (label on top, slider underneath).
 lblLimit = uilabel(topButtonLayout,'Text',sprintf('Drop Rate:'),...
     'FontWeight','bold','HorizontalAlignment','Right');
 lblLimit.Layout.Row = 1;
@@ -200,7 +448,7 @@ lblLimit.Layout.Column = 7;
 applyColorScheme(lblLimit, figColor);
 
 uiLimit = uieditfield(topButtonLayout,'numeric','Value',5, ...
-    'Tooltip',sprintf('Min drop of firing rate \n for auto limit.'),...
+    'Tooltip','Fold drop in firing rate Limit needs to trim. Higher = more conservative.',...
     'ValueChangedFcn',@(ui,ev)setDropVal(ui.Value));
 uiLimit.Layout.Row = 2;
 uiLimit.Layout.Column = 7;
@@ -214,7 +462,7 @@ lblSliderReAlign.Layout.Column = 8;
 applyColorScheme(lblSliderReAlign, figColor);
 
 sliderReAlign = uislider(topButtonLayout,'Value', 0,...
-    'Tooltip',sprintf('Realign the spike waveform \n for any selected unit.'),...
+    'Tooltip','Shift selected units'' spike times by this many ms.',...
     'Limits',[-halfSpikeWaveDur halfSpikeWaveDur]);
 sliderReAlign.MajorTicks = [-halfSpikeWaveDur 0 halfSpikeWaveDur];
 sliderReAlign.Layout.Row = [1 2];
@@ -223,7 +471,8 @@ applyColorScheme(sliderReAlign, figColor);
 sliderReAlign.ValueChangedFcn = @(sld,ev)updateRealignSpikes(sld.Value);
 
 btnSave = uibutton(parentPanel,'Text','Save',...
-    'ButtonPushedFcn',@(btn,ev)onSave(), 'Tooltip', 'Ctrl+Shift+S or Cmd+Shift+S');
+    'ButtonPushedFcn',@(btn,ev)onSave(), ...
+    'Tooltip','Save the curation. Ctrl+S');
 btnSave.Layout.Column = 4;
 btnSave.Layout.Row = 1;
 applyColorScheme(btnSave, figColor);
@@ -234,7 +483,7 @@ lblSave.Layout.Row = 1;
 applyColorScheme(lblSave, figColor);
 
 processingPanel = uipanel(leftGrid, 'title','Similarity Processing');
-processingPanel.Layout.Row = 2;
+processingPanel.Layout.Row = 3;
 processingPanel.Layout.Column = 1;
 applyColorScheme(processingPanel, figColor);
 
@@ -246,7 +495,7 @@ processingLayout = uigridlayout(processingPanel,[2 8], ...
 applyColorScheme(processingLayout, figColor);
 
 btnPreProcess = uibutton(processingLayout,'Text','Process',...
-    'Tooltip',sprintf('After you set the distance and the metric \n run similarity detection.'),...
+    'Tooltip','Compute pairwise similarity.',...
     'ButtonPushedFcn',@(btn,ev)onSimilarityEstimation());
 btnPreProcess.Layout.Row = 2;
 btnPreProcess.Layout.Column = 1;
@@ -266,7 +515,7 @@ applyColorScheme(lblEstType , figColor);
 
 distanceDD = uidropdown(processingLayout,...
     'Items',{'XCorr','KL-div','Bhattacharyya'},...
-    'Tooltip',sprintf('Select the metric for \n similarity detection.'),...
+    'Tooltip','Similarity metric.',...
     'Value','XCorr',...
     'ValueChangedFcn',@(dd,ev)updateDistance(dd.Value));
 distanceDD.Layout.Row = 2;
@@ -282,7 +531,7 @@ lblDist.Layout.Column = 4;
 applyColorScheme(lblDist, figColor);
 
 uiDist = uieditfield(processingLayout,'numeric','Value',0,"Limits",[0 1], ...
-    'Tooltip',sprintf('Set min similarity \n between units.'),...
+    'Tooltip','Walker similarity threshold. 0 = no filter.',...
     "LowerLimitInclusive","on", ...
     "UpperLimitInclusive","on", ...
     'ValueChangedFcn',@(ui,ev)setDistVal(ui.Value,0));
@@ -297,7 +546,7 @@ lblAmpDist.Layout.Column = 5;
 applyColorScheme(lblAmpDist, figColor);
 
 uiAmpDist = uieditfield(processingLayout,'numeric','Value',0,"Limits",[0 1], ...
-    'Tooltip',sprintf('Set mean Amp. Var. ratio.'),...
+    'Tooltip','Max amplitude mismatch for the pair walker. 0 = no filter.',...
     "LowerLimitInclusive","on", ...
     "UpperLimitInclusive","on", ...
     'ValueChangedFcn',@(ui,ev)setDistVal(ui.Value,1));
@@ -312,7 +561,7 @@ lblYDist.Layout.Column = 3;
 applyColorScheme(lblYDist, figColor);
 
 uiYDist = uieditfield(processingLayout,'numeric','Value',0,"Limits",[0 range(ylocs)], ...
-    'Tooltip',sprintf('Set max radius \n to search for similarity'),...
+    'Tooltip','Max y-distance (µm) for Process / pair walker.',...
     "LowerLimitInclusive","on", ...
     "UpperLimitInclusive","on", ...
     'ValueChangedFcn',@(ui,ev)setDistYVal(ui.Value));
@@ -327,13 +576,101 @@ colGroup = [];
 lastGroup = 0;
 yDistThr = 0;
 
+% Auto-curation defaults (configurable via the "Auto curation" panel).
+% These are deliberately kept independent of the Similarity Processing
+% values so that running Auto does not depend on whatever the user has
+% typed in the manual fields. Defaults below are overridden by the
+% persistent-prefs file (loadedPrefs, populated near the top of this
+% function) when the user has saved a previous session's tuning.
+autoDistVal     = 200;     % search radius (um) for similar-pair gating
+autoSimVal      = 0.85;    % similarity threshold (XCorr default; KL/Bhatta uses <=0.10)
+autoAmpVal      = 0.15;    % amplitude variance ratio gate
+autoIsiVal      = 1.0;     % max ISI violation %
+autoOverlapFrac = 0.10;    % coincidence overlap fraction (Phase: removal)
+autoIsiBudget   = 1.5;     % merged-ISI budget (Phase: merge)
+autoPCVal       = 0.30;    % PC-distance gate (Phase: merge)
+autoCCGRatio    = 2;       % CCG peak / baseline-median ratio (Phase: cleaning)
+% Timing-consistency gate (Phase: cleaning). After CCG peak-at-zero
+% triggers, the contaminated side's coincident-spike lags (relative to
+% the nearest clean-side spike) must cluster tightly around their
+% median: at least autoLagConsistencyFrac of them within +-autoLagTightMs
+% of the median lag. Random coincidences spread the lags evenly inside
+% the +-0.5 ms window; a real sorter-introduced duplicate produces a
+% sharp sub-ms peak. Only the consistent-lag subset is stripped.
+autoLagTightMs         = 0.2;
+autoLagConsistencyFrac = 0.75;
+
+% Pull saved Auto-panel values from the prefs file so the user gets
+% their tuning back on the next launch. Each guard verifies the
+% loaded value is finite and inside the editfield's accepted range
+% before overwriting the default; a corrupt prefs entry can never
+% break the GUI's bring-up.
+if isfield(loadedPrefs,'autoDistVal') && isfinite(loadedPrefs.autoDistVal) && ...
+        loadedPrefs.autoDistVal >= 0
+    autoDistVal = loadedPrefs.autoDistVal;
+end
+if isfield(loadedPrefs,'autoSimVal') && isfinite(loadedPrefs.autoSimVal) && ...
+        loadedPrefs.autoSimVal >= 0 && loadedPrefs.autoSimVal <= 1
+    autoSimVal = loadedPrefs.autoSimVal;
+end
+if isfield(loadedPrefs,'autoAmpVal') && isfinite(loadedPrefs.autoAmpVal) && ...
+        loadedPrefs.autoAmpVal >= 0 && loadedPrefs.autoAmpVal <= 1
+    autoAmpVal = loadedPrefs.autoAmpVal;
+end
+if isfield(loadedPrefs,'autoIsiVal') && isfinite(loadedPrefs.autoIsiVal) && ...
+        loadedPrefs.autoIsiVal >= 0 && loadedPrefs.autoIsiVal <= 100
+    autoIsiVal = loadedPrefs.autoIsiVal;
+end
+if isfield(loadedPrefs,'autoOverlapFrac') && isfinite(loadedPrefs.autoOverlapFrac) && ...
+        loadedPrefs.autoOverlapFrac >= 0 && loadedPrefs.autoOverlapFrac <= 1
+    autoOverlapFrac = loadedPrefs.autoOverlapFrac;
+end
+if isfield(loadedPrefs,'autoIsiBudget') && isfinite(loadedPrefs.autoIsiBudget) && ...
+        loadedPrefs.autoIsiBudget >= 1 && loadedPrefs.autoIsiBudget <= 10
+    autoIsiBudget = loadedPrefs.autoIsiBudget;
+end
+if isfield(loadedPrefs,'autoPCVal') && isfinite(loadedPrefs.autoPCVal) && ...
+        loadedPrefs.autoPCVal >= 0 && loadedPrefs.autoPCVal <= 5
+    autoPCVal = loadedPrefs.autoPCVal;
+end
+if isfield(loadedPrefs,'autoCCGRatio') && isfinite(loadedPrefs.autoCCGRatio) && ...
+        loadedPrefs.autoCCGRatio >= 0.5 && loadedPrefs.autoCCGRatio <= 10
+    autoCCGRatio = loadedPrefs.autoCCGRatio;
+end
+if isfield(loadedPrefs,'autoLagTightMs') && isfinite(loadedPrefs.autoLagTightMs) && ...
+        loadedPrefs.autoLagTightMs > 0 && loadedPrefs.autoLagTightMs <= 2
+    autoLagTightMs = loadedPrefs.autoLagTightMs;
+end
+if isfield(loadedPrefs,'autoLagConsistencyFrac') && isfinite(loadedPrefs.autoLagConsistencyFrac) && ...
+        loadedPrefs.autoLagConsistencyFrac >= 0 && loadedPrefs.autoLagConsistencyFrac <= 1
+    autoLagConsistencyFrac = loadedPrefs.autoLagConsistencyFrac;
+end
+
+% Audit trail of pairs/units touched by the most recent Auto run.
+% Each pair of vectors is matched 1:1 so the pair walker on the Auto
+% panel can step through them. autoPairType (closure variable,
+% default 'Merged') selects which set the Next / Prev buttons walk.
+autoMergedPrimary    = [];
+autoMergedAbsorbed   = [];
+autoOverlapDroppedK  = [];   % unit dropped by the >autoOverlapFrac test
+autoOverlapTriggerJ  = [];   % the neighbour that caused the drop
+autoCCGStripCont     = [];   % unit whose coincident spikes were stripped
+autoCCGStripClean    = [];   % the cleaner partner of that pair
+autoPairType         = 'Merged';
+if isfield(loadedPrefs,'autoPairType') && (ischar(loadedPrefs.autoPairType) || isstring(loadedPrefs.autoPairType)) ...
+        && any(strcmp(char(loadedPrefs.autoPairType), ...
+        {'Merged','Overlap removed','SUA+','SUA','MUA+','MUA','NaN'}))
+    autoPairType = char(loadedPrefs.autoPairType);
+end
+lastAutoPair         = 0;
+
 
 if exist('Next.png','file')
     btnNextPair = uibutton(processingLayout, 'Icon','Next.png', 'Text','',...
-        'ButtonPushedFcn',@(btn,ev)onSelectSimilarPairs(1), 'Tooltip', sprintf('Next pair: \n Ctrl+Shift+Down or Cmd+Shift+Down'));
+        'ButtonPushedFcn',@(btn,ev)onSelectSimilarPairs(1), 'Tooltip','Next similar pair. Ctrl+]');
 else
     btnNextPair = uibutton(processingLayout, 'Text','Next',...
-        'ButtonPushedFcn',@(btn,ev)onSelectSimilarPairs(1), 'Tooltip', sprintf('Next pair: \n Ctrl+Shift+Down or Cmd+Shift+Down'));
+        'ButtonPushedFcn',@(btn,ev)onSelectSimilarPairs(1), 'Tooltip','Next similar pair. Ctrl+]');
 end
 btnNextPair.Layout.Row = 2;
 btnNextPair.Layout.Column = 6;
@@ -341,40 +678,315 @@ applyColorScheme(btnNextPair, figColor);
 
 if exist('Prev.png','file')
     btnPrevPair = uibutton(processingLayout, 'Icon','Prev.png', 'Text','',...
-        'ButtonPushedFcn',@(btn,ev)onSelectSimilarPairs(-1), 'Tooltip', sprintf('Prev. pair: \n Ctrl+Shift+Up or Cmd+Shift+Up'));
+        'ButtonPushedFcn',@(btn,ev)onSelectSimilarPairs(-1), 'Tooltip','Previous similar pair. Ctrl+[');
 else
     btnPrevPair = uibutton(processingLayout, 'Text','Previous',...
-        'ButtonPushedFcn',@(btn,ev)onSelectSimilarPairs(-1), 'Tooltip', sprintf('Prev. pair: \n Ctrl+Shift+Up or Cmd+Shift+Up'));
+        'ButtonPushedFcn',@(btn,ev)onSelectSimilarPairs(-1), 'Tooltip','Previous similar pair. Ctrl+[');
 end
 btnPrevPair.Layout.Row = 1;
 btnPrevPair.Layout.Column = 6;
 applyColorScheme(btnPrevPair, figColor);
 
 pairNumber = uilabel(processingLayout,'Text','Pair #:',...
-    'FontWeight','bold','HorizontalAlignment','left');
+    'FontWeight','bold','HorizontalAlignment','left',...
+    'Tooltip','Similar-pair walker. Step with Ctrl+[ and Ctrl+].');
 pairNumber.Layout.Row=1;
 pairNumber.Layout.Column = 7;
 applyColorScheme(pairNumber, figColor);
 
 uifPair = uieditfield(processingLayout,'Value','0','Editable','on',...
+    'Tooltip','Index of the displayed similar pair. Step with Ctrl+[ and Ctrl+].',...
     'ValueChangedFcn',@(ui,ev)changeuifPar(ui.Value,0));
 uifPair.Layout.Row=2;
 uifPair.Layout.Column=7;
 applyColorScheme(uifPair, figColor);
 
 uifPair2 = uieditfield(processingLayout,'Value','/0','Editable','off',...
+    'Tooltip','Total similar pairs. Step with Ctrl+[ and Ctrl+].',...
     'ValueChangedFcn',@(ui,ev)changeuifParAll(ui.Value,0));
 uifPair2.Layout.Row=2;
 uifPair2.Layout.Column=8;
 applyColorScheme(uifPair2, figColor);
 
+% Auto curation panel (parameters + Auto button)
+autoPanel = uipanel(leftGrid, 'title','Auto Curation');
+autoPanel.Layout.Row = 2;
+autoPanel.Layout.Column = 1;
+applyColorScheme(autoPanel, figColor);
+
+% Auto panel layout: 4 rows x 10 cols. Each parameter cell is
+% label-on-top + edit-below (2 rows tall). The top half holds
+% CCG, Sim, Amp.Var., PC Dist; the bottom half holds Overlap,
+% ISI, Budget, Dist. CCG sits at col 1 directly above Overlap so
+% the two coincidence-related gates are paired top-to-bottom in
+% the leftmost column. Cols 5 and 9 are 0-width spacers that
+% double the visual gap before the pair walker (col 6+) and
+% before the Auto button (col 10) -- keeping the parameter
+% block, walker, and trigger button as three clearly separated
+% groups without depending on per-column-pair spacing (which
+% uigridlayout doesn't support).
+%
+%       Col 1   Col 2  Col 3  Col 4    Col 5   Col 6  Col 7   Col 8  Col 9   Col 10 (Auto)
+% R1:   CCG:    Sim:   Amp:   PC Dist: ----- gap PairType: -- (spans 6-8) -- gap   Auto
+% R2:   [v]     [v]    [v]    [v]      ----- gap [dropdown] - (spans 6-8) -- gap   (Auto)
+% R3:   Overlap:ISI %: Budget:Dist:    ----- gap Prev    Pair #:  (empty)   gap   (Auto)
+% R4:   [v]     [v]    [v]    [v]      ----- gap Next    [v]      /0        gap   (Auto)
+autoLayout = uigridlayout(autoPanel,[4 10], ...
+    'ColumnWidth',{60, 75, 65, 65, 0, 28, 50, 30, 0, 75}, ...
+    'RowHeight',{'fit','fit','fit','fit'}, ...
+    'ColumnSpacing',10, ...
+    'RowSpacing',4, ...
+    'Padding',[5 5 5 5]);
+applyColorScheme(autoLayout, figColor);
+
+% --- Top half (rows 1-2): similarity-related parameters -----------
+% --- CCG peak/median ratio (col 1 top, directly above Overlap) ---
+% Lag-zero CCG peak must exceed autoCCGRatio times the median of
+% the off-zero bins for cleanup to fire on a candidate pair.
+% Paired with Overlap below so both coincidence-related gates
+% live in the leftmost column.
+lblAutoCCG = uilabel(autoLayout,'Text','CCG:',...
+    'FontWeight','bold','HorizontalAlignment','Left');
+lblAutoCCG.Layout.Row = 1;
+lblAutoCCG.Layout.Column = 1;
+applyColorScheme(lblAutoCCG, figColor);
+
+uiAutoCCG = uieditfield(autoLayout,'numeric','Value',autoCCGRatio, ...
+    'Limits',[0.5 10], ...
+    'Tooltip','CCG lag-0 peak / baseline-median ratio. Higher = stricter. Default 1.5.',...
+    'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
+    'ValueChangedFcn',@(ui,ev)setAutoCCGRatio(ui.Value));
+uiAutoCCG.Layout.Row = 2;
+uiAutoCCG.Layout.Column = 1;
+applyColorScheme(uiAutoCCG, figColor);
+
+lblAutoSim = uilabel(autoLayout,'Text','Similarity:',...
+    'FontWeight','bold','HorizontalAlignment','Left');
+lblAutoSim.Layout.Row = 1;
+lblAutoSim.Layout.Column = 2;
+applyColorScheme(lblAutoSim, figColor);
+
+uiAutoSim = uieditfield(autoLayout,'numeric','Value',autoSimVal, ...
+    'Limits',[0 1], ...
+    'Tooltip','Waveform similarity gate.',...
+    'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
+    'ValueChangedFcn',@(ui,ev)setAutoSimVal(ui.Value));
+uiAutoSim.Layout.Row = 2;
+uiAutoSim.Layout.Column = 2;
+applyColorScheme(uiAutoSim, figColor);
+
+lblAutoAmp = uilabel(autoLayout,'Text','Amp. Var.:',...
+    'FontWeight','bold','HorizontalAlignment','Left');
+lblAutoAmp.Layout.Row = 1;
+lblAutoAmp.Layout.Column = 3;
+applyColorScheme(lblAutoAmp, figColor);
+
+uiAutoAmp = uieditfield(autoLayout,'numeric','Value',autoAmpVal, ...
+    'Limits',[0 1], ...
+    'Tooltip','Max amplitude mismatch between two units. Lower = stricter.',...
+    'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
+    'ValueChangedFcn',@(ui,ev)setAutoAmpVal(ui.Value));
+uiAutoAmp.Layout.Row = 2;
+uiAutoAmp.Layout.Column = 3;
+applyColorScheme(uiAutoAmp, figColor);
+
+% --- PC Dist (col 4 top, above Dist) -----------------------------
+lblAutoPC = uilabel(autoLayout,'Text','PC Dist:',...
+    'FontWeight','bold','HorizontalAlignment','Left');
+lblAutoPC.Layout.Row = 1;
+lblAutoPC.Layout.Column = 4;
+applyColorScheme(lblAutoPC, figColor);
+
+uiAutoPC = uieditfield(autoLayout,'numeric','Value',autoPCVal, ...
+    'Limits',[0 5], ...
+    'Tooltip','Normalised PC shape distance gate. Lower = stricter.',...
+    'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
+    'ValueChangedFcn',@(ui,ev)setAutoPCVal(ui.Value));
+uiAutoPC.Layout.Row = 2;
+uiAutoPC.Layout.Column = 4;
+applyColorScheme(uiAutoPC, figColor);
+
+
+% Walker selector for the Auto panel. Two flavours of target:
+%   PAIR options (highlight TWO related units per click):
+%     * 'Merged'          -> autoMergedPrimary / autoMergedAbsorbed
+%     * 'Overlap removed' -> autoOverlapDroppedK / autoOverlapTriggerJ
+%   UNIT options (highlight ONE unit per click, by isolation class):
+%     * 'SUA+', 'SUA', 'MUA+', 'MUA' -> units of that isolation class.
+%     * 'NaN'                        -> dropped/unclassified units
+%                                       (groupList NaN or iso 'NA').
+% (CCG-cleaned pairs do not get their own walker entry -- the cleanup
+% phase only strips coincident spikes, it does not change unit
+% identity, so there is nothing to step through visually.)
+% Spans cols 5-7 on the top two rows so the dropdown sits exactly
+% on top of the Prev/Next + Pair# walker below.
+lblAutoPairType = uilabel(autoLayout,'Text','Pair type:',...
+    'FontWeight','bold','HorizontalAlignment','Left');
+lblAutoPairType.Layout.Row = 1;
+lblAutoPairType.Layout.Column = [6 8];
+applyColorScheme(lblAutoPairType, figColor);
+
+autoPairTypeItems = {'Merged','Overlap removed', ...
+                     'SUA+','SUA','MUA+','MUA','NaN'};
+% Make sure autoPairType matches one of the dropdown's items
+% (a stale value from an earlier build would otherwise throw when
+% uidropdown tries to apply it as Value).
+if ~ismember(autoPairType, autoPairTypeItems)
+    autoPairType = 'Merged';
+end
+ddAutoPairType = uidropdown(autoLayout, ...
+    'Items', autoPairTypeItems, ...
+    'Value', autoPairType, ...
+    'Tooltip','Walker target: pair classes step through pairs; isolation classes step through single units.', ...
+    'ValueChangedFcn', @(dd,ev) setAutoPairType(dd.Value));
+ddAutoPairType.Layout.Row = 2;
+ddAutoPairType.Layout.Column = [6 8];
+applyColorScheme(ddAutoPairType, figColor);
+
+% Auto button: rightmost column, spans all four rows so it reads as
+% the pipeline trigger rather than just another parameter cell.
+% Two-line label keeps the button compact while making the action
+% explicit ('Auto curation' instead of just 'Auto').
+btnAutoCurate = uibutton(autoLayout,'Text',sprintf('Auto\ncuration'),...
+    'Tooltip','Run automatic curation.',...
+    'ButtonPushedFcn',@(btn,ev)onAutoCurate());
+btnAutoCurate.Layout.Row = [1 4];
+btnAutoCurate.Layout.Column = 10;
+applyColorScheme(btnAutoCurate, figColor);
+
+% --- Bottom half (rows 3-4): drop / quality params + Dist ---------
+% Overlap sits in col 1 directly under CCG so the two
+% coincidence-related gates are paired top-to-bottom.
+lblAutoOverlap = uilabel(autoLayout,'Text','Overlap:',...
+    'FontWeight','bold','HorizontalAlignment','Left');
+lblAutoOverlap.Layout.Row = 3;
+lblAutoOverlap.Layout.Column = 1;
+applyColorScheme(lblAutoOverlap, figColor);
+
+uiAutoOverlap = uieditfield(autoLayout,'numeric','Value',autoOverlapFrac, ...
+    'Limits',[0 1], ...
+    'Tooltip','Drop a unit if this fraction of its spikes overlap with a neighbour. Lower = stricter.',...
+    'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
+    'ValueChangedFcn',@(ui,ev)setOverlapVal(ui.Value));
+uiAutoOverlap.Layout.Row = 4;
+uiAutoOverlap.Layout.Column = 1;
+applyColorScheme(uiAutoOverlap, figColor);
+
+lblAutoIsi = uilabel(autoLayout,'Text','ISI %:',...
+    'FontWeight','bold','HorizontalAlignment','Left');
+lblAutoIsi.Layout.Row = 3;
+lblAutoIsi.Layout.Column = 2;
+applyColorScheme(lblAutoIsi, figColor);
+
+uiAutoIsi = uieditfield(autoLayout,'numeric','Value',autoIsiVal, ...
+    'Limits',[0 100], ...
+    'Tooltip','Max ISI violation %% for the merged unit.',...
+    'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
+    'ValueChangedFcn',@(ui,ev)setAutoIsiVal(ui.Value));
+uiAutoIsi.Layout.Row = 4;
+uiAutoIsi.Layout.Column = 2;
+applyColorScheme(uiAutoIsi, figColor);
+
+lblAutoBudget = uilabel(autoLayout,'Text','Budget:',...
+    'FontWeight','bold','HorizontalAlignment','Left');
+lblAutoBudget.Layout.Row = 3;
+lblAutoBudget.Layout.Column = 3;
+applyColorScheme(lblAutoBudget, figColor);
+
+uiAutoBudget = uieditfield(autoLayout,'numeric','Value',autoIsiBudget, ...
+    'Limits',[1 10], ...
+    'Tooltip','Merged-ISI budget vs parents'' average. 1 = no slack.',...
+    'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
+    'ValueChangedFcn',@(ui,ev)setAutoBudgetVal(ui.Value));
+uiAutoBudget.Layout.Row = 4;
+uiAutoBudget.Layout.Column = 3;
+applyColorScheme(uiAutoBudget, figColor);
+
+% Dist sits in the rightmost bottom-half slot, mirroring the Auto
+% button position above it.
+lblAutoDist = uilabel(autoLayout,'Text','Dist (µm):',...
+    'FontWeight','bold','HorizontalAlignment','Left');
+lblAutoDist.Layout.Row = 3;
+lblAutoDist.Layout.Column = 4;
+applyColorScheme(lblAutoDist, figColor);
+
+uiAutoDist = uieditfield(autoLayout,'numeric','Value',autoDistVal, ...
+    'Limits',[0 range(ylocs)], ...
+    'Tooltip','Max y-distance (µm) between two units. Smaller = stricter.',...
+    'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
+    'ValueChangedFcn',@(ui,ev)setAutoDistVal(ui.Value));
+uiAutoDist.Layout.Row = 4;
+uiAutoDist.Layout.Column = 4;
+applyColorScheme(uiAutoDist, figColor);
+
+% Pair walker (mirrors the Similarity Processing panel's Next/Prev
+% buttons but iterates only over pairs the most recent Auto run
+% produced for the selected pair type). Sits under the dropdown:
+% Prev/Next stacked in col 6, Pair# label/edit stacked in col 7,
+% /total parked in col 8 row 4.
+if exist('Prev.png','file')
+    btnPrevAutoPair = uibutton(autoLayout, 'Icon','Prev.png', 'Text','',...
+        'ButtonPushedFcn',@(btn,ev)onSelectMergedPairs(-1), ...
+        'Tooltip','Previous Auto pair / unit. Ctrl+Up');
+else
+    btnPrevAutoPair = uibutton(autoLayout, 'Text','Prev',...
+        'ButtonPushedFcn',@(btn,ev)onSelectMergedPairs(-1), ...
+        'Tooltip','Previous Auto pair / unit. Ctrl+Up');
+end
+btnPrevAutoPair.Layout.Row = 3;
+btnPrevAutoPair.Layout.Column = 6;
+applyColorScheme(btnPrevAutoPair, figColor);
+
+if exist('Next.png','file')
+    btnNextAutoPair = uibutton(autoLayout, 'Icon','Next.png', 'Text','',...
+        'ButtonPushedFcn',@(btn,ev)onSelectMergedPairs(1), ...
+        'Tooltip','Next Auto pair / unit. Ctrl+Down');
+else
+    btnNextAutoPair = uibutton(autoLayout, 'Text','Next',...
+        'ButtonPushedFcn',@(btn,ev)onSelectMergedPairs(1), ...
+        'Tooltip','Next Auto pair / unit. Ctrl+Down');
+end
+btnNextAutoPair.Layout.Row = 4;
+btnNextAutoPair.Layout.Column = 6;
+applyColorScheme(btnNextAutoPair, figColor);
+
+% Counter title flips between '#Pair' and '#Unit' depending on
+% whether the dropdown is sitting on a pair-mode or unit-mode item.
+% Initialise it from autoPairType so a stale unit-class value
+% (re-loaded session, hot-reload) renders the right label even
+% before the user touches the dropdown.
+if any(strcmp(autoPairType, {'SUA+','SUA','MUA+','MUA','NaN'}))
+    lblAutoPairText = 'Unit #:';
+else
+    lblAutoPairText = 'Pair #:';
+end
+lblAutoPair = uilabel(autoLayout,'Text',lblAutoPairText,...
+    'FontWeight','bold','HorizontalAlignment','left',...
+    'Tooltip','Auto pair / unit walker. Step with Ctrl+Up and Ctrl+Down.');
+lblAutoPair.Layout.Row = 3;
+lblAutoPair.Layout.Column = 7;
+applyColorScheme(lblAutoPair, figColor);
+
+uifAutoPair = uieditfield(autoLayout,'Value','0','Editable','on',...
+    'Tooltip','Index of the displayed Auto pair / unit. Step with Ctrl+Up and Ctrl+Down.',...
+    'ValueChangedFcn',@(ui,ev)changeAutoPair(ui.Value));
+uifAutoPair.Layout.Row = 4;
+uifAutoPair.Layout.Column = 7;
+applyColorScheme(uifAutoPair, figColor);
+
+uifAutoPair2 = uieditfield(autoLayout,'Value','/0','Editable','off',...
+    'Tooltip','Total Auto pairs / units. Step with Ctrl+Up and Ctrl+Down.');
+uifAutoPair2.Layout.Row = 4;
+uifAutoPair2.Layout.Column = 8;
+applyColorScheme(uifAutoPair2, figColor);
+
 % criteria selection panel
 middlePanel = uipanel(leftGrid, 'title','Group Selection');
-middlePanel.Layout.Row = 3;
+middlePanel.Layout.Row = 4;
 middlePanel.Layout.Column = 1;
 applyColorScheme(middlePanel, figColor);
 
-middleButtonLayout = uigridlayout(middlePanel,[3 9], ...   
+middleButtonLayout = uigridlayout(middlePanel,[3 10], ...
     'ColumnWidth',{'.75x','.75x','.75x','1x','.75x','1.25x','1x','.5x','.75x','.75x'}, ...
     'RowHeight',{'fit','fit','fit'},...
     'ColumnSpacing',10, ...
@@ -388,7 +1000,7 @@ lblRateInc.Layout.Column = 1;
 applyColorScheme(lblRateInc, figColor);
 
 uifRate = uieditfield(middleButtonLayout,'numeric','Value',0,...
-    'Tooltip','Set min firing rate',...
+    'Tooltip','Min firing rate (Hz) for the Include filter.',...
     'ValueChangedFcn',@(ui,ev)setRateIncVal(ui.Value));
 uifRate.Layout.Row=2;
 uifRate.Layout.Column=1;
@@ -402,7 +1014,7 @@ lblISIInc.Layout.Column = 2;
 applyColorScheme(lblISIInc, figColor);
 
 uifISI = uieditfield(middleButtonLayout,'numeric','Value',ceil(max(preprocessed.isiViolation)),...
-    'Tooltip','Set max %ISI violation',...
+    'Tooltip','Max ISI violation %% for the Include filter.',...
     'ValueChangedFcn',@(ui,ev)setISIIncVal(ui.Value));
 uifISI.Layout.Row=2;
 uifISI.Layout.Column=2;
@@ -416,7 +1028,7 @@ lblSNRInc.Layout.Column = 3;
 applyColorScheme(lblSNRInc, figColor);
 
 uifSNR = uieditfield(middleButtonLayout,'numeric','Value',1,...
-    'Tooltip','Set min SNR (Amp. rel. to Thr.)',...
+    'Tooltip','Min SNR for the Include filter.',...
     'ValueChangedFcn',@(ui,ev)setSNRIncVal(ui.Value));
 uifSNR.Layout.Row=2;
 uifSNR.Layout.Column=3;
@@ -432,7 +1044,7 @@ applyColorScheme(lblPlarityInc, figColor);
 polarityDD = uidropdown(middleButtonLayout,...
     'Items',{'All','Main Neg.', 'Main Pos.', 'All Pos.', '1 Chan Neg.'},...
     'Value','All',...
-    'Tooltip','Select spike polarity',...
+    'Tooltip','Spike-polarity filter for Include.',...
     'ValueChangedFcn',@(dd,ev)updatePolarity(dd.Value));
 polarityDD.Layout.Row = 2;
 polarityDD.Layout.Column = 4;
@@ -447,7 +1059,7 @@ applyColorScheme(lblTglVis, figColor);
 
 chkTogVis = uicheckbox(middleButtonLayout,'Text','',...
     'FontWeight','bold',...
-    'Tooltip','Toggle Vis of selected units',...
+    'Tooltip','Toggle Vis on every selected unit.',...
     'Value',false,...
     'ValueChangedFcn',@(cb,ev)onToggleVis(cb.Value));
 chkTogVis.Layout.Row = 2;
@@ -455,7 +1067,7 @@ chkTogVis.Layout.Column = 5;
 applyColorScheme(chkTogVis, figColor);
 
 chkInclusion = uicheckbox(middleButtonLayout,'Text','Include',...
-    'Tooltip',sprintf('Include units that\n pass all criteria.'),...
+    'Tooltip','Tick units that pass all filters above.',...
     'FontWeight','bold',...
     'Value',false,...
     'ValueChangedFcn',@(cb,ev)onINCEXC(cb.Value,1));
@@ -466,7 +1078,7 @@ incChan =[];
 exChan = [];
 
 chkExclusion = uicheckbox(middleButtonLayout,'Text','Exclude',...
-    'Tooltip',sprintf('Exclude units that\n do not pass all criteria.'),...
+    'Tooltip','Tick units that fail any filter above.',...
     'FontWeight','bold',...
     'Value',false,...
     'ValueChangedFcn',@(cb,ev)onINCEXC(cb.Value,0));
@@ -476,18 +1088,18 @@ applyColorScheme(chkExclusion, figColor);
 
 
 btnDeselectUnit = uibutton(middleButtonLayout, 'Text','Deselect',...
-    'Tooltip',sprintf('Deselect all selected units.'),...
-    'ButtonPushedFcn',@(btn,ev)onDeselect, 'Tooltip', sprintf('Deselect all selected units: \n Ctrl+Shift+H or Cmd+Shift+H'));
+    'ButtonPushedFcn',@(btn,ev)onDeselect, ...
+    'Tooltip','Untick all selected units. Ctrl+H');
 btnDeselectUnit.Layout.Row=2;
 btnDeselectUnit.Layout.Column = 7;
 applyColorScheme(btnDeselectUnit, figColor);
 
 if exist('Next.png','file')
     btnNextUnit = uibutton(middleButtonLayout, 'Icon','Next.png', 'Text','',...
-        'ButtonPushedFcn',@(btn,ev)onSelectUnit(1), 'Tooltip', sprintf('Next unit: \n Ctrl+Shift+N or Cmd+Shift+N'));
+        'ButtonPushedFcn',@(btn,ev)onSelectUnit(1), 'Tooltip','Next unit. Ctrl+N');
 else
     btnNextUnit = uibutton(middleButtonLayout, 'Text','Next',...
-        'ButtonPushedFcn',@(btn,ev)onSelectUnit(1), 'Tooltip', sprintf('Next unit: \n Ctrl+Shift+N or Cmd+Shift+N'));
+        'ButtonPushedFcn',@(btn,ev)onSelectUnit(1), 'Tooltip','Next unit. Ctrl+N');
 end
 btnNextUnit.Layout.Row = 2;
 btnNextUnit.Layout.Column = 8;
@@ -495,10 +1107,10 @@ applyColorScheme(btnNextUnit, figColor);
 
 if exist('Prev.png','file')
     btnPrevUnit = uibutton(middleButtonLayout, 'Icon','Prev.png', 'Text','',...
-        'ButtonPushedFcn',@(btn,ev)onSelectUnit(-1), 'Tooltip', sprintf('Prev. unit: \n Ctrl+Shift+P or Cmd+Shift+P'));
+        'ButtonPushedFcn',@(btn,ev)onSelectUnit(-1), 'Tooltip','Previous unit. Ctrl+P');
 else
     btnPrevUnit = uibutton(middleButtonLayout, 'Text','Previous',...
-        'ButtonPushedFcn',@(btn,ev)onSelectUnit(-1), 'Tooltip', sprintf('Prev. unit: \n Ctrl+Shift+P or Cmd+Shift+P'));
+        'ButtonPushedFcn',@(btn,ev)onSelectUnit(-1), 'Tooltip','Previous unit. Ctrl+P');
 end
 btnPrevUnit.Layout.Row = 1;
 btnPrevUnit.Layout.Column = 8;
@@ -523,13 +1135,29 @@ uifUnit2.Layout.Column=10;
 applyColorScheme(uifUnit2, figColor);
 
 
-% Add pagination controls
+% Pagination row 3 layout (10-col middleButtonLayout):
+%   Col 1   First (⏮)
+%   Cols 2-3 Prev (◀)
+%   Col 4   "Size:" label
+%   Col 5   page-size edit
+%   Col 6   editable current-page number
+%   Col 7   "/Y" total-pages label
+%   Cols 8-9 Next (▶)
+%   Col 10  Last (⏭)
 if totalPages > 1
-    lblPage = uilabel(middleButtonLayout,'Text',sprintf('Page: %d/%d', currentPage, totalPages),...
-        'FontWeight','bold','HorizontalAlignment','center');
-    lblPage.Layout.Row = 3;
-    lblPage.Layout.Column = 6;
-    applyColorScheme(lblPage, figColor);
+    btnFirstPage = uibutton(middleButtonLayout,'Text','⏮',...
+        'ButtonPushedFcn',@(btn,ev)goToPage(1), ...
+        'Tooltip','First page.');
+    btnFirstPage.Layout.Row = 3;
+    btnFirstPage.Layout.Column = 1;
+    applyColorScheme(btnFirstPage, figColor);
+
+    btnPrevPage = uibutton(middleButtonLayout,'Text','◀ Prev',...
+        'ButtonPushedFcn',@(btn,ev)onChangePage(-1), ...
+        'Tooltip','Previous page. Ctrl+Left');
+    btnPrevPage.Layout.Row = 3;
+    btnPrevPage.Layout.Column = [2 3];
+    applyColorScheme(btnPrevPage, figColor);
 
     lblPageSize = uilabel(middleButtonLayout,'Text','Size:',...
         'FontWeight','bold','HorizontalAlignment','center');
@@ -538,22 +1166,45 @@ if totalPages > 1
     applyColorScheme(lblPageSize, figColor);
 
     uifPageSize = uieditfield(middleButtonLayout,'Value','50',...
+        'Tooltip','Number of unit rows shown per page.', ...
         'ValueChangedFcn',@(ui,ev)changeuifPageSize(ui.Value));
     uifPageSize.Layout.Row=3;
     uifPageSize.Layout.Column=5;
     applyColorScheme(uifPageSize, figColor);
 
-    btnPrevPage = uibutton(middleButtonLayout,'Text','◀ Prev Page',...
-        'ButtonPushedFcn',@(btn,ev)onChangePage(-1),'Tooltip', sprintf('Prev. unit: \n Ctrl+Shift+Left or Cmd+Shift+Left'));
-    btnPrevPage.Layout.Row = 3;
-    btnPrevPage.Layout.Column = [1 3];
-    applyColorScheme(btnPrevPage, figColor);
+    % Editable current page. The total ("/Y") sits next to it as a
+    % label so only the page number itself is user-typeable.
+    uifPageNum = uieditfield(middleButtonLayout,'numeric', ...
+        'Value', currentPage, ...
+        'Limits',[1 max(1,totalPages)], ...
+        'LowerLimitInclusive','on', 'UpperLimitInclusive','on', ...
+        'RoundFractionalValues','on', ...
+        'Tooltip','Jump to page.', ...
+        'ValueChangedFcn', @(ui,ev) goToPage(ui.Value));
+    uifPageNum.Layout.Row = 3;
+    uifPageNum.Layout.Column = 6;
+    applyColorScheme(uifPageNum, figColor);
 
-    btnNextPage = uibutton(middleButtonLayout,'Text','Next Page ▶',...
-        'ButtonPushedFcn',@(btn,ev)onChangePage(1),'Tooltip', sprintf('Prev. unit: \n Ctrl+Shift+Right or Cmd+Shift+Right'));
+    lblPage = uilabel(middleButtonLayout, ...
+        'Text', sprintf('/%d', totalPages), ...
+        'FontWeight','bold','HorizontalAlignment','left');
+    lblPage.Layout.Row = 3;
+    lblPage.Layout.Column = 7;
+    applyColorScheme(lblPage, figColor);
+
+    btnNextPage = uibutton(middleButtonLayout,'Text','Next ▶',...
+        'ButtonPushedFcn',@(btn,ev)onChangePage(1), ...
+        'Tooltip','Next page. Ctrl+Right');
     btnNextPage.Layout.Row = 3;
-    btnNextPage.Layout.Column = [7 9];
+    btnNextPage.Layout.Column = [8 9];
     applyColorScheme(btnNextPage, figColor);
+
+    btnLastPage = uibutton(middleButtonLayout,'Text','⏭',...
+        'ButtonPushedFcn',@(btn,ev)goToPage(totalPages), ...
+        'Tooltip','Last page.');
+    btnLastPage.Layout.Row = 3;
+    btnLastPage.Layout.Column = 10;
+    applyColorScheme(btnLastPage, figColor);
 end
 
 lastUnit = 0;
@@ -563,7 +1214,7 @@ checkPanel = uipanel(leftGrid, ...
     'Title','Groups:', ...
     'BackgroundColor',figColor,...
     'Scrollable','on');
-checkPanel.Layout.Row = 4;
+checkPanel.Layout.Row = 5;
 checkPanel.Layout.Column = 1;
 applyColorScheme(checkPanel, figColor);
 
@@ -594,7 +1245,7 @@ lblDetectablity       = gobjects(numGroups,1);
 lblISIViolation       = gobjects(numGroups,1);
 
 % Object for multiple plot
-plotItemsNames  = {'Amplitude','Waveform', 'CCG', 'ISI', 'Density', 'PCs','Trace', 'Features'};
+plotItemsNames  = {'Amplitude','Waveform', 'CCG', 'ISI', 'Density', 'Amp Dist', 'PCs', 'Trace', 'Features'};
 multipleSpinnerObj = gobjects(length(plotItemsNames),1);
 multiplePlotObj = gobjects(length(plotItemsNames),1);
 plotScaleFactor = ones(1, length(plotItemsNames));
@@ -704,7 +1355,7 @@ plotButtonPanel.Layout.Row = 1;
 plotButtonPanel.Layout.Column = 1;
 applyColorScheme(plotButtonPanel, figColor);
 
-plotButtonGrid = uigridlayout(plotButtonPanel,[3 12],...
+plotButtonGrid = uigridlayout(plotButtonPanel,[3 14],...
     'ColumnWidth',{'1x','1x','1x','1x','1x','1x','1x','1x','1x','1x','1x', '1x','1x','fit'},...
     'RowHeight',{'fit','fit','fit'},...
     'Padding',[0 0 0 0],...
@@ -713,8 +1364,8 @@ plotButtonGrid = uigridlayout(plotButtonPanel,[3 12],...
 applyColorScheme(plotButtonGrid, figColor);
 
 plotTypeDD = uidropdown(plotButtonGrid,...
-    'Items',{'Amplitude','Waveform', 'CCG', 'ISI', 'Density', 'PCs','Trace', 'Features','Multiple'},...
-    'Tooltip',sprintf('Select plot type, \n select multiple for multiple types'),...
+    'Items',{'Amplitude','Waveform', 'CCG', 'ISI', 'Density', 'Amp Dist', 'PCs','Trace','Features','Multiple'},...
+    'Tooltip','Select a plot, or Multiple to show several at once.',...
     'Value','Trace',...
     'ValueChangedFcn',@(dd,ev)updatePlotType(dd.Value));
 plotTypeDD.Layout.Row = 2;
@@ -726,7 +1377,7 @@ lastPlotted = plotType;
 
 plotFilterTypeDD = uidropdown(plotButtonGrid,...
     'Items',{'filtered','raw'},...
-    'Tooltip',sprintf('Select Filter types'),...
+    'Tooltip','Bandpass-filtered or raw signal.',...
     'Value','filtered',...
     'ValueChangedFcn',@(dd,ev)updatePlotFilterType(dd.Value));
 plotFilterTypeDD.Layout.Row = 2;
@@ -737,7 +1388,7 @@ plotFilterType = 'filtered';
 
 chTypeDropdown = uidropdown(plotButtonGrid,...
     'Items',{'Config' ,'0', '1', '2', '3', '4', '5', '6', '7','8','9','10'},...
-    'Tooltip',sprintf('Number of channels to show \n before/after the main channel.'),...
+    'Tooltip','How many channels above/below the main one.',...
     'Value','Config');
 chTypeDropdown.Layout.Row = 2;
 chTypeDropdown.Layout.Column = 3;
@@ -746,7 +1397,7 @@ chTypeDropdown.ValueChangedFcn      = @(sld,ev)updateChType(sld.Value);
 
 numWaveformDropdown = uidropdown(plotButtonGrid,...
     'Items',{'1','5','10','25','50','100','1000'},...
-    'Tooltip',sprintf('Number of waveforms to show.'),...
+    'Tooltip','Max waveforms drawn per unit.',...
     'Value','25');
 numWaveformDropdown.Layout.Row = 2;
 numWaveformDropdown.Layout.Column = 4;
@@ -757,7 +1408,7 @@ numWaveforms = 25;
 
 spikeWaveDurDD = uidropdown(plotButtonGrid,...
     'Items',{'Config','0.25','0.5','1','1.5','2'},...
-    'Tooltip',sprintf('Select the waveform duration.'),...
+    'Tooltip','Half-window of waveform plot (ms).',...
     'Value','Config',...
     'ValueChangedFcn',@(dd,ev)updateWaveDur(dd.Value));
 spikeWaveDurDD.Layout.Row = 2;
@@ -766,7 +1417,7 @@ applyColorScheme(spikeWaveDurDD, figColor);
 
 meanWaveformDD = uidropdown(plotButtonGrid,...
     'Items',{'Individual','Mean'},...
-    'Tooltip',sprintf('Select to plot the mean or \n individual waveforms.'),...
+    'Tooltip','Show every spike or just the mean.',...
     'Value','Individual',...
     'ValueChangedFcn',@(dd,ev)updateWavetype(dd.Value));
 meanWaveformDD.Layout.Row = 2;
@@ -776,7 +1427,7 @@ plotMean = 0;
 
 ccgLagDD = uidropdown(plotButtonGrid,...
     'Items',{'25','50','75','100','200'},...
-    'Tooltip',sprintf('Select CCG max time lag (ms).'),...
+    'Tooltip','CCG half-window (ms).',...
     'Value','100',...
     'ValueChangedFcn',@(dd,ev)updateCCGLag(dd.Value));
 ccgLagDD.Layout.Row = 2;
@@ -785,7 +1436,7 @@ applyColorScheme(ccgLagDD, figColor);
 
 ccgSmoothDD = uidropdown(plotButtonGrid,...
     'Items',{'0','1','2', '5', '10'},...
-    'Tooltip',sprintf('Smoothing factor for \n CCG and density plots.'),...
+    'Tooltip','Boxcar smoothing for CCG / density. 0 = none.',...
     'Value','0',...
     'ValueChangedFcn',@(dd,ev)updateCCGSmoothN(dd.Value));
 ccgSmoothDD.Layout.Row = 2;
@@ -794,41 +1445,84 @@ applyColorScheme(ccgSmoothDD, figColor);
 
 isiThrDD = uidropdown(plotButtonGrid,...
     'Items',{'1','2','3','4','5'},...
-    'Tooltip',sprintf('Select the thereshold to \n measure ISI violation.'),...
+    'Tooltip','ISI violation window (ms).',...
     'Value','1',...
     'ValueChangedFcn',@(dd,ev)updateISIThr(dd.Value));
 isiThrDD.Layout.Row = 2;
 isiThrDD.Layout.Column = 9;
 applyColorScheme(isiThrDD, figColor);
 
-ampSlider = uislider(plotButtonGrid,'Orientation','horizontal','Value', 1,'MajorTicksMode','auto', 'Limits',[0 10]);
+ampSlider = uislider(plotButtonGrid,'Orientation','horizontal','Value', 5,'MajorTicksMode','auto', 'Limits',[0 10], ...
+    'Tooltip','Waveform vertical scale.');
 ampSlider.MajorTicks = [0 10];
 ampSlider.Layout.Row = 2;
 ampSlider.Layout.Column = 10;
 applyColorScheme(ampSlider, figColor);
 ampSlider.ValueChangedFcn      = @(sld,ev)updateScale(sld.Value);
 
-lineWidthSlider = uislider(plotButtonGrid,'Orientation','horizontal','Value', 1,'MajorTicksMode','auto', 'Limits',[0 5]);
+lineWidthSlider = uislider(plotButtonGrid,'Orientation','horizontal','Value', 0.15,'MajorTicksMode','auto', 'Limits',[0 5], ...
+    'Tooltip','Waveform line thickness.');
 lineWidthSlider.MajorTicks = [0 5];
 lineWidthSlider.Layout.Row = 2;
 lineWidthSlider.Layout.Column = 11;
 applyColorScheme(lineWidthSlider, figColor);
 lineWidthSlider.ValueChangedFcn      = @(sld,ev)updateLineWidth(sld.Value);
-lineWidth = 1;
+lineWidth = 0.15;
 
-alphaSlider = uislider(plotButtonGrid,'Orientation','horizontal','Value', 1,'MajorTicksMode','auto', 'Limits',[0 1]);
+alphaSlider = uislider(plotButtonGrid,'Orientation','horizontal','Value', 0.5,'MajorTicksMode','auto', 'Limits',[0 1], ...
+    'Tooltip','Trace opacity.');
 alphaSlider.MajorTicks = [0 1];
 alphaSlider.Layout.Row = 2;
 alphaSlider.Layout.Column = 12;
 applyColorScheme(alphaSlider, figColor);
 alphaSlider.ValueChangedFcn      = @(sld,ev)updateAlphaLevel(sld.Value);
-alphaLevel = 1;
+alphaLevel = 0.5;
+
+chkOverlay = uicheckbox(plotButtonGrid, 'Text','', ...
+    'Value', false, ...
+    'Tooltip','Overlay all groups at the same location.', ...
+    'ValueChangedFcn', @(cb,ev)updatePlotOverlay(cb.Value));
+chkOverlay.Layout.Row = 2;
+chkOverlay.Layout.Column = 13;
+applyColorScheme(chkOverlay, figColor);
+plotOverlay = false;
+
+lblOverlay = uilabel(plotButtonGrid,'Text','Overlay:',...
+    'HorizontalAlignment','left');
+lblOverlay.Layout.Row = 1;
+lblOverlay.Layout.Column = 13;
+applyColorScheme(lblOverlay, figColor);
 
 btnExportFig = uibutton(plotButtonGrid,'Text','Export Fig.',...
-    'ButtonPushedFcn',@(btn,ev)onExportFig());
+    'ButtonPushedFcn',@(btn,ev)onExportFig(), ...
+    'Tooltip','Export the main plot as a vector file.');
 btnExportFig.Layout.Row = 2;
-btnExportFig.Layout.Column = 13;
+btnExportFig.Layout.Column = 14;
 applyColorScheme(btnExportFig, figColor);
+
+% Open the curation table in a separate window. The table used to
+% live as a plot type / multi-plot panel, which meant every
+% selection click rebuilt it (and lost the user's column sort).
+% In a standalone uifigure it survives across selection changes
+% and can be refreshed on demand.
+% Shortcut help button -- pops the same dialog as Ctrl+/.
+% Sits underneath the Overlay checkbox (column 13) so it's
+% discoverable without the user having to know the keyboard
+% shortcut, and it slots into the empty cell that already
+% existed in the third row of the plot toolbar.
+btnShortcutHelp = uibutton(plotButtonGrid,'Text','?',...
+    'ButtonPushedFcn',@(btn,ev) showShortcutsHelp(), ...
+    'Tooltip','Show the list of keyboard shortcuts. Ctrl+/');
+btnShortcutHelp.Layout.Row = 3;
+btnShortcutHelp.Layout.Column = 13;
+applyColorScheme(btnShortcutHelp, figColor);
+
+btnTableWindow = uibutton(plotButtonGrid,'Text','Open table',...
+    'ButtonPushedFcn',@(btn,ev) openTableWindow(), ...
+    'Tooltip','Open the curation table in a standalone window.');
+btnTableWindow.Layout.Row = 3;
+btnTableWindow.Layout.Column = 14;
+applyColorScheme(btnTableWindow, figColor);
 
 % labels for buttons
 lblplotType = uilabel(plotButtonGrid,'Text','Plot Type:',...
@@ -906,12 +1600,74 @@ applyColorScheme(lblAlphaLvl, figColor);
 exportFormatDD = uidropdown(plotButtonGrid,...
     'Items',{'Image','Vector'},...
     'Value','Image',...
+    'Tooltip','Export format: raster image or vector.',...
     'ValueChangedFcn',@(dd,ev)updateExportFormat(dd.Value));
 exportFormatDD.Layout.Row = 1;
-exportFormatDD.Layout.Column = 13;
+exportFormatDD.Layout.Column = 14;
 applyColorScheme(exportFormatDD, figColor);
 
 exportType = 'Image';
+
+% Apply persistent user prefs to the just-built widgets. Each block
+% is guarded so a missing / corrupt field falls back to the default.
+if ~isempty(fieldnames(loadedPrefs))
+    try
+        if isfield(loadedPrefs,'plotType') && any(strcmpi(loadedPrefs.plotType, plotTypeDD.Items))
+            plotTypeDD.Value = loadedPrefs.plotType;
+            plotType = loadedPrefs.plotType;
+        end
+        if isfield(loadedPrefs,'plotFilterType') && any(strcmpi(loadedPrefs.plotFilterType, plotFilterTypeDD.Items))
+            plotFilterTypeDD.Value = loadedPrefs.plotFilterType;
+            plotFilterType = loadedPrefs.plotFilterType;
+        end
+        if isfield(loadedPrefs,'numWaveforms') && ismember(num2str(loadedPrefs.numWaveforms), numWaveformDropdown.Items)
+            numWaveformDropdown.Value = num2str(loadedPrefs.numWaveforms);
+            numWaveforms = loadedPrefs.numWaveforms;
+        end
+        if isfield(loadedPrefs,'plotMean') && ismember(loadedPrefs.plotMean, [0 1])
+            plotMean = loadedPrefs.plotMean;
+            if plotMean == 1
+                meanWaveformDD.Value = 'Mean';
+            else
+                meanWaveformDD.Value = 'Individual';
+            end
+        end
+        if isfield(loadedPrefs,'plotOverlay')
+            plotOverlay = logical(loadedPrefs.plotOverlay);
+            chkOverlay.Value = plotOverlay;
+        end
+        if isfield(loadedPrefs,'ccgLag') && ismember(num2str(loadedPrefs.ccgLag), ccgLagDD.Items)
+            ccgLagDD.Value = num2str(loadedPrefs.ccgLag);
+            ccgLag = loadedPrefs.ccgLag;
+        end
+        if isfield(loadedPrefs,'smoothN') && ismember(num2str(loadedPrefs.smoothN), ccgSmoothDD.Items)
+            ccgSmoothDD.Value = num2str(loadedPrefs.smoothN);
+            smoothN = loadedPrefs.smoothN;
+        end
+        if isfield(loadedPrefs,'thresholdISI') && ismember(num2str(loadedPrefs.thresholdISI), isiThrDD.Items)
+            isiThrDD.Value = num2str(loadedPrefs.thresholdISI);
+            thresholdISI = loadedPrefs.thresholdISI;
+        end
+        if isfield(loadedPrefs,'ampScale') && isfinite(loadedPrefs.ampScale)
+            ampScale = loadedPrefs.ampScale;
+            ampSlider.Value = max(min(ampScale, ampSlider.Limits(2)), ampSlider.Limits(1));
+        end
+        if isfield(loadedPrefs,'lineWidth') && isfinite(loadedPrefs.lineWidth)
+            lineWidth = loadedPrefs.lineWidth;
+            lineWidthSlider.Value = max(min(lineWidth, lineWidthSlider.Limits(2)), lineWidthSlider.Limits(1));
+        end
+        if isfield(loadedPrefs,'alphaLevel') && isfinite(loadedPrefs.alphaLevel)
+            alphaLevel = loadedPrefs.alphaLevel;
+            alphaSlider.Value = max(min(alphaLevel, alphaSlider.Limits(2)), alphaSlider.Limits(1));
+        end
+        if isfield(loadedPrefs,'exportType') && any(strcmpi(loadedPrefs.exportType, exportFormatDD.Items))
+            exportFormatDD.Value = loadedPrefs.exportType;
+            exportType = loadedPrefs.exportType;
+        end
+    catch
+        % Any pref restoration failure is non-fatal -- defaults stand.
+    end
+end
 
 %% Lower right pannels, Scrollers
 xSlider = uislider(bottomRightGrid,'Value',0,...
@@ -928,7 +1684,7 @@ applyColorScheme(lblXAmpScale, figColor);
 
 xStepDropdown = uidropdown(bottomRightGrid,...
     'Items',{'0.001','0.01','0.1','1','2','5','10','100','1000','full'},...
-    'Tooltip',sprintf('Window size for plots.'),...
+    'Tooltip','Time-window length (s). ''full'' = whole recording.',...
     'Value','0.1');
 xStepDropdown.Layout.Row = 5;
 xStepDropdown.Layout.Column = 3;
@@ -951,7 +1707,7 @@ applyColorScheme(ySlider, figColor);
 channelValues = arrayfun(@num2str, channelValues, 'UniformOutput', false);
 yStepDropdown = uidropdown(bottomRightGrid,...
     'Items',[{'full'}, channelValues],...
-    'Tooltip',sprintf('Range for channel visualization.'),...
+    'Tooltip','Channels in the vertical viewport.',...
     'Value','full');
 yStepDropdown.Layout.Row = 2;
 yStepDropdown.Layout.Column = 1;
@@ -985,7 +1741,7 @@ xStepVal     = 0.1;
 yWindowStart = 1;
 yWindowEnd   = numChannels;
 yStepVal     = numChannels;
-ampScale     = 1;
+ampScale     = 5;
 
 
 
@@ -996,7 +1752,7 @@ normalizeTimeAmp();
 refreshLabels();
 
 %% =============== CALLBACKS ===============
-    function keyPressHandler(~, event)
+    function keyPressHandler(src, event)
         persistent lastTime lastKey lastModifiers
         if isempty(lastTime)
             lastTime = datetime('now');
@@ -1012,24 +1768,142 @@ refreshLabels();
         lastKey = event.Key;
         lastModifiers = event.Modifier;
 
-        if (ismember('control', event.Modifier) || ismember('command', event.Modifier)) ...
-                && ismember('shift', event.Modifier)
+        % Unmodified Space inside the table window toggles the
+        % focused unit's Vis/Select pair. We only fire when the
+        % event came from the table figure -- pressing Space in
+        % the main GUI shouldn't fight with text-entry widgets.
+        if isempty(event.Modifier) && strcmpi(event.Key, 'space')
+            if ~isempty(tableFigure) && isgraphics(tableFigure) && ...
+                    isequal(src, tableFigure)
+                toggleTableFocusedSelection();
+            end
+            return;
+        end
+
+        % Curation shortcuts fire on the Control key alone (no Cmd,
+        % no Alt/Option, no Shift). Mac users press the dedicated
+        % "control" / ⌃ key; Windows/Linux users press Ctrl. The
+        % same key name on every platform.
+        % Letters are mnemonic (D=Delete, M=Merge, T=spliT,
+        % K=isolation tier, U=Undo, R=Reset, L=Limit, H=deselect,
+        % E=Edit notes, S=Save, P/N=Prev/Next unit).
+        if ismember('control', event.Modifier) ...
+                && ~ismember('command', event.Modifier) ...
+                && ~ismember('alt', event.Modifier) ...
+                && ~ismember('shift', event.Modifier)
+            % Track whether this keystroke actually mutated the
+            % curation state. Only mutating actions need a full
+            % table rebuild; navigation / help / save / bare-Ctrl
+            % auto-repeat events do not -- and rebuilding for
+            % those would silently throw away the user's column
+            % sort. Bare-modifier events (event.Key = 'control')
+            % don't match any case and leave dataChanged false,
+            % which is exactly what stops them from re-rendering
+            % the standalone table.
+            dataChanged = false;
             switch lower(event.Key)
-                case 'r', onReset()
-                case 'uparrow', onSelectSimilarPairs(-1)
-                case 'downarrow', onSelectSimilarPairs(1)
+                case 'r', onReset();              dataChanged = true;
+                case 'uparrow',   onSelectMergedPairs(-1)   % Auto walker prev
+                case 'downarrow', onSelectMergedPairs(1)    % Auto walker next
+                case {'leftbracket','open_bracket'}, onSelectSimilarPairs(-1)  % Similarity walker prev
+                case {'rightbracket','close_bracket'}, onSelectSimilarPairs(1) % Similarity walker next
                 case 'leftarrow', onChangePage(-1)
                 case 'rightarrow', onChangePage(1)
                 case 'p', onSelectUnit(-1)
                 case 'n', onSelectUnit(1)
                 case 's', onSave()
-                case 'd', onRemove()
-                case 'm', onMerge()
-                case 'i', onMUA()
-                case 'u', onUndo()
-                case 'l', onAutoCut()
+                case 'd', onRemove();             dataChanged = true;
+                case 'm', onMerge();              dataChanged = true;
+                case 'k', onMUA();                dataChanged = true;
+                case 'u', onUndo();               dataChanged = true;
+                case 'l', onAutoCut();            dataChanged = true;
                 case 'h', onDeselect()
+                case 't', onSplit();              dataChanged = true;   % T = spliT
+                case 'e', onEditNotes();          dataChanged = true;   % E = Edit notes
+                case 'slash', showShortcutsHelp()    % Ctrl+/ (also '?')
+                case 'questionmark', showShortcutsHelp()
             end
+            % Repaint selection colours on the standalone table so
+            % shortcuts that change which units are ticked
+            % (P/N walker steps, walker arrows, Deselect) update
+            % the row tinting without rebuilding -- preserving
+            % the user's column sort. Full rebuild is reserved
+            % for actions that mutate the underlying data.
+            if dataChanged && ~isempty(tableFigure) && isgraphics(tableFigure) && ...
+                    isequal(src, tableFigure)
+                try, refreshTableWindow(); catch, end
+            elseif ~isempty(tableHandle) && isgraphics(tableHandle)
+                try, paintSelectedTableRows(); catch, end
+            end
+        end
+    end
+
+    function toggleTableFocusedSelection()
+        % Helper for the Space key. Reads the currently selected
+        % cell in the standalone table, looks up the unit at that
+        % row, and runs the Vis/Select toggle. Re-paints the row
+        % colour and triggers a plot refresh so the rest of the
+        % GUI tracks the change.
+        if isempty(tableHandle) || ~isgraphics(tableHandle), return; end
+        sel = tableHandle.Selection;
+        if isempty(sel), return; end
+        if size(sel, 2) >= 2
+            row = sel(1, 1);
+        elseif numel(sel) >= 1
+            row = sel(1);
+        else
+            return;
+        end
+        if ~isfinite(row) || row < 1, return; end
+        if isa(tableHandle.Data, 'table')
+            if row > height(tableHandle.Data), return; end
+            unitIdx = double(tableHandle.Data{row, 1});
+        else
+            if row > size(tableHandle.Data, 1), return; end
+            v = tableHandle.Data{row, 1};
+            if isnumeric(v)
+                unitIdx = double(v);
+            else
+                unitIdx = str2double(v);
+            end
+        end
+        toggleUnitSelect(unitIdx);
+        try, paintSelectedTableRows(); catch, end
+        try, plotOption(); catch, end
+    end
+
+    function showShortcutsHelp()
+        % Centralised reference for every keyboard shortcut wired into
+        % the GUI. Triggered by Ctrl+? (or "/"). All shortcuts use
+        % the Control key as the sole modifier (Mac users press
+        % the dedicated "control" / ⌃ key, separate from Cmd) so
+        % we don't collide with macOS Cmd+Shift+letter bindings.
+        msg = sprintf([ ...
+            'Keyboard shortcuts (Ctrl + key):\n\n', ...
+            '  D    Remove selected units (Delete)\n', ...
+            '  M    Merge selected units\n', ...
+            '  T    Split selected unit (PCA + GMM)\n', ...
+            '  K    Cycle isolation tier of selected units\n', ...
+            '  U    Undo selected units (also dissolves merge group)\n', ...
+            '  R    Reset every edit (with confirmation)\n', ...
+            '  L    Apply Limit (auto-trim) to selected units\n', ...
+            '  E    Edit note for the radio-selected unit\n', ...
+            '  H    Deselect every selected unit\n', ...
+            '  N    Select next unit\n', ...
+            '  P    Select previous unit\n', ...
+            '  S    Save curated results\n', ...
+            '  Up   / Down    Walk previous / next Auto pair (or unit)\n', ...
+            '  [    / ]       Walk previous / next similar pair\n', ...
+            '  Left / Right   Walk previous / next page\n', ...
+            '  ?    Show this list\n\n', ...
+            'Inside the standalone Curation Table window:\n', ...
+            '  Space   Toggle Vis/Select for the focused row\n', ...
+            '  Click   Set the focused row as the merge target\n', ...
+            '  All Ctrl+key shortcuts above also work here.\n']);
+        try
+            uialert(parentFig, msg, 'Keyboard shortcuts', 'Icon', 'info');
+        catch
+            disp(msg);
         end
     end
 
@@ -1039,13 +1913,43 @@ refreshLabels();
         totalPages = ceil(numGroups/PAGE_SIZE);
         onChangePage(0);
     end
+
+    function goToPage(target)
+        % Jump straight to a specific page. Used by First / Last
+        % buttons and the editable page number field. Clamps to
+        % [1, totalPages] so a typo can't crash the navigation.
+        if isempty(target) || ~isfinite(target), return; end
+        target = round(target);
+        if target < 1, target = 1; end
+        if target > totalPages, target = totalPages; end
+        currentPage = target;
+        onChangePage(0);
+    end
+
 % Function to change page in pagination
     function onChangePage(direction)
+        % Bail out if the main figure has been closed but a callback
+        % (e.g. the table window's keyboard handler) still fires.
+        % Without this, uigridlayout(checkPanel,...) below crashes
+        % with "'Parent' cannot be set to a deleted object" when
+        % checkPanel was destroyed alongside parentFig.
+        if isempty(checkPanel) || ~isgraphics(checkPanel) || ~isvalid(checkPanel)
+            return;
+        end
         newPage = currentPage + direction;
         if newPage >= 1 && newPage <= totalPages
             currentPage = newPage;
-            if exist('lblPage', 'var')
-                lblPage.Text = sprintf('Page: %d/%d', currentPage, totalPages);
+            % Keep the editable page-number field and the "/Y" total
+            % label in sync no matter how the page changed (button
+            % click, keyboard shortcut, programmatic call).
+            if exist('lblPage', 'var') && isvalid(lblPage)
+                lblPage.Text = sprintf('/%d', totalPages);
+            end
+            if exist('uifPageNum','var') && isvalid(uifPageNum)
+                if uifPageNum.Limits(2) ~= max(1,totalPages)
+                    uifPageNum.Limits = [1 max(1,totalPages)];
+                end
+                uifPageNum.Value = currentPage;
             end
 
             % Clean up old UI elements
@@ -1092,6 +1996,20 @@ refreshLabels();
 
             % Create UI elements for the current page's groups
             createGroupUiElements();
+
+            % If a previously-ticked group sits on this freshly-built
+            % page, point the buttongroup's SelectedObject at its radio
+            % so onMerge has a live target even when the merge partner
+            % lives on another page.
+            startIdx = (currentPage-1) * PAGE_SIZE + 1;
+            endIdx   = min(startIdx + PAGE_SIZE - 1, numGroups);
+            for k = startIdx:endIdx
+                if chkBoxSelect(k) && isvalid(groupRadioButtons(k))
+                    radioGroupBG.SelectedObject = groupRadioButtons(k);
+                    break;
+                end
+            end
+            drawnow;
 
             % Refresh state of checkboxes based on current selection
             refreshVisibility();
@@ -1377,12 +2295,12 @@ refreshLabels();
     end
 
     function onRemove()
-        % For each group that is selected => set label = NaN => color => gray
+        % Mark each selected group as removed (groupList = NaN) but
+        % keep its entries in sortedRes.unifiedLabels intact so the
+        % unit's spikes can still be visualised via effLabel(k).
         selectedIdx = find(chkBoxSelect);
         for k = selectedIdx'
-            sortedRes.unifiedLabels(sortedRes.unifiedLabels==groupList(k)) = NaN;
-            sortedRes.channelNum(sortedRes.unifiedLabels==groupList(k)) = NaN;
-            groupList(k) = NaN;
+            groupList(k)   = NaN;
             channelList(k) = NaN;
         end
         refreshLabels();
@@ -1414,7 +2332,16 @@ refreshLabels();
             return;
         end
 
-        if ~any([groupSelectCheckboxes(groupList == selIdx).Value] == 1) && ~any([groupSelectCheckboxes(originalGroupList == selIdx).Value] == 1)
+        % Validate via chkBoxSelect (closure state) rather than the
+        % per-page UI handles. groupSelectCheckboxes(g) is a
+        % GraphicsPlaceholder when g lives on a different page, so
+        % indexing-and-reading-.Value through a multi-page mask
+        % crashes with "Unrecognized property 'Value' for class
+        % 'matlab.graphics.GraphicsPlaceholder'". chkBoxSelect
+        % carries the same logical state without that hazard.
+        sel_now  = chkBoxSelect(:) & (groupList(:) == selIdx);
+        sel_orig = chkBoxSelect(:) & (originalGroupList(:) == selIdx);
+        if ~any(sel_now) && ~any(sel_orig)
             uialert(parentFig,'Inconsistent merging! Merge into one of the selected groups.','Merge Error');
             return;
         end
@@ -1434,7 +2361,35 @@ refreshLabels();
         plotOption();
     end
 
-    function onReset()
+    function onReset(skipConfirm)
+        % Confirm before wiping every curation edit -- Reset is the
+        % only single click that can undo Auto sweeps + manual merges
+        % + removals + isolation labels at once, so a misclick should
+        % not be silent. The skipConfirm flag is used by onAutoCurate
+        % (which calls onReset internally before each Auto run); the
+        % public callbacks always confirm.
+        if nargin < 1, skipConfirm = false; end
+        if ~skipConfirm
+            try
+                answer = uiconfirm(parentFig, ...
+                    'Reset will undo all your curation. Are you sure?', ...
+                    'Confirm Reset', ...
+                    'Options',{'Yes','No'}, ...
+                    'DefaultOption','No', ...
+                    'CancelOption','No', ...
+                    'Icon','warning');
+            catch
+                % If the figure handle is somehow invalid, fall back
+                % to the modal questdlg so we still respect the
+                % user choice.
+                answer = questdlg('Reset will undo all your curation. Are you sure?', ...
+                    'Confirm Reset', 'Yes', 'No', 'No');
+            end
+            if ~strcmpi(answer, 'Yes')
+                return;
+            end
+        end
+
         groupList = originalGroupList;
         channelList = originalChannelList;
         sampleWaveform = originalSampleWaveform;
@@ -1464,6 +2419,35 @@ refreshLabels();
 
         selected_order = [];
         unitIsolation = repmat({'NA'},[numGroups,1]);
+        % Recompute firing rate / ISI on the restored labels so the
+        % Group rows show real numbers again (any earlier NaN values
+        % from a removed-unit pass are wiped out here).
+        preprocessSortedData();
+        % Wipe every Auto-pair audit trail; every Auto-merge / drop /
+        % strip has been undone by the label restore above.
+        autoMergedPrimary    = [];
+        autoMergedAbsorbed   = [];
+        autoOverlapDroppedK  = [];
+        autoOverlapTriggerJ  = [];
+        autoCCGStripCont     = [];
+        autoCCGStripClean    = [];
+        lastAutoPair         = 0;
+        if exist('uifAutoPair','var') && isvalid(uifAutoPair)
+            uifAutoPair.Value  = '0';
+        end
+        if exist('uifAutoPair2','var') && isvalid(uifAutoPair2)
+            uifAutoPair2.Value = '/0';
+        end
+        % Inline cache wipes (in addition to refresh* calls below).
+        % Defensive against any edge case where refreshXxx's cell
+        % reassignment fails to propagate to the parent workspace.
+        xcorr_vals     = cell(numGroups, numGroups);
+        isiCounts      = cell(numGroups, numGroups);
+        isiCenters     = cell(numGroups, numGroups);
+        isiViolations  = zeros(numGroups, numGroups);
+        DenCenters     = cell(numGroups, numGroups);
+        DenCounts      = cell(numGroups, numGroups);
+        presence_ratio = zeros(numGroups, numGroups);
         refreshDensity();
         refreshISI();
         refreshCCG();
@@ -1472,6 +2456,449 @@ refreshLabels();
         chkAllVis.Value = false;
         rdoNone.Value = true;
         updateChannelPlot();
+        % Force plotOption to fully rebuild axChannels rather than just
+        % deleting children -- otherwise a previously-merged unit's
+        % stale tile / line objects can leave the new ACG looking flat.
+        % lastMultiPlotOrder is reset too so plotMultiple recreates
+        % its multiPlotPanels (otherwise those handles point to
+        % children of the just-deleted axChannels and allchild()
+        % errors).
+        lastPlotted         = '';
+        lastMultiPlotOrder  = [];
+        selected_order_last = [];
+        drawnow;
+        plotOption();
+    end
+
+    function onSplit()
+        % Split each ticked unit into N sub-clusters (set in the Split
+        % options dropdown / num-clusters field next to the toolbar)
+        % via PCA on multi-channel waveforms + the chosen clustering
+        % method (GMM / kmeans / hierarchical). Sub-clusters get
+        % fresh labels = max(groupList,'omitnan') + 1, +2, ... ; the
+        % highest-amplitude (highest-SNR) sub-cluster keeps the
+        % original label so the user's "primary" identity is stable.
+        % originalUnifiedLabels and originalGroupList are NOT
+        % touched, so Reset / Undo unwind the split.
+        %
+        % While the routine is running we disable the Split button so
+        % a second click can't enqueue an overlapping split. The
+        % onCleanup hook re-enables it even if we error out.
+        if exist('btnSplit','var') && isvalid(btnSplit)
+            btnSplit.Enable = 'off';
+            if isvalid(btnSplit) && isprop(btnSplit,'Text')
+                btnSplit.Text = 'Splitting...';
+            end
+        end
+        if exist('lblSave','var') && isvalid(lblSave)
+            prevSaveLbl = lblSave.Text;
+            lblSave.Text = 'Split in progress...';
+        else
+            prevSaveLbl = '';
+        end
+        drawnow;
+        cleanupSplit = onCleanup(@() resetSplitButton(prevSaveLbl)); %#ok<NASGU>
+
+        selectedIdx = find(chkBoxSelect);
+        if isempty(selectedIdx)
+            try
+                uialert(parentFig, 'Tick at least one unit to split.', 'Split');
+            catch
+            end
+            return;
+        end
+        if isempty(mappedData)
+            if isfield(cfg,'inputFolder') && isfield(cfg,'outputFolder')
+                mappedData = map_input_file(cfg.fullFilePath, cfg);
+            else
+                try
+                    uialert(parentFig, 'Cannot split: input file is not accessible.', 'Split');
+                catch
+                end
+                return;
+            end
+        end
+
+        nSplitDone = 0;
+        newSelected = [];
+        for k = selectedIdx(:)'
+            if isnan(groupList(k)),       continue; end
+            if isnan(channelList(k)),     continue; end
+
+            kLabel    = groupList(k);
+            kRows     = find(sortedRes.unifiedLabels == kLabel);
+            nSpikesK  = numel(kRows);
+            if nSpikesK < 50, continue; end   % too few to split reliably
+
+            % --- Cluster the unit's spikes ---------------------------
+            % Preferred path: cluster directly on the per-spike PCA
+            % features the sorter already saved into sortedRes.features.
+            % That avoids reading 1000+ snippets from the memmap and
+            % running a fresh PCA per click; it also keeps the split
+            % working in the same feature space the sorter uses, so
+            % cluster boundaries are consistent with the upstream
+            % decisions. We fall back to the old "read snippets +
+            % run pca() on the fly" path only when the features matrix
+            % is missing, the wrong size, or has too many non-finite
+            % rows for the unit.
+            nClusters  = max(2, splitNumClusters);
+            chCenter   = channelList(k);
+            allRowsK   = kRows;
+            assignment = nan(numel(allRowsK), 1);
+            uniqClusts = [];
+            keepClust  = [];
+            newClusts  = [];
+
+            useFeatures = isfield(sortedRes,'features') && ...
+                          ~isempty(sortedRes.features) && ...
+                          size(sortedRes.features,1) == numel(sortedRes.unifiedLabels);
+            if useFeatures
+                % Take EVERY feature column the sorter saved -- the
+                % more dimensions the clusterer sees, the closer the
+                % split decision tracks the sorter's own feature
+                % space. We only pad to 2 columns for the corner case
+                % where the sorter kept just PC1; otherwise the full
+                % matrix flows straight in.
+                feat = double(sortedRes.features(allRowsK, :));
+                finiteRow = all(isfinite(feat), 2);
+                if sum(finiteRow) < 50
+                    useFeatures = false;
+                else
+                    feat = feat(finiteRow, :);
+                    if size(feat, 2) < 2
+                        feat = [feat, zeros(size(feat,1), 1)];
+                    end
+                    finiteIdx = find(finiteRow);
+                    clustLabels = [];
+                    try
+                        switch lower(splitMethod)
+                            case 'gmm'
+                                gm = fitgmdist(feat, nClusters, ...
+                                    'RegularizationValue', 0.01, ...
+                                    'Replicates', 3, ...
+                                    'Options', statset('MaxIter', 200));
+                                clustLabels = cluster(gm, feat);
+                            case {'graph','community','spectral'}
+                                % Graph-based clustering on a kNN
+                                % similarity graph. spectralcluster
+                                % builds the affinity graph, computes
+                                % the Laplacian eigenvectors and runs
+                                % k-means in eigenspace, so it picks
+                                % up cluster shapes a vanilla k-means
+                                % would smear together (curved or
+                                % non-convex feature manifolds).
+                                clustLabels = spectralcluster(feat, nClusters);
+                            otherwise   % 'K-means' or anything unknown
+                                clustLabels = kmeans(feat, nClusters, ...
+                                    'Replicates', 3, ...
+                                    'Options', statset('MaxIter', 200));
+                        end
+                    catch
+                        try
+                            clustLabels = kmeans(feat, nClusters, 'Replicates', 3, ...
+                                'Options', statset('MaxIter', 200));
+                        catch
+                            useFeatures = false;
+                        end
+                    end
+                    if useFeatures && (isempty(clustLabels) || numel(unique(clustLabels)) < 2)
+                        useFeatures = false;
+                    end
+                    if useFeatures
+                        assignment(finiteIdx) = clustLabels;
+                        % Rank clusters by mean peak-to-peak on the
+                        % unit's main channel. We only need ~50 spikes
+                        % per cluster to estimate amplitude reliably,
+                        % so this is a single small vectorised memmap
+                        % read per cluster -- a fraction of the cost
+                        % of the old path's full waveform matrix read.
+                        uniqClusts = unique(clustLabels(:))';
+                        ampClust   = zeros(numel(uniqClusts), 1);
+                        if ~isnan(chCenter) && chCenter >= 1 && chCenter <= numChannels && ...
+                                chCenter <= numel(channel_mapping) && ...
+                                ~isempty(mappedData)
+                            chMap = channel_mapping(round(chCenter));
+                            if isfinite(chMap) && chMap >= 1 && ...
+                                    chMap <= size(mappedData.Data.data, 1)
+                                chMap       = round(chMap);
+                                windowSize  = 2*numSpikeSamples + 1;
+                                relIdx      = -numSpikeSamples:numSpikeSamples;
+                                nSamplesAll = size(mappedData.Data.data, 2);
+                                for ci = 1:numel(uniqClusts)
+                                    cVal  = uniqClusts(ci);
+                                    cIdxs = finiteIdx(clustLabels == cVal);
+                                    if isempty(cIdxs), continue; end
+                                    nSamp = min(numel(cIdxs), 50);
+                                    cSamp = cIdxs(randperm(numel(cIdxs), nSamp));
+                                    spkPos = round(double( ...
+                                        sortedRes.spike_idx(allRowsK(cSamp))));
+                                    spkPos = spkPos(spkPos > numSpikeSamples & ...
+                                                    spkPos <= nSamplesAll - numSpikeSamples);
+                                    if isempty(spkPos), continue; end
+                                    try
+                                        idxMat = relIdx(:) + spkPos(:)';
+                                        slab   = double(mappedData.Data.data( ...
+                                            chMap, idxMat(:)'));
+                                        slab2D = reshape(slab, windowSize, ...
+                                            numel(spkPos))';
+                                        ampClust(ci) = mean( ...
+                                            max(slab2D,[],2) - min(slab2D,[],2));
+                                    catch
+                                    end
+                                end
+                            end
+                        end
+                        [~, ampOrder] = sort(ampClust, 'descend');
+                        keepClust     = uniqClusts(ampOrder(1));
+                        newClusts     = uniqClusts(ampOrder(2:end));
+                    end
+                end
+            end
+
+            if ~useFeatures
+                % --- Fallback: read snippets + PCA on the fly --------
+                chList   = max(1, chCenter - numChannelPlot) : min(numChannels, chCenter + numChannelPlot);
+                nChans   = numel(chList);
+                wfLen    = 2*numSpikeSamples + 1;
+
+                sampleCap = min(nSpikesK, 1000);
+                if nSpikesK > sampleCap
+                    samplePos = kRows(randperm(nSpikesK, sampleCap));
+                else
+                    samplePos = kRows;
+                end
+                sampleSpkIdx = sortedRes.spike_idx(samplePos);
+                edgeOK = sampleSpkIdx > numSpikeSamples & sampleSpkIdx <= num_Samples - numSpikeSamples;
+                samplePos    = samplePos(edgeOK);
+                sampleSpkIdx = sampleSpkIdx(edgeOK);
+                if numel(sampleSpkIdx) < 50, continue; end
+
+                wfMatrix = zeros(numel(sampleSpkIdx), nChans * wfLen);
+                for s = 1:numel(sampleSpkIdx)
+                    spkPos = sampleSpkIdx(s);
+                    snip = double(mappedData.Data.data(channel_mapping(chList), ...
+                        spkPos - numSpikeSamples : spkPos + numSpikeSamples));
+                    if strcmp(plotFilterType,'filtered')
+                        try
+                            snip = bandpass_filter_GUI(snip', cfg.bandpass, cfg.samplingFrequency)';
+                        catch
+                        end
+                    end
+                    wfMatrix(s, :) = snip(:)';
+                end
+
+                try
+                    nComp = min(5, size(wfMatrix,2)-1);
+                    [~, score, ~] = pca(wfMatrix, 'NumComponents', max(2, nComp));
+                catch
+                    continue;
+                end
+                clustLabels = [];
+                try
+                    switch lower(splitMethod)
+                        case 'gmm'
+                            gm = fitgmdist(score, nClusters, ...
+                                'RegularizationValue', 0.01, ...
+                                'Replicates', 3, ...
+                                'Options', statset('MaxIter', 200));
+                            clustLabels = cluster(gm, score);
+                        case {'graph','community','spectral'}
+                            clustLabels = spectralcluster(score, nClusters);
+                        otherwise   % 'K-means' or anything unknown
+                            clustLabels = kmeans(score, nClusters, ...
+                                'Replicates', 3, ...
+                                'Options', statset('MaxIter', 200));
+                    end
+                catch
+                    try
+                        clustLabels = kmeans(score, nClusters, 'Replicates', 3, ...
+                            'Options', statset('MaxIter', 200));
+                    catch
+                        continue;
+                    end
+                end
+                if isempty(clustLabels) || numel(unique(clustLabels)) < 2
+                    continue;
+                end
+
+                mainColIdx = find(chList == chCenter, 1);
+                if isempty(mainColIdx), mainColIdx = ceil(nChans/2); end
+                mainCols   = ((mainColIdx-1)*wfLen + 1) : (mainColIdx*wfLen);
+                uniqClusts = unique(clustLabels(:))';
+                nClustActual = numel(uniqClusts);
+                ampClust   = zeros(nClustActual, 1);
+                clustMeans = zeros(nClustActual, size(score,2));
+                for ci = 1:nClustActual
+                    cVal = uniqClusts(ci);
+                    mask = clustLabels == cVal;
+                    if ~any(mask), continue; end
+                    wfClust       = wfMatrix(mask, mainCols);
+                    ampClust(ci)  = mean(max(wfClust, [], 2) - min(wfClust, [], 2));
+                    clustMeans(ci,:) = mean(score(mask, :), 1, 'omitnan');
+                end
+                [~, ampOrder] = sort(ampClust, 'descend');
+                keepClust     = uniqClusts(ampOrder(1));
+                newClusts     = uniqClusts(ampOrder(2:end));
+
+                sampledMask  = false(numel(allRowsK), 1);
+                sampledMask(ismember(allRowsK, samplePos)) = true;
+                unsampledRows = allRowsK(~sampledMask);
+
+                [~, sampledOrderInAll] = ismember(samplePos, allRowsK);
+                valid = sampledOrderInAll > 0;
+                assignment(sampledOrderInAll(valid)) = clustLabels(valid);
+
+                if ~isempty(unsampledRows)
+                    stepBatch = 200;
+                    try
+                        coeffFull = pca(wfMatrix, 'NumComponents', size(score,2));
+                    catch
+                        coeffFull = [];
+                    end
+                    if ~isempty(coeffFull)
+                        wfMean = mean(wfMatrix,1);
+                        for off = 1:stepBatch:numel(unsampledRows)
+                            batch    = unsampledRows(off:min(off+stepBatch-1, end));
+                            spkBatch = sortedRes.spike_idx(batch);
+                            keep     = spkBatch > numSpikeSamples & spkBatch <= num_Samples - numSpikeSamples;
+                            spkBatch = spkBatch(keep);
+                            batch    = batch(keep);
+                            if isempty(batch), continue; end
+                            bWf = zeros(numel(batch), nChans * wfLen);
+                            for s = 1:numel(batch)
+                                snip = double(mappedData.Data.data(channel_mapping(chList), ...
+                                    spkBatch(s) - numSpikeSamples : spkBatch(s) + numSpikeSamples));
+                                if strcmp(plotFilterType,'filtered')
+                                    try
+                                        snip = bandpass_filter_GUI(snip', cfg.bandpass, cfg.samplingFrequency)';
+                                    catch
+                                    end
+                                end
+                                bWf(s,:) = snip(:)';
+                            end
+                            try
+                                bScore = (bWf - wfMean) * coeffFull;
+                                dist = pdist2(bScore, clustMeans);
+                                [~, nearest] = min(dist, [], 2);
+                                assignClust = uniqClusts(nearest);
+                                [~, batchOrder] = ismember(batch, allRowsK);
+                                ok = batchOrder > 0;
+                                assignment(batchOrder(ok)) = assignClust(ok);
+                            catch
+                            end
+                        end
+                    end
+                end
+            end
+
+            % Default any leftover unassigned spike to the largest
+            % observed cluster so we don't lose them.
+            unassigned = isnan(assignment);
+            if any(unassigned)
+                obs  = assignment(~unassigned);
+                if ~isempty(obs)
+                    uObs = unique(obs);
+                    cnts = arrayfun(@(c) sum(obs == c), uObs);
+                    [~, biggest] = max(cnts);
+                    assignment(unassigned) = uObs(biggest);
+                end
+            end
+
+            % Skip degenerate splits where every spike landed in one
+            % cluster.
+            survivingClusts = unique(assignment(:))';
+            if numel(survivingClusts) < 2
+                continue;
+            end
+
+            % --- Allocate one new unit slot per non-keeper cluster.
+            for nc = newClusts(:)'
+                if ~ismember(nc, survivingClusts), continue; end
+                rowsForNewLabel = allRowsK(assignment == nc);
+                if isempty(rowsForNewLabel), continue; end
+
+                newLabel = max(groupList(~isnan(groupList))) + 1;
+                newK     = numGroups + 1;
+
+                groupList(newK,1)              = newLabel;
+                channelList(newK,1)            = chCenter;
+                mergedFlag(newK,1)             = false;
+                unitIsolation{newK,1}          = unitIsolation{k};
+                stable_length(newK,:)          = stable_length(k,:);
+                mainPolarity(newK,1)           = mainPolarity(k);
+                sidePolarity(newK,1)           = sidePolarity(k);
+                detectblity(newK,1)            = detectblity(k);
+                chkBoxSelect(newK,1)           = 1;
+                chkBoxVis(newK,1)              = 1;
+                preprocessed.firingRate(newK,1)    = 0;
+                preprocessed.isiViolation(newK,1)  = 0;
+                preprocessed.logFiringRate(newK,1) = log(eps);
+                originalGroupList(newK,1)      = NaN;
+                originalChannelList(newK,1)    = NaN;
+                wfShape = size(sampleWaveform);
+                sampleWaveform(newK,:,:)         = nan(1, wfShape(2), wfShape(3));
+                originalSampleWaveform(newK,:,:) = nan(1, wfShape(2), wfShape(3));
+                unitNotes{newK,1}             = sprintf('Split from G%g', kLabel);
+                channelPlot(newK,:)           = chCenter + (-numChannelPlot:numChannelPlot);
+
+                xcorr_vals(newK,:)     = cell(1, size(xcorr_vals,2));
+                xcorr_vals(:,newK)     = cell(size(xcorr_vals,1), 1);
+                isiCounts(newK,:)      = cell(1, size(isiCounts,2));
+                isiCounts(:,newK)      = cell(size(isiCounts,1), 1);
+                isiCenters(newK,:)     = cell(1, size(isiCenters,2));
+                isiCenters(:,newK)     = cell(size(isiCenters,1), 1);
+                isiViolations(newK,:)  = 0;
+                isiViolations(:,newK)  = 0;
+                DenCenters(newK,:)     = cell(1, size(DenCenters,2));
+                DenCenters(:,newK)     = cell(size(DenCenters,1), 1);
+                DenCounts(newK,:)      = cell(1, size(DenCounts,2));
+                DenCounts(:,newK)      = cell(size(DenCounts,1), 1);
+                presence_ratio(newK,:) = 0;
+                presence_ratio(:,newK) = 0;
+
+                numGroups   = newK;
+                totalPages  = ceil(numGroups / PAGE_SIZE);
+
+                sortedRes.unifiedLabels(rowsForNewLabel) = newLabel;
+                sortedRes.channelNum(rowsForNewLabel)    = chCenter;
+
+                nSplitDone = nSplitDone + 1;
+                newSelected(end+1) = newK; %#ok<AGROW>
+            end
+        end
+
+        if nSplitDone == 0
+            try
+                uialert(parentFig, ...
+                    'No unit could be split (need >=50 spikes and a non-degenerate clustering).', ...
+                    'Split');
+            catch
+            end
+            return;
+        end
+
+        % Recompute per-unit metrics, refresh caches, rebuild page UI.
+        try, preprocessSortedData(); catch, end
+        try, refreshCCG();           catch, end
+        try, refreshISI();           catch, end
+        try, refreshDensity();       catch, end
+
+        % Auto-tick the new sub-cluster slots so the user sees both
+        % halves of every split unit side-by-side after the operation.
+        for nk = newSelected
+            if ~ismember(nk, selected_order)
+                selected_order(end+1) = nk;
+            end
+        end
+
+        % Rebuild page so the new rows / checkboxes / radios appear.
+        currentPage = max(1, min(currentPage, totalPages));
+        onChangePage(0);
+
+        lastPlotted         = '';
+        lastMultiPlotOrder  = [];
+        selected_order_last = [];
+        drawnow;
         plotOption();
     end
 
@@ -1481,7 +2908,7 @@ refreshLabels();
             currentType = unitIsolation{visibleGroups(1)};
             typeMap = {'NA', 'SUA+'; 'SUA+', 'SUA'; 'SUA', 'MUA+'; 'MUA+', 'MUA'; 'MUA', 'NA'};
             nextType = typeMap{strcmp(typeMap(:,1), currentType), 2};
-            
+
             % Batch update
             for i = 1:length(visibleGroups)
                 unitIsolation{visibleGroups(i)} = nextType;
@@ -1490,9 +2917,74 @@ refreshLabels();
         refreshLabels();
     end
 
+    function onEditNotes()
+        % Edit the free-text note for the unit currently chosen by the
+        % radio button (preferred, since it identifies a single unit
+        % unambiguously). If no radio is selected, fall back to the
+        % most recently ticked Select-checkbox unit.
+        targetIdx = [];
+        for i = 1:numel(groupRadioButtons)
+            if isvalid(groupRadioButtons(i)) && isprop(groupRadioButtons(i),'Value') ...
+                    && groupRadioButtons(i).Value
+                targetIdx = i;
+                break;
+            end
+        end
+        if isempty(targetIdx)
+            tickedIdx = find(chkBoxSelect, 1, 'last');
+            if ~isempty(tickedIdx)
+                targetIdx = tickedIdx;
+            end
+        end
+        if isempty(targetIdx)
+            try
+                uialert(parentFig, ...
+                    'Select a unit first (radio button or checkbox).', ...
+                    'Notes');
+            catch
+            end
+            return;
+        end
+        if numel(unitNotes) < targetIdx
+            unitNotes(end+1:targetIdx) = {''};
+        end
+        existing = unitNotes{targetIdx};
+        if isempty(existing), existing = ''; end
+        prompt = sprintf('Note for unit G:%g (Ch %g):', ...
+            groupList(targetIdx), channelList(targetIdx));
+        try
+            answer = inputdlg(prompt, 'Edit unit note', [3 70], {existing});
+            if ~isempty(answer)
+                unitNotes{targetIdx} = answer{1};
+            end
+        catch ME
+            warning('Notes dialog failed: %s', ME.message);
+        end
+    end
+
     function onUndo()
         selectedIdx = find(chkBoxSelect);
-        for k = selectedIdx'
+
+        % If any of the ticked units are part of a merge (their
+        % groupList value is shared with at least one other unit),
+        % expand the undo set to include every constituent of that
+        % merge. Otherwise undoing only the primary (or only the
+        % absorbed) leaves the other side still wired into the
+        % merged train, and metrics like ACG / ISI / CCG never come
+        % back for the dissolved constituents.
+        expandedIdx = selectedIdx(:);
+        for k = selectedIdx(:)'
+            gv = groupList(k);
+            if ~isnan(gv)
+                sameMerge = find(groupList == gv);
+                if numel(sameMerge) > 1
+                    expandedIdx = [expandedIdx; sameMerge(:)]; %#ok<AGROW>
+                end
+            end
+        end
+        expandedIdx = unique(expandedIdx);
+
+        for k = expandedIdx'
             groupList(k) = originalGroupList(k);
             channelList(k) = originalChannelList(k);
             sampleWaveform(k,:,:) = originalSampleWaveform(k,:,:);
@@ -1502,11 +2994,97 @@ refreshLabels();
             mergedFlag(k,1) = false;
             unitIsolation{k} = 'NA';
             stable_length(k,:) = [1, trialLength];
+
+            % Auto-tick + auto-make-visible every dissolved
+            % constituent so the user actually sees its ACG / ISI /
+            % waveform after Undo. Without this, undoing just the
+            % visible primary leaves the absorbed unit dissolved in
+            % data but never re-rendered (selected_order still only
+            % had the primary, so plotCCG never asks for the
+            % absorbed's spike train).
+            chkBoxSelect(k) = 1;
+            chkBoxVis(k)    = 1;
+            if ~ismember(k, selected_order)
+                selected_order(end+1) = k; %#ok<AGROW>
+            end
+            if k <= numel(groupSelectCheckboxes) && ...
+               isvalid(groupSelectCheckboxes(k)) && ...
+               isprop(groupSelectCheckboxes(k),'Value')
+                groupSelectCheckboxes(k).Value = true;
+                groupVisCheckboxes(k).Value    = true;
+                cu = getGroupColor(groupList(k));
+                groupSelectCheckboxes(k).FontColor  = cu;
+                groupSelectCheckboxes(k).FontWeight = 'Bold';
+                groupVisCheckboxes(k).FontColor     = cu;
+                groupVisCheckboxes(k).FontWeight    = 'Bold';
+                if k <= numel(lblChannelHandles) && isvalid(lblChannelHandles(k))
+                    lblChannelHandles(k).BackgroundColor = cu;
+                    lblChannelHandles(k).FontColor       = bestTextColorFor(cu);
+                end
+            end
         end
+        % Recompute the per-unit metrics on the restored labels so that
+        % Group rows for previously-NaN units regain real ISI / rate.
+        preprocessSortedData();
+
+        % If any of the just-undone units are at the END of the array
+        % AND were originally created by Split (originalGroupList is
+        % NaN), trim them off entirely instead of leaving a ghost
+        % NaN row hanging off the last page. We only trim trailing
+        % slots so internal indices used by selected_order /
+        % autoMergedPrimary etc. don't have to shift.
+        trimmedAny = false;
+        while numGroups > 0 ...
+                && (numel(originalGroupList) >= numGroups) ...
+                && isnan(groupList(numGroups)) ...
+                && isnan(originalGroupList(numGroups))
+            trimSplitSlot(numGroups);
+            numGroups = numGroups - 1;
+            trimmedAny = true;
+        end
+        if trimmedAny
+            totalPages = max(1, ceil(numGroups / PAGE_SIZE));
+            if currentPage > totalPages
+                currentPage = totalPages;
+            end
+        end
+
+        % channelList was just restored above for the dissolved units;
+        % rebuild channelPlot inline so plotWaveforms / plotTrace can
+        % resolve their footprints without going through
+        % updateChannelPlot (which would force an early plotOption).
+        channelPlot = channelList + (-numChannelPlot:numChannelPlot);
+        % Inline cache wipes (in addition to refresh* calls below) so
+        % the ACG / ISI / Density caches are guaranteed cleared even
+        % if a refreshXxx variant is somehow not propagating its cell
+        % reassignment up to the parent workspace.
+        xcorr_vals     = cell(numGroups, numGroups);
+        isiCounts      = cell(numGroups, numGroups);
+        isiCenters     = cell(numGroups, numGroups);
+        isiViolations  = zeros(numGroups, numGroups);
+        DenCenters     = cell(numGroups, numGroups);
+        DenCounts      = cell(numGroups, numGroups);
+        presence_ratio = zeros(numGroups, numGroups);
         refreshDensity();
         refreshISI();
         refreshCCG();
         refreshLabels();
+        if trimmedAny
+            onChangePage(0);
+        end
+        % Force the next plotOption call to *fully* rebuild axChannels
+        % (including the tiledlayout used by plotCCG / plotISI / etc.),
+        % otherwise stale child objects from the pre-undo state can
+        % leave the dissolved unit's ACG stuck on a flat row even when
+        % the underlying xcorr_vals cache has been wiped. We also reset
+        % selected_order_last so plotWaveforms re-snaps the y-window
+        % and lastMultiPlotOrder so plotMultiple recreates its
+        % multiPlotPanels (otherwise those handles point to children
+        % of the just-deleted axChannels and allchild() errors).
+        lastPlotted         = '';
+        lastMultiPlotOrder  = [];
+        selected_order_last = [];
+        drawnow;
         plotOption();
     end
 
@@ -1532,7 +3110,13 @@ refreshLabels();
                 end
             end
         end
-        plotOption();
+        % Limit only changes what's visible on the Density plot (the
+        % shaded trim band) and what gets saved later. The Waveform /
+        % Trace / CCG / ISI / Amplitude views don't reflect the trim,
+        % so skip the heavy redraw on those plot types.
+        if any(strcmpi(plotType, {'Density','Multiple'}))
+            plotOption();
+        end
 
         function [startIdx, endIdx] = findStableInterval(d)
             n = numel(d);
@@ -1562,6 +3146,1155 @@ refreshLabels();
         end
     end
 
+    function onAutoCurate()
+        % Surface a "running" status into the top Save label as soon as
+        % Auto kicks off. The pipeline replaces the text with the merge
+        % count when it finishes; this lets the user see Auto is still
+        % working through Phases 1-5 without staring at a frozen GUI.
+        if exist('lblSave','var') && isvalid(lblSave)
+            lblSave.Text = 'Auto curation in progress...';
+        end
+        if exist('btnAutoCurate','var') && isvalid(btnAutoCurate)
+            btnAutoCurate.Enable = 'off';
+        end
+        cleanupAuto = onCleanup(@() resetAutoButton());
+
+        drawnow;
+
+        % Reset to the original state first so each Auto run is
+        % independent of any previous run (or manual edits). Skip
+        % the confirmation dialog -- the user has just pressed
+        % Auto, they don't need a second prompt.
+        try, onReset(true); catch, end
+
+        % Reset every Auto-pair audit trail so the Next/Prev walker on
+        % the Auto panel starts at zero for whichever pair-type the
+        % user has selected.
+        autoMergedPrimary    = [];
+        autoMergedAbsorbed   = [];
+        autoOverlapDroppedK  = [];
+        autoOverlapTriggerJ  = [];
+        autoCCGStripCont     = [];
+        autoCCGStripClean    = [];
+        lastAutoPair         = 0;
+        if exist('uifAutoPair','var') && isvalid(uifAutoPair)
+            uifAutoPair.Value  = '0';
+        end
+        if exist('uifAutoPair2','var') && isvalid(uifAutoPair2)
+            uifAutoPair2.Value = '/0';
+        end
+
+        % Automatic curation pipeline (removal -> cleaning -> merge,
+        % with the necessary setup steps interleaved):
+        %  1) Drop units that never fire (firingRate == 0).
+        %  2) Classify SUA+ / SUA / MUA+ / MUA from a composite quality
+        %     score that blends ISI %, ACG refractoriness ratio, and
+        %     SNR (1 + detectability). Each component contributes
+        %     independently so a unit can still be SUA when one factor
+        %     is weak provided the others compensate.
+        %  3) Run similarity analysis. yDistThr is forced to >=100 um
+        %     for this run (a zero-distance setting would only compare
+        %     same-y groups), then restored.
+        %  4) Removal: drop units whose spike train is mostly a
+        %     duplicate of a single neighbour's (>autoOverlapFrac
+        %     coincidence within 0.5 ms) AND whose SNR < 1.5. Doing
+        %     this BEFORE cleaning means the CCG-peak step doesn't
+        %     waste effort on units we're about to throw away.
+        %  5) Cleaning: per-pair CCG-peak cleanup. Pairs with a strong
+        %     lag-0 peak strip coincident spikes from the noisier
+        %     side; identity is preserved.
+        %  6) Merge: walk candidate pairs and merge those that pass
+        %     similarity, amplitude, PC, and merged-ISI gates.
+        %  7) Apply the auto-limit to every surviving unit using the
+        %     current Drop Rate field.
+
+        % All gates come from the "Auto Curation" panel (closure
+        % variables) so that Auto runs are independent of whatever the
+        % user has typed in the Similarity Processing panel.
+        thrIsiAbs    = autoIsiVal;
+        thrIsiBudget = autoIsiBudget;
+        thrPC        = autoPCVal;
+        thrAmp       = autoAmpVal;
+        thrSim       = autoSimVal;
+
+        if strcmp(distanceEstType, 'XCorr')
+            simBetter = @(s) s >= thrSim;
+        else
+            simBetter = @(s) s <= thrSim;
+        end
+
+        % Per-step counters for the end-of-Auto summary popup. The user
+        % shouldn't have to read console output to know what changed.
+        nAutoZeroDrops  = 0;     % zero-rate drops (Phase 1)
+        nAutoCoincDrops = 0;     % coincidence-overlap drops (Phase 4)
+        nAutoCCGStrips  = 0;     % CCG-peak coincident-spike strips (Phase 5)
+        nAutoCCGDrops   = 0;     % CCG-peak full unit drops (Phase 5)
+
+        % --- Phase 1: drop zero-firing-rate units ---------------------
+        % Mark as removed but leave sortedRes.unifiedLabels alone so
+        % the underlying spikes can still be visualised via effLabel.
+        try
+            for k = 1:numGroups
+                if isnan(groupList(k)), continue; end
+                if preprocessed.firingRate(k) == 0
+                    groupList(k)      = NaN;
+                    channelList(k)    = NaN;
+                    unitIsolation{k}  = 'NA';
+                    mergedFlag(k)     = true;
+                    nAutoZeroDrops    = nAutoZeroDrops + 1;
+                end
+            end
+        catch ME
+            uialert(parentFig, sprintf('Phase 1 (drop zero-rate) failed: %s', ME.message), 'Auto Curation Error');
+            return;
+        end
+
+        % --- Phase 2: composite-score isolation classification --------
+        try
+            classifyIsolationAll();
+        catch ME
+            uialert(parentFig, sprintf('Phase 2 (isolation classify) failed: %s', ME.message), 'Auto Curation Error');
+            return;
+        end
+
+        % --- Phase 3: similarity analysis at autoDistVal um neighbourhood
+        % Temporarily override yDistThr with the auto-curation Dist
+        % value so onSimilarityEstimation uses the right radius, then
+        % restore the user's previously typed value afterwards.
+        prevYDist = yDistThr;
+        if ~isempty(autoDistVal) && autoDistVal > 0
+            yDistThr = autoDistVal;
+        elseif yDistThr <= 0
+            yDistThr = 100;
+        end
+        try
+            onSimilarityEstimation();
+        catch ME
+            yDistThr = prevYDist;
+            uialert(parentFig, sprintf('Phase 3 (similarity) failed: %s', ME.message), 'Auto Curation Error');
+            return;
+        end
+        yDistThr = prevYDist;
+
+        % --- Phase 4: removal (drop coincidence-noise units) ---------
+        % For every non-SUA unit, count how many of its spikes fall
+        % within 0.5 ms of ANY spike from a neighbour group whose
+        % primary channel sits within autoDistVal um in y. If more
+        % than autoOverlapFrac of the unit's spikes are coincident,
+        % the unit is treated as a duplicate / shared-noise pickup
+        % and set to NaN. Running removal BEFORE cleaning keeps the
+        % CCG-peak phase from wasting cycles on units we're about
+        % to throw away anyway.
+        try
+            coincSamples = round(0.5e-3 * cfg.samplingFrequency);
+            coincFrac    = autoOverlapFrac;
+            if ~isempty(autoDistVal) && autoDistVal > 0
+                coincYUm = autoDistVal;
+            elseif ~isempty(yDistThr) && yDistThr > 0
+                coincYUm = yDistThr;
+            else
+                coincYUm = 200;
+            end
+            snrAll4 = 1 + detectblity;
+            for k = 1:numGroups
+                if isnan(groupList(k)),                              continue; end
+                spk_k = sortedRes.spike_idx(sortedRes.unifiedLabels == groupList(k));
+                if numel(spk_k) < 10, continue; end
+                if isnan(channelList(k)), continue; end
+                yk = ylocs(channelList(k));
+
+                % Per-neighbour test: drop k as soon as ONE single
+                % neighbour j alone accounts for > coincFrac of k's
+                % spikes (within 0.5 ms) AND k itself is genuinely
+                % low quality (SNR < 1.5). Without the SNR gate we
+                % would NaN any unit that happens to share spikes
+                % with a noisier neighbour -- including high-SNR
+                % units the user explicitly wants to keep.
+                shouldDrop = false;
+                triggerJ   = NaN;
+                threshold  = coincFrac * numel(spk_k);
+                for j = 1:numGroups
+                    if j == k || isnan(groupList(j)) || isnan(channelList(j)), continue; end
+                    if abs(ylocs(channelList(j)) - yk) > coincYUm, continue; end
+                    spk_j = sortedRes.spike_idx(sortedRes.unifiedLabels == groupList(j));
+                    if isempty(spk_j), continue; end
+                    [d_kj, ~] = nearest_distances(spk_k, spk_j);
+                    if sum(d_kj <= coincSamples) > threshold
+                        shouldDrop = true;
+                        triggerJ   = j;
+                        break;
+                    end
+                end
+
+                snr_k = snrAll4(k);
+                if isnan(snr_k), snr_k = 0; end
+                if shouldDrop && snr_k < 1.5
+                    groupList(k)     = NaN;
+                    channelList(k)   = NaN;
+                    unitIsolation{k} = 'NA';
+                    mergedFlag(k)    = true;
+                    nAutoCoincDrops  = nAutoCoincDrops + 1;
+                    % Record (dropped unit, neighbour-that-caused-it)
+                    % so the Auto-panel pair walker can revisit each
+                    % overlap drop.
+                    autoOverlapDroppedK(end+1,1) = k;          %#ok<AGROW>
+                    autoOverlapTriggerJ(end+1,1) = triggerJ;   %#ok<AGROW>
+                end
+            end
+            % counts/labels were rewritten; refresh metrics + UI labels
+            preprocessSortedData();
+            refreshLabels();
+        catch ME
+            uialert(parentFig, sprintf('Phase 4 (removal) failed: %s', ME.message), 'Auto Curation Error');
+        end
+
+        % --- Phase 5: cleaning (per-pair CCG-peak cleanup) -----------
+        % Trigger criterion: the cross-correlogram has a peak AT lag 0
+        % whose height is the GLOBAL MAX of the CCG and exceeds 2x the
+        % 90th percentile of all the other bins. That's a stricter
+        % "true peak at zero" test than a generic Poisson null --
+        % structural temporal coupling at non-zero lags (real biology)
+        % won't trip it because their global max is away from zero.
+        %
+        % CCG bins: 1 ms wide, ±100 ms half-window. We compute it via
+        % a two-pointer pairwise-difference histogram so we don't have
+        % to allocate a num_Samples-long binary vector per pair (the
+        % old binary_xcorr approach).
+        %
+        % If triggered, pick the lower-SNR side as the contaminated
+        % unit and strip its spikes that are coincident (within
+        % 0.5 ms) with the cleaner unit by setting their
+        % sortedRes.unifiedLabels rows to -1. The higher-SNR (cleaner)
+        % unit is never touched, and identity is preserved (cleanup
+        % never drops a class, only spikes).
+        try
+            coincSamples = round(0.5e-3 * cfg.samplingFrequency);
+            if ~isempty(autoDistVal) && autoDistVal > 0
+                coincYUm = autoDistVal;
+            elseif ~isempty(yDistThr) && yDistThr > 0
+                coincYUm = yDistThr;
+            else
+                coincYUm = 200;
+            end
+            snrAll = 1 + detectblity;
+
+            % CCG parameters. ccgPeakRatio is wired to the Auto
+            % panel's CCG field so the user can dial cleanup
+            % strictness without touching the source.
+            ccgBin       = round(1e-3 * cfg.samplingFrequency);  % 1 ms
+            ccgMaxLag    = 100 * ccgBin;                          % ±100 ms
+            ccgZeroTolBins = 1;                                    % "at zero" = ±1 ms
+            ccgPeakRatio = autoCCGRatio;                          % peak > ratio * baseline median
+
+            for k = 1:numGroups
+                if isnan(groupList(k)) || isnan(channelList(k)), continue; end
+                yk = ylocs(channelList(k));
+
+                for j = (k+1):numGroups
+                    if isnan(groupList(j)) || isnan(channelList(j)), continue; end
+                    if groupList(k) == groupList(j), continue; end
+                    if abs(ylocs(channelList(j)) - yk) > coincYUm, continue; end
+
+                    spk_k_rows = find(sortedRes.unifiedLabels == groupList(k));
+                    spk_j_rows = find(sortedRes.unifiedLabels == groupList(j));
+                    spk_k = sortedRes.spike_idx(spk_k_rows);
+                    spk_j = sortedRes.spike_idx(spk_j_rows);
+                    if numel(spk_k) < 10 || numel(spk_j) < 10, continue; end
+
+                    % Build the CCG histogram and run the peak test.
+                    [ccg, zeroBinIdx] = pairCCG(spk_k, spk_j, ccgMaxLag, ccgBin);
+                    if ~ccgPeakAtZero(ccg, zeroBinIdx, ccgZeroTolBins, ccgPeakRatio)
+                        continue;
+                    end
+
+                    % Coincidence mask for the strip phase. Use
+                    % nearest_distances to find each k spike's tightest
+                    % j neighbour (and vice versa) within ±0.5 ms.
+                    [d1_kj, d2_kj] = nearest_distances(spk_k, spk_j);
+                    coincMask_k    = min(d1_kj, d2_kj) <= coincSamples;
+
+                    % CCG peak triggered. Pick the lower-SNR side as
+                    % the contaminated unit. Treat NaN SNR as "very
+                    % low" so a NaN-detectability unit is always the
+                    % contaminated side (otherwise NaN <= x is false
+                    % and we would silently mark the better unit).
+                    sk = snrAll(k); if isnan(sk), sk = 0; end
+                    sj = snrAll(j); if isnan(sj), sj = 0; end
+                    if sk < sj
+                        contIdx    = k;
+                        cleanIdx   = j;
+                        cont_rows  = spk_k_rows;
+                        cont_coinc = coincMask_k;
+                        signedLag  = autoSignedNearestLag(spk_k, spk_j);
+                    elseif sk > sj
+                        contIdx    = j;
+                        cleanIdx   = k;
+                        cont_rows  = spk_j_rows;
+                        [d1_jk, d2_jk] = nearest_distances(spk_j, spk_k);
+                        cont_coinc     = min(d1_jk, d2_jk) <= coincSamples;
+                        signedLag  = autoSignedNearestLag(spk_j, spk_k);
+                    else
+                        % SNR tie -> higher ISI loses.
+                        if preprocessed.isiViolation(k) >= preprocessed.isiViolation(j)
+                            contIdx    = k;
+                            cleanIdx   = j;
+                            cont_rows  = spk_k_rows;
+                            cont_coinc = coincMask_k;
+                            signedLag  = autoSignedNearestLag(spk_k, spk_j);
+                        else
+                            contIdx    = j;
+                            cleanIdx   = k;
+                            cont_rows  = spk_j_rows;
+                            [d1_jk, d2_jk] = nearest_distances(spk_j, spk_k);
+                            cont_coinc     = min(d1_jk, d2_jk) <= coincSamples;
+                            signedLag  = autoSignedNearestLag(spk_j, spk_k);
+                        end
+                    end
+
+                    if ~any(cont_coinc), continue; end
+
+                    % --- Timing-consistency gate -----------------
+                    % The coincident spikes' signed lags to the
+                    % nearest clean spike must cluster tightly around
+                    % their median. A real duplicate (same physical
+                    % spike picked up by both units with a small
+                    % sorter-induced offset) gives a sharp peak;
+                    % random coincidences spread the lag distribution
+                    % uniformly inside the +-0.5 ms window. The strip
+                    % is applied only to the consistent-lag subset;
+                    % if fewer than autoLagConsistencyFrac of the
+                    % coincident lags fall inside +-autoLagTightMs of
+                    % the median, skip the pair entirely.
+                    tightSamples = max(1, round(autoLagTightMs * 1e-3 * cfg.samplingFrequency));
+                    coincIdx     = find(cont_coinc);
+                    coincLags    = signedLag(coincIdx);
+                    coincLags    = coincLags(~isnan(coincLags));
+                    if numel(coincLags) < 5
+                        continue;
+                    end
+                    medLag           = median(coincLags);
+                    withinTight      = abs(coincLags - medLag) <= tightSamples;
+                    consistencyFrac  = sum(withinTight) / numel(coincLags);
+                    if consistencyFrac < autoLagConsistencyFrac
+                        continue;
+                    end
+                    keepCoinc            = false(numel(signedLag), 1);
+                    keepCoinc(coincIdx)  = withinTight;
+                    cont_coinc           = cont_coinc & keepCoinc;
+                    if ~any(cont_coinc), continue; end
+
+                    % Strip the contaminated unit's coincident rows
+                    % from sortedRes.unifiedLabels (set to -1).
+                    sortedRes.unifiedLabels(cont_rows(cont_coinc)) = -1;
+                    nAutoCCGStrips = nAutoCCGStrips + 1;
+                    autoCCGStripCont(end+1,1)  = contIdx;  %#ok<AGROW>
+                    autoCCGStripClean(end+1,1) = cleanIdx; %#ok<AGROW>
+
+                    % Refresh the contaminated unit's ISI / firing-rate
+                    % immediately so the GUI label and any downstream
+                    % gate sees the cleaned numbers, not the pre-strip
+                    % ones. (preprocessSortedData runs again at the
+                    % end of the phase to catch every unit.) Cleaning
+                    % only strips spikes; identity is preserved so the
+                    % later merge phase sees the cleaned train.
+                    spk_c_after = sortedRes.spike_idx(sortedRes.unifiedLabels == groupList(contIdx));
+                    if numel(spk_c_after) >= 2
+                        [~, ~, preprocessed.isiViolation(contIdx)] = ...
+                            getISIViolations(spk_c_after, cfg.samplingFrequency, thresholdISI);
+                    else
+                        preprocessed.isiViolation(contIdx) = 0;
+                    end
+                    preprocessed.firingRate(contIdx)   = numel(spk_c_after) / max(trialLength, eps);
+                    preprocessed.logFiringRate(contIdx) = log(max(preprocessed.firingRate(contIdx), eps));
+                end
+            end
+            preprocessSortedData();
+            refreshLabels();
+        catch ME
+            uialert(parentFig, sprintf('Phase 5 (cleaning) failed: %s', ME.message), 'Auto Curation Error');
+        end
+
+        % --- Phase 6: gated automatic merges -------------------------
+        % Walk candidate pairs from the simMat that survived cleanup
+        % and removal, and merge those that pass similarity, amplitude,
+        % PC, and merged-ISI gates. simMat is keyed by group index;
+        % NaN groupList entries are skipped so dropped units don't
+        % participate even if they appear in simMat from Phase 3.
+        nMerged = 0;
+        try
+            if ~isempty(disimlarityScore)
+                simMat = full(disimlarityScore);
+                ampMat = full(ampSimilarity);
+                if any(simMat(:) ~= 0)
+                    [rIdx, cIdx] = find(simBetter(simMat) & ampMat <= thrAmp);
+                    keep = rIdx > cIdx;
+                    rIdx = rIdx(keep); cIdx = cIdx(keep);
+                    for p = 1:numel(rIdx)
+                        gA = cIdx(p); gB = rIdx(p);
+                        if isnan(groupList(gA)) || isnan(groupList(gB)), continue; end
+                        if groupList(gA) == groupList(gB), continue; end
+                        if ~checkPCDistance(gA, gB, thrPC), continue; end
+                        if ~checkMergedISI(gA, gB, thrIsiAbs, thrIsiBudget), continue; end
+
+                        if preprocessed.firingRate(gA) >= preprocessed.firingRate(gB)
+                            primary = gA; absorbed = gB;
+                        else
+                            primary = gB; absorbed = gA;
+                        end
+                        mergeLabel   = groupList(primary);
+                        mergeChannel = channelList(primary);
+                        absLab       = groupList(absorbed);
+
+                        % For the XCorr metric we want the absorbed
+                        % cluster's spike times shifted into the
+                        % primary's frame before they get relabelled,
+                        % otherwise two units whose templates differ
+                        % only by a sorter-introduced sub-ms offset
+                        % merge into a smeared ACG (the lag-0 bin
+                        % isn't really at lag 0). KL / Bhatta don't
+                        % carry a lag, so we leave spike times alone
+                        % for those metrics. originalSpikeIdx is
+                        % untouched so Reset / Undo restore the
+                        % original timing.
+                        if strcmp(distanceEstType, 'XCorr') && ~isnan(mergeChannel)
+                            mwA = localMeanWaveform(primary, mergeChannel);
+                            mwB = localMeanWaveform(absorbed, mergeChannel);
+                            if ~isempty(mwA) && ~isempty(mwB) && ...
+                               numel(mwA) == numel(mwB) && numel(mwA) > 4
+                                M2 = numel(mwA);
+                                lagCap = max(1, round(M2/4));
+                                [~, bestLag] = max_half_corr(mwA(:)', mwB(:)', 1, M2, lagCap, 0);
+                                if isfinite(bestLag) && bestLag ~= 0
+                                    shiftRows = find(sortedRes.unifiedLabels == absLab);
+                                    shifted   = sortedRes.spike_idx(shiftRows) - bestLag;
+                                    shifted(shifted < 1)            = 1;
+                                    shifted(shifted > num_Samples)  = num_Samples;
+                                    sortedRes.spike_idx(shiftRows)  = shifted;
+                                end
+                            end
+                        end
+
+                        % Find every unit currently sharing the
+                        % absorbed label -- this is what fixes the
+                        % transitive-merge bug. With chain merges like
+                        % (3->5) then (3->9), the second merge would
+                        % otherwise leave unit 5 stranded on its old
+                        % label even though 3, 7, 9 all share the new
+                        % one. Updating every member of the absorbed
+                        % cluster keeps the whole transitive group on
+                        % the same label.
+                        absMembers = find(groupList == absLab);
+                        sortedRes.unifiedLabels(sortedRes.unifiedLabels == absLab) = mergeLabel;
+                        sortedRes.channelNum(sortedRes.unifiedLabels == absLab)   = mergeChannel;
+                        groupList(absMembers)   = mergeLabel;
+                        channelList(absMembers) = mergeChannel;
+                        mergedFlag(absMembers)  = true;
+                        nMerged = nMerged + 1;
+
+                        % Record this merge for the Auto-panel pair
+                        % walker. We store the (primary, absorbed)
+                        % index pair so the user can step through every
+                        % merge and inspect both constituents.
+                        autoMergedPrimary(end+1,1)  = primary;  %#ok<AGROW>
+                        autoMergedAbsorbed(end+1,1) = absorbed; %#ok<AGROW>
+                    end
+                end
+            end
+        catch ME
+            uialert(parentFig, sprintf('Phase 6 (merge) failed: %s', ME.message), 'Auto Curation Error');
+            return;
+        end
+
+        % Recompute per-unit metrics now that some labels collapsed.
+        try
+            preprocessSortedData();
+            if nMerged > 0
+                % Phase 2 already classified before any merges. Only
+                % re-classify if Phase 6 actually changed any spike
+                % trains; otherwise the existing labels are still
+                % correct and we save a numGroups-sized loop.
+                classifyIsolationAll();
+            end
+            % Keep channelPlot in sync with the post-merge channelList
+            % (avoids calling updateChannelPlot which would also force
+            % an early plotOption redraw mid-pipeline).
+            channelPlot = channelList + [-numChannelPlot:numChannelPlot];
+            refreshLabels();
+            refreshDensity();
+            refreshISI();
+            refreshCCG();
+        catch ME
+            uialert(parentFig, sprintf('Recompute failed: %s', ME.message), 'Auto Curation Error');
+        end
+
+        % --- Phase 7: auto-limit each surviving unit (inline) --------
+        % Compute presence-ratio density per unit and look for a
+        % dropRate-fold rate change with findchangepts; trim
+        % stable_length to the stable epoch. Done inline so we do not
+        % trigger plotOption over hundreds of groups via onAutoCut.
+        densityBinSize = max(1, round(trialLength/(2*ccgLag)));
+        for k = 1:numGroups
+            if isnan(groupList(k)), continue; end
+            stable_length(k,:) = [1, trialLength];
+            spk_k = unique(sortedRes.spike_idx( ...
+                sortedRes.unifiedLabels == groupList(k)));
+            if numel(spk_k) < 10, continue; end
+            try
+                [Dc_centers, Dc_counts, ~] = presenceRatio( ...
+                    spk_k, cfg.samplingFrequency, trialLength, ...
+                    densityBinSize, smoothN);
+                % Do NOT store into DenCenters / DenCounts here -- those
+                % cells are indexed by LABEL elsewhere, and caching them
+                % under the group INDEX would later trip plotDensity
+                % into reading a stale (zeroed) presence_ratio scalar.
+                if numel(Dc_counts) >= 3
+                    [sI, eI] = limitStableInterval(Dc_counts, dropRate);
+                    xs = Dc_centers(sI); xe = Dc_centers(eI);
+                    span = max(Dc_centers(end), eps);
+                    stable_length(k,1) = max(1, min(trialLength, ...
+                        trialLength * (xs - Dc_centers(1)) / span));
+                    stable_length(k,2) = max(1, min(trialLength, ...
+                        trialLength * xe / span));
+                end
+            catch
+                % skip units whose density cannot be computed
+            end
+        end
+
+        plotOption();
+
+        if exist('lblSave','var') && isvalid(lblSave)
+            lblSave.Text = sprintf('Auto curation: %d merges', nMerged);
+        end
+        fprintf('Auto curation: %d pairs merged.\n', nMerged);
+
+        % Surface the audit count for whichever pair-type the user
+        % currently has selected so the walker is ready to browse it.
+        if exist('uifAutoPair2','var') && isvalid(uifAutoPair2)
+            [aArr, ~] = currentAutoPairList();
+            uifAutoPair2.Value = sprintf('/%d', numel(aArr));
+        end
+
+        % Plain-language summary popup for the user. No "Phase X"
+        % jargon -- just what changed, ordered to match the
+        % removal -> cleaning -> merge pipeline.
+        summaryMsg = sprintf([ ...
+            'Auto curation finished.\n\n', ...
+            '  Removed (zero rate):    %d\n', ...
+            '  Removed (overlap):      %d\n', ...
+            '  Cleaned (CCG peak):     %d spike-strips\n', ...
+            '  Merged pairs:           %d\n'], ...
+            nAutoZeroDrops, nAutoCoincDrops, nAutoCCGStrips, ...
+            nMerged);
+        try
+            uialert(parentFig, summaryMsg, 'Auto curation complete', ...
+                'Icon', 'success');
+        catch
+            disp(summaryMsg);
+        end
+    end
+
+    function resetAutoButton()
+        % Re-enable the Auto button when onAutoCurate finishes (or
+        % errors out). Wired via onCleanup so we never leave the
+        % button stuck in disabled state.
+        if exist('btnAutoCurate','var') && isvalid(btnAutoCurate)
+            btnAutoCurate.Enable = 'on';
+        end
+    end
+
+    function resetSplitButton(prevSaveLbl)
+        % Re-enable the Split button when onSplit finishes / errors.
+        if exist('btnSplit','var') && isvalid(btnSplit)
+            btnSplit.Enable = 'on';
+            if isprop(btnSplit,'Text')
+                btnSplit.Text = 'Split';
+            end
+        end
+        if exist('lblSave','var') && isvalid(lblSave) && nargin > 0
+            try
+                lblSave.Text = prevSaveLbl;
+            catch
+            end
+        end
+    end
+
+    function [ccg, zeroBinIdx] = pairCCG(spkA, spkB, maxLagSamples, binSamples)
+        % Build a 1-D cross-correlogram histogram of (spkB - spkA)
+        % differences inside ±maxLagSamples, binned at binSamples
+        % resolution. Uses a two-pointer sweep so total work is
+        % O(nA + nB + #pairs-in-range) rather than O(num_Samples).
+        spkA = sort(spkA(:));
+        spkB = sort(spkB(:));
+        nA   = numel(spkA);
+        nB   = numel(spkB);
+        halfBins   = floor(maxLagSamples / binSamples);
+        nBins      = 2*halfBins + 1;
+        zeroBinIdx = halfBins + 1;
+        ccg        = zeros(nBins, 1);
+        if nA == 0 || nB == 0, return; end
+
+        % Pre-compute every pairwise difference within range using
+        % two pointers. For each k spike we keep a moving window
+        % [j_lo, j_hi] over spkB.
+        b_lo = 1; b_hi = 0;
+        diffsCell = cell(nA, 1);
+        for i = 1:nA
+            t = spkA(i);
+            while b_lo <= nB && spkB(b_lo) < t - maxLagSamples
+                b_lo = b_lo + 1;
+            end
+            while b_hi < nB && spkB(b_hi + 1) <= t + maxLagSamples
+                b_hi = b_hi + 1;
+            end
+            if b_lo <= b_hi
+                diffsCell{i} = spkB(b_lo:b_hi) - t;
+            end
+        end
+        if all(cellfun(@isempty, diffsCell)), return; end
+        allDiffs = vertcat(diffsCell{:});
+        if isempty(allDiffs), return; end
+        binIdx = round(double(allDiffs) / binSamples) + zeroBinIdx;
+        keep   = binIdx >= 1 & binIdx <= nBins;
+        binIdx = binIdx(keep);
+        if isempty(binIdx), return; end
+        ccg = accumarray(binIdx(:), 1, [nBins, 1]);
+    end
+
+    function tf = ccgPeakAtZero(ccg, zeroBinIdx, zeroTolBins, ratio)
+        % True iff ALL of these hold:
+        %   * the CCG has a peak in the lag-zero window
+        %     (zeroBinIdx +/- zeroTolBins -- so with the default
+        %     zeroTolBins=1, that's bins -1, 0, +1 in lag units)
+        %     whose value is the (joint) global max of the whole
+        %     CCG. Computing it as "max-in-window must equal
+        %     max-anywhere" handles ties cleanly: if two non-zero
+        %     bins are tied for the top, MATLAB's max(...) would
+        %     only point at the first one, so a tie split between
+        %     a zero-window bin and an off-zero bin used to slip
+        %     past undetected -- now both have to be present in
+        %     the window for the test to pass.
+        %   * that peak is greater than `ratio` times the baseline,
+        %     where baseline = MEDIAN of the *non-peak* bins (the
+        %     rest of the CCG outside the lag-zero window). Using
+        %     the median instead of the mean makes the baseline
+        %     robust to a few high off-zero bins (real biological
+        %     coupling, edge artefacts) -- a couple of outlier bins
+        %     no longer drag the baseline up far enough to mask
+        %     a genuine duplicate peak.
+        % If the baseline is all-zero we don't trigger -- there's
+        % nothing to compare the peak against, so conservatively
+        % treat that as "not a real peak".
+        tf = false;
+        if isempty(ccg) || all(ccg == 0), return; end
+        nB         = numel(ccg);
+        peakRange  = max(1, zeroBinIdx-zeroTolBins) : min(nB, zeroBinIdx+zeroTolBins);
+        if isempty(peakRange), return; end
+        peakValue  = max(ccg(peakRange));
+        offRange   = ccg;
+        offRange(peakRange) = [];
+        if isempty(offRange)
+            return;     % CCG is entirely inside the peak window
+        end
+        % Off-window must NOT have a strictly larger bin -- if it
+        % does, the actual global max sits away from zero and this
+        % isn't a "true peak at zero" pair.
+        if any(offRange > peakValue), return; end
+        if ~any(offRange > 0)
+            return;     % no baseline activity -> can't compare
+        end
+        baseline = median(offRange);
+        % Sparse CCGs (most off-zero bins are zero) end up with
+        % median = 0, which would make the test trivially true for
+        % any non-zero peak. Fall back to the mean of non-zero
+        % off-window bins so the baseline still reflects the
+        % typical non-zero rate.
+        if baseline <= 0
+            nz = offRange(offRange > 0);
+            if isempty(nz), return; end
+            baseline = mean(nz);
+            if baseline <= 0, return; end
+        end
+        tf = peakValue > ratio * baseline;
+    end
+
+    function lag = autoSignedNearestLag(A, B)
+        % For each element of A, signed lag (samples) to its nearest
+        % neighbour in B: lag(i) = B_nearest - A(i). Positive means
+        % the B spike comes after the A spike. NaN when B is empty.
+        % Used by the Phase 5 timing-consistency gate so we can tell
+        % whether the coincident spikes cluster around a specific
+        % sub-ms offset (real duplicate) or are scattered (random).
+        A = A(:); B = B(:);
+        nA = numel(A); nB = numel(B);
+        lag = nan(nA, 1);
+        if nA == 0 || nB == 0, return; end
+        [Bs, ~]    = sort(B);
+        [As, srtA] = sort(A);
+        j = 1;
+        for ii = 1:nA
+            while j < nB && Bs(j+1) < As(ii)
+                j = j + 1;
+            end
+            bestDiff = Bs(j) - As(ii);
+            bestAbs  = abs(bestDiff);
+            if j+1 <= nB
+                d2 = Bs(j+1) - As(ii);
+                if abs(d2) < bestAbs
+                    bestDiff = d2; bestAbs = abs(d2);
+                end
+            end
+            if j-1 >= 1
+                d2 = Bs(j-1) - As(ii);
+                if abs(d2) < bestAbs
+                    bestDiff = d2; bestAbs = abs(d2);
+                end
+            end
+            lag(srtA(ii)) = bestDiff;
+        end
+    end
+
+    function trimSplitSlot(idx)
+        % Remove the unit at index `idx` from every per-unit array.
+        % Caller guarantees idx is at the end of the array (so other
+        % indices don't have to shift) and that the slot is a
+        % dissolved Split-created unit (groupList = NaN AND
+        % originalGroupList = NaN). Pure structural cleanup --
+        % does NOT touch sortedRes.* (the spike rows are restored
+        % independently via originalUnifiedLabels in onUndo).
+        if idx < 1, return; end
+
+        % Drop scalar / vector arrays (length numGroups).
+        if numel(groupList)        >= idx, groupList(idx)        = []; end
+        if numel(channelList)      >= idx, channelList(idx)      = []; end
+        if numel(mergedFlag)       >= idx, mergedFlag(idx)       = []; end
+        if numel(unitIsolation)    >= idx, unitIsolation(idx)    = []; end
+        if numel(mainPolarity)     >= idx, mainPolarity(idx)     = []; end
+        if numel(sidePolarity)     >= idx, sidePolarity(idx)     = []; end
+        if numel(detectblity)      >= idx, detectblity(idx)      = []; end
+        if numel(chkBoxSelect)     >= idx, chkBoxSelect(idx)     = []; end
+        if numel(chkBoxVis)        >= idx, chkBoxVis(idx)        = []; end
+        if numel(unitNotes)        >= idx, unitNotes(idx)        = []; end
+        if numel(originalGroupList)   >= idx, originalGroupList(idx)   = []; end
+        if numel(originalChannelList) >= idx, originalChannelList(idx) = []; end
+
+        % Per-unit struct arrays inside `preprocessed`.
+        if isfield(preprocessed,'firingRate') && numel(preprocessed.firingRate) >= idx
+            preprocessed.firingRate(idx) = [];
+        end
+        if isfield(preprocessed,'isiViolation') && numel(preprocessed.isiViolation) >= idx
+            preprocessed.isiViolation(idx) = [];
+        end
+        if isfield(preprocessed,'logFiringRate') && numel(preprocessed.logFiringRate) >= idx
+            preprocessed.logFiringRate(idx) = [];
+        end
+
+        % 2-D rows.
+        if size(stable_length,1)            >= idx, stable_length(idx,:)          = []; end
+        if size(channelPlot,1)              >= idx, channelPlot(idx,:)            = []; end
+        if size(sampleWaveform,1)           >= idx, sampleWaveform(idx,:,:)       = []; end
+        if size(originalSampleWaveform,1)   >= idx, originalSampleWaveform(idx,:,:) = []; end
+
+        % NxN caches: drop both the row and the column at idx.
+        if size(xcorr_vals,1)    >= idx, xcorr_vals(idx,:)    = []; end
+        if size(xcorr_vals,2)    >= idx, xcorr_vals(:,idx)    = []; end
+        if size(isiCounts,1)     >= idx, isiCounts(idx,:)     = []; end
+        if size(isiCounts,2)     >= idx, isiCounts(:,idx)     = []; end
+        if size(isiCenters,1)    >= idx, isiCenters(idx,:)    = []; end
+        if size(isiCenters,2)    >= idx, isiCenters(:,idx)    = []; end
+        if size(isiViolations,1) >= idx, isiViolations(idx,:) = []; end
+        if size(isiViolations,2) >= idx, isiViolations(:,idx) = []; end
+        if size(DenCenters,1)    >= idx, DenCenters(idx,:)    = []; end
+        if size(DenCenters,2)    >= idx, DenCenters(:,idx)    = []; end
+        if size(DenCounts,1)     >= idx, DenCounts(idx,:)     = []; end
+        if size(DenCounts,2)     >= idx, DenCounts(:,idx)     = []; end
+        if size(presence_ratio,1)>= idx, presence_ratio(idx,:)= []; end
+        if size(presence_ratio,2)>= idx, presence_ratio(:,idx)= []; end
+
+        % Drop / clean up UI handles for this slot. Nested functions
+        % share the parent's workspace so we can mutate the handle
+        % arrays directly.
+        if numel(groupSelectCheckboxes) >= idx
+            if isvalid(groupSelectCheckboxes(idx))
+                delete(groupSelectCheckboxes(idx));
+            end
+            groupSelectCheckboxes(idx) = [];
+        end
+        if numel(groupVisCheckboxes) >= idx
+            if isvalid(groupVisCheckboxes(idx))
+                delete(groupVisCheckboxes(idx));
+            end
+            groupVisCheckboxes(idx) = [];
+        end
+        if numel(groupRadioButtons) >= idx
+            if isvalid(groupRadioButtons(idx))
+                delete(groupRadioButtons(idx));
+            end
+            groupRadioButtons(idx) = [];
+        end
+        if exist('lblGroupHandles','var') && numel(lblGroupHandles) >= idx
+            if isvalid(lblGroupHandles(idx)), delete(lblGroupHandles(idx)); end
+            lblGroupHandles(idx) = [];
+        end
+        if exist('lblChannelHandles','var') && numel(lblChannelHandles) >= idx
+            if isvalid(lblChannelHandles(idx)), delete(lblChannelHandles(idx)); end
+            lblChannelHandles(idx) = [];
+        end
+        if exist('lblIsolation','var') && numel(lblIsolation) >= idx
+            if isvalid(lblIsolation(idx)), delete(lblIsolation(idx)); end
+            lblIsolation(idx) = [];
+        end
+        if exist('lblRate','var') && numel(lblRate) >= idx
+            if isvalid(lblRate(idx)), delete(lblRate(idx)); end
+            lblRate(idx) = [];
+        end
+        if exist('lblDetectablity','var') && numel(lblDetectablity) >= idx
+            if isvalid(lblDetectablity(idx)), delete(lblDetectablity(idx)); end
+            lblDetectablity(idx) = [];
+        end
+        if exist('lblISIViolation','var') && numel(lblISIViolation) >= idx
+            if isvalid(lblISIViolation(idx)), delete(lblISIViolation(idx)); end
+            lblISIViolation(idx) = [];
+        end
+
+        % selected_order: drop idx (no shifting; we only trim trailing).
+        selected_order(selected_order == idx) = [];
+
+        % All Auto-pair audit trails: drop entries that touched idx.
+        % Any of the four lists may be non-empty after an Auto run.
+        if ~isempty(autoMergedPrimary)
+            keep = (autoMergedPrimary ~= idx) & (autoMergedAbsorbed ~= idx);
+            autoMergedPrimary  = autoMergedPrimary(keep);
+            autoMergedAbsorbed = autoMergedAbsorbed(keep);
+        end
+        if ~isempty(autoOverlapDroppedK)
+            keep = (autoOverlapDroppedK ~= idx) & (autoOverlapTriggerJ ~= idx);
+            autoOverlapDroppedK = autoOverlapDroppedK(keep);
+            autoOverlapTriggerJ = autoOverlapTriggerJ(keep);
+        end
+        if ~isempty(autoCCGStripCont)
+            keep = (autoCCGStripCont ~= idx) & (autoCCGStripClean ~= idx);
+            autoCCGStripCont  = autoCCGStripCont(keep);
+            autoCCGStripClean = autoCCGStripClean(keep);
+        end
+    end
+
+    function classifyIsolationAll()
+        % Composite ISI / ACG / SNR score; weights 0.4 / 0.4 / 0.2 so
+        % a clean ISI+ACG can earn SUA even with modest SNR.
+        snrAll = 1 + detectblity;
+        for k = 1:numGroups
+            if isnan(groupList(k))
+                unitIsolation{k} = 'NA';
+                continue;
+            end
+            isi      = preprocessed.isiViolation(k);
+            sr       = snrAll(k);
+            acgRatio = acgRefractoryRatio(k);
+            if isnan(isi),      isi = 2.0;   end
+            if isnan(sr),       sr  = 1.0;   end
+            if isnan(acgRatio), acgRatio = 1; end
+
+            sIsi  = max(0, 1 - isi / 2.0);
+            sSnr  = max(0, min(1, (sr - 1) / 4));
+            sAcg  = max(0, 1 - acgRatio / 0.10);
+            score = 0.4*sIsi + 0.4*sAcg + 0.2*sSnr;
+
+            if score >= 0.85 && isi < 0.5 && acgRatio < 0.05
+                unitIsolation{k} = 'SUA+';
+            elseif score >= 0.65 && isi < 1.0
+                unitIsolation{k} = 'SUA';
+            elseif score >= 0.45
+                unitIsolation{k} = 'MUA+';
+            else
+                unitIsolation{k} = 'MUA';
+            end
+        end
+    end
+
+
+    function [startIdx, endIdx] = limitStableInterval(d, dropFactor)
+        % Identical heuristic to onAutoCut's findStableInterval:
+        % findchangepts -> if 1 cp, trim the side whose mean rate is
+        % more than dropFactor lower than the other; if 2+ cps, walk
+        % them and tighten startIdx / endIdx whenever the same drop
+        % criterion is met (also confirmed against the next-segment
+        % mean to avoid trimming a transient dip). Without this
+        % multi-cp branch, Phase 5 silently never trims units that
+        % have a drop+recovery+drop shape.
+        n = numel(d);
+        startIdx = 1; endIdx = n;
+        if n < 3, return; end
+        cp = findchangepts(d, 'Statistic', 'rms', 'MinThreshold', 5);
+        if isscalar(cp)
+            if mean(d(1:cp)) < mean(d(cp+1:end)) / dropFactor
+                startIdx = cp + 1; endIdx = n;
+            elseif mean(d(1:cp)) / dropFactor > mean(d(cp+1:end))
+                startIdx = 1; endIdx = cp;
+            end
+        elseif numel(cp) >= 2
+            for ci = 1:numel(cp)
+                if mean(d(1:cp(ci))) < mean(d(cp(ci)+1:end))/dropFactor && ...
+                   mean(d(1:cp(ci))) < mean(d(cp(ci)+1:min(2*cp(ci),n)))/dropFactor
+                    startIdx = cp(ci)+1;
+                elseif mean(d(startIdx:cp(ci)))/dropFactor > mean(d(cp(ci)+1:end)) && ...
+                       mean(d(startIdx:cp(ci)))/dropFactor > mean(d(cp(ci)+1:min(2*cp(ci),n)))
+                    endIdx = cp(ci);
+                    break
+                end
+            end
+        end
+    end
+
+    function setOverlapVal(val)
+        if ~isempty(val) && isfinite(val) && val >= 0 && val <= 1
+            autoOverlapFrac = val;
+        end
+    end
+
+    function setAutoDistVal(val)
+        if ~isempty(val) && isfinite(val) && val >= 0
+            autoDistVal = val;
+        end
+    end
+
+    function setAutoSimVal(val)
+        if ~isempty(val) && isfinite(val) && val >= 0 && val <= 1
+            autoSimVal = val;
+        end
+    end
+
+    function setAutoAmpVal(val)
+        if ~isempty(val) && isfinite(val) && val >= 0 && val <= 1
+            autoAmpVal = val;
+        end
+    end
+
+    function setAutoIsiVal(val)
+        if ~isempty(val) && isfinite(val) && val >= 0
+            autoIsiVal = val;
+        end
+    end
+
+    function setAutoPCVal(val)
+        if ~isempty(val) && isfinite(val) && val >= 0
+            autoPCVal = val;
+        end
+    end
+
+    function setAutoBudgetVal(val)
+        if ~isempty(val) && isfinite(val) && val >= 1
+            autoIsiBudget = val;
+        end
+    end
+
+    function setAutoCCGRatio(val)
+        % Auto-cleanup peak/baseline-median ratio. Clamped to
+        % [0.5, 10] -- below 0.5 the test would trigger on the
+        % median itself (i.e. nothing); above 10 even the most
+        % obvious shared-spike pairs would slip past.
+        if ~isempty(val) && isfinite(val)
+            autoCCGRatio = max(0.5, min(10, val));
+        end
+    end
+
+    function setSplitMethod(val)
+        if ~isempty(val) && (ischar(val) || isstring(val))
+            splitMethod = char(val);
+        end
+    end
+
+    function setSplitNumClusters(val)
+        if ~isempty(val) && isfinite(val) && val >= 2
+            splitNumClusters = max(2, round(val));
+        end
+    end
+
+    function lbl = effLabel(k)
+        % Effective label of group k for plotting / spike lookup. When
+        % a unit is marked as removed (groupList(k) = NaN) we still
+        % want to be able to visualise it, so fall back to the unit's
+        % pre-curation label in originalGroupList.
+        if k >= 1 && k <= numGroups && ~isnan(groupList(k))
+            lbl = groupList(k);
+        elseif k >= 1 && k <= numel(originalGroupList)
+            lbl = originalGroupList(k);
+        else
+            lbl = NaN;
+        end
+    end
+
+    function lbls = effLabelVec(ks)
+        % Vectorised version of effLabel — avoids the arrayfun /
+        % function-call overhead when resolving the effective labels of
+        % many indices at once (called every plotWaveforms / plotCCG /
+        % plotISI redraw for every selected unit).
+        ks   = ks(:);
+        lbls = nan(size(ks));
+        valid = ks >= 1 & ks <= numGroups;
+        if any(valid)
+            kv         = ks(valid);
+            gl         = groupList(kv);
+            useOrig    = isnan(gl);
+            % primary path: groupList value when not NaN
+            lbls(valid) = gl;
+            % NaN-marked units fall back to the pre-curation label
+            if any(useOrig)
+                kfall = kv(useOrig);
+                inOrig = kfall >= 1 & kfall <= numel(originalGroupList);
+                if any(inOrig)
+                    out = originalGroupList(kfall(inOrig));
+                    % map back into lbls
+                    validIdx = find(valid);
+                    fallIdx  = validIdx(useOrig);
+                    fallIdx  = fallIdx(inOrig);
+                    lbls(fallIdx) = out;
+                end
+            end
+        end
+    end
+
+    function r = acgRefractoryRatio(k)
+        % Refractory ratio: count of ISI < 1.5 ms divided by count in
+        % the 5-25 ms window. Smaller is better (cleaner refractory
+        % hole). Returns 1 (worst) when there are too few spikes or
+        % the baseline window is empty, so under-sampled units do not
+        % spuriously look refractory.
+        r = 1;
+        if isnan(groupList(k)), return; end
+        spk = sortedRes.spike_idx(sortedRes.unifiedLabels == groupList(k));
+        if numel(spk) < 50, return; end
+        d = diff(sort(double(spk))) / cfg.samplingFrequency * 1000;
+        if isempty(d), return; end
+        nearZero = sum(d < 1.5);
+        baseline = sum(d >= 5 & d <= 25);
+        if baseline < 5, return; end
+        r = nearZero / baseline;
+    end
+
+    function ok = checkPCDistance(gA, gB, thr)
+        % Project each group's mean waveform onto the shared channel's
+        % PCA basis and compare PC1/PC2. Returns false only when both
+        % groups have a valid projection AND their normalised distance
+        % exceeds thr; empty PCA / out-of-footprint cases pass through.
+        %
+        % When the user-selected similarity metric is XCorr, mwB is
+        % first shifted by the lag that maximises the cross-correlation
+        % with mwA before projecting. This way the PC distance reflects
+        % shape mismatch only, not a sub-sample timing offset that the
+        % XCorr similarity score has already accounted for. KL / Bhatta
+        % already operate on per-spike PCA scores, so no realignment
+        % is applied for those metrics.
+        ok = true;
+        ch = channelList(gA);
+        if ch < 1 || ch > numChannels, return; end
+        if isempty(PCA{ch}) || ~isfield(PCA{ch},'coeff') || isempty(PCA{ch}.coeff)
+            return;
+        end
+        mwA = localMeanWaveform(gA, ch);
+        mwB = localMeanWaveform(gB, ch);
+        if isempty(mwA) || isempty(mwB), return; end
+
+        if strcmp(distanceEstType, 'XCorr')
+            mwA_row = mwA(:)';
+            mwB_row = mwB(:)';
+            M2 = numel(mwA_row);
+            if M2 == numel(mwB_row) && M2 > 4
+                maxLag = max(1, round(M2/4));
+                [~, bestLag] = max_half_corr(mwA_row, mwB_row, 1, M2, maxLag, 0);
+                if isfinite(bestLag) && bestLag ~= 0
+                    % bestLag is "B leads A by bestLag samples"; shift
+                    % B by -bestLag to bring it into A's frame.
+                    mwB = circshift(mwB_row, -bestLag);
+                    mwB = mwB(:);
+                end
+            end
+        end
+
+        pcA = (mwA(:)' - PCA{ch}.mu) * PCA{ch}.coeff;
+        pcB = (mwB(:)' - PCA{ch}.mu) * PCA{ch}.coeff;
+        scale = max(PCA{ch}.max(:));
+        if scale <= 0, scale = 1; end
+        ok = norm(pcA - pcB) / scale <= thr;
+    end
+
+    function mw = localMeanWaveform(g, ch)
+        % Mean waveform of group g on global channel ch (empty if ch is
+        % outside g's local footprint stored in sampleWaveform).
+        mw = [];
+        if isnan(channelList(g)), return; end
+        localIdx = ch - channelList(g) + numChannelPlot + 1;
+        if localIdx < 1 || localIdx > 2*numChannelPlot + 1, return; end
+        nLocal = size(sampleWaveform, 2);
+        if localIdx > nLocal, return; end
+        mw = squeeze(sampleWaveform(g, localIdx, :));
+    end
+
+    function ok = checkMergedISI(gA, gB, isiAbs, isiBudget)
+        % Decide whether merging gA into gB (or vice versa) is safe based
+        % on ISI-violation behaviour. Three independent gates:
+        %
+        %   1) Hard cap on the merged train: isiM <= isiAbs.
+        %   2) Per-parent cap: each parent's own ISI must already be
+        %      reasonable (<= isiAbs * isiBudget). This catches the
+        %      "small but contaminated unit dissolves into a large clean
+        %      one" failure mode -- the merged ISI looks fine because
+        %      the large clean parent dominates the spike count, so the
+        %      merge appears valid even though the small parent is
+        %      clearly bad.
+        %   3) Size-weighted budget: the merged ISI must not exceed
+        %      isiBudget * weighted-average parent ISI, where the
+        %      weights are the parent spike counts. The merged ISI of
+        %      two independent point processes is approximately this
+        %      weighted average, so the budget is naturally tighter
+        %      when one parent is much smaller. The budget is also
+        %      tightened toward 1.0 (no margin) as the size disparity
+        %      grows.
+        labA = groupList(gA); labB = groupList(gB);
+        spkA = sortedRes.spike_idx(sortedRes.unifiedLabels == labA);
+        spkB = sortedRes.spike_idx(sortedRes.unifiedLabels == labB);
+        NA = numel(spkA); NB = numel(spkB);
+        spkM = sort([spkA(:); spkB(:)]);
+        if numel(spkM) < 2
+            ok = true;
+            return;
+        end
+        [~,~,isiM] = getISIViolations(spkM, cfg.samplingFrequency, thresholdISI);
+        isiA = preprocessed.isiViolation(gA);
+        isiB = preprocessed.isiViolation(gB);
+
+        % Per-parent cap.
+        parentCap = isiAbs * max(isiBudget, 1);
+
+        % Spike-count-weighted average of parent ISIs.
+        denom        = max(NA + NB, 1);
+        weightedIsi  = (NA*isiA + NB*isiB) / denom;
+
+        % Each parent's ISI must sit close to the size-weighted
+        % average (within 0.5 %). This blocks merges where the two
+        % parents have wildly different ISI profiles -- a strong sign
+        % that they aren't drawn from the same source even when the
+        % combined train looks fine.
+        weightedDevCap = 0.5;
+        devA = abs(isiA - weightedIsi);
+        devB = abs(isiB - weightedIsi);
+
+        % Size-disparity factor in [0, 1]: 1 when NA == NB, ~0 when
+        % one is wildly larger. Used to shrink the effective budget
+        % toward 1.0 when sizes are very imbalanced.
+        sizeFactor   = 2 * min(NA, NB) / denom;
+        effBudget    = 1 + (isiBudget - 1) * sizeFactor;
+
+        budgetCap    = max(effBudget * weightedIsi, 1e-6);
+
+        ok = (isiM   <= isiAbs)         && ...
+             (isiA   <= parentCap)       && ...
+             (isiB   <= parentCap)       && ...
+             (devA   <= weightedDevCap)  && ...
+             (devB   <= weightedDevCap)  && ...
+             (isiM   <= budgetCap);
+    end
+
     function onSave()
         lblSave.Text = "Saving in Progress...";
         drawnow;
@@ -1583,19 +4316,109 @@ refreshLabels();
         numFields = numel(fieldnames(sorted_out));
         saveh5SpikeData_gui(outputFolder, sorted_out, zeros(numFields,1));
 
-        curatedSamples.unifiedLabels = unique(groupList);
-        curatedSamples.channelNum    = channelList(unique(groupList));
-        curatedSamples.waveform      = sampleWaveform(unique(groupList),:,:);
-        curatedSamples.unitIsolation = unitIsolation(unique(groupList));
-        curatedSamples.validInterval = stable_length(unique(groupList),:);
-        curatedSamples.spikePolarity = mainPolarity(unique(groupList),:);
+        % Pick one representative group index per unique surviving
+        % label, skipping NaN entries (units marked as removed). The
+        % older code indexed channelList / sampleWaveform / ... by
+        % the LABEL VALUE itself, which (a) only worked when labels
+        % happened to equal indices and (b) crashes on NaN.
+        [uniqLabels_curated, repIdx] = unique(groupList);
+        keepRow                      = ~isnan(uniqLabels_curated);
+        uniqLabels_curated           = uniqLabels_curated(keepRow);
+        repIdx                       = repIdx(keepRow);
+
+        curatedSamples.unifiedLabels = uniqLabels_curated;
+        curatedSamples.channelNum    = channelList(repIdx);
+        curatedSamples.waveform      = sampleWaveform(repIdx,:,:);
+        curatedSamples.unitIsolation = unitIsolation(repIdx);
+        curatedSamples.validInterval = stable_length(repIdx,:);
+        curatedSamples.spikePolarity = mainPolarity(repIdx,:);
+        if exist('unitNotes','var')
+            % Per-unit free-text notes (added in this version of the
+            % GUI). Saved alongside the curated payload so they
+            % survive across sessions.
+            try
+                curatedSamples.notes = unitNotes(repIdx);
+            catch
+            end
+        end
         curatedSamples.original.unifiedLabels = originalUnifiedLabels;
         curatedSamples.original.channelNum    = originalChannelNum;
         curatedSamples.original.waveform      = originalSampleWaveform;
         curatedSamples.original.unitIsolation = unitIsolation;
 
+        % --- Full session state (resume on next launch) -----------
+        % Everything the GUI needs to stand back up exactly where
+        % the user left off: per-unit arrays (length = numGroups,
+        % including dropped/merged units in their original slots)
+        % and the post-curation per-spike arrays (with -1 markers
+        % for cleanup-stripped spikes intact). On the next launch,
+        % the constructor checks for curated_sample.mat in this
+        % folder and applies session.* on top of the freshly-loaded
+        % raw sort data.
+        curatedSamples.session.groupList     = groupList;
+        curatedSamples.session.channelList   = channelList;
+        curatedSamples.session.unitIsolation = unitIsolation;
+        curatedSamples.session.stable_length = stable_length;
+        curatedSamples.session.mainPolarity  = mainPolarity;
+        curatedSamples.session.sidePolarity  = sidePolarity;
+        curatedSamples.session.mergedFlag    = mergedFlag;
+        curatedSamples.session.unitNotes     = unitNotes;
+        curatedSamples.session.detectblity   = detectblity;
+        curatedSamples.session.numGroups     = numGroups;
+        curatedSamples.session.spikeLabels   = sortedRes.unifiedLabels;
+        curatedSamples.session.spikeIdx      = sortedRes.spike_idx;
+        curatedSamples.session.spikeChannels = sortedRes.channelNum;
+
         filename = fullfile(outputFolder,'curated_sample.mat');
         save(filename,'curatedSamples', '-v7.3');
+
+        % Also write a plain-text CSV summarising every surviving unit
+        % so the metrics can be opened directly in Excel / pandas /
+        % awk without having to load the .mat. Columns follow the
+        % same per-unit order as curated_sample.mat.
+        try
+            csvFile = fullfile(outputFolder, 'curated_metrics.csv');
+            nKept   = numel(repIdx);
+            ratesC  = preprocessed.firingRate(repIdx);
+            isiC    = preprocessed.isiViolation(repIdx);
+            snrC    = 1 + detectblity(repIdx);
+            polC    = mainPolarity(repIdx);
+            stableA = stable_length(repIdx,1);
+            stableB = stable_length(repIdx,2);
+            isoStr  = unitIsolation(repIdx);
+            if exist('unitNotes','var')
+                notesC = unitNotes(repIdx);
+            else
+                notesC = repmat({''}, nKept, 1);
+            end
+            % Build the table column by column to avoid issues if any
+            % of the inputs has unexpected shape.
+            T = table( ...
+                uniqLabels_curated(:),     ...
+                channelList(repIdx),       ...
+                ratesC(:),                 ...
+                isiC(:),                   ...
+                snrC(:),                   ...
+                isoStr(:),                 ...
+                polC(:),                   ...
+                stableA(:),                ...
+                stableB(:),                ...
+                notesC(:),                 ...
+                'VariableNames', { ...
+                    'Label','Channel','FiringRate_Hz', ...
+                    'ISI_violation_pct','SNR','Isolation', ...
+                    'Polarity','StableStart','StableEnd','Notes'});
+            writetable(T, csvFile);
+        catch ME
+            warning('CSV export failed: %s', ME.message);
+        end
+
+        % Checkpoint user prefs alongside the curated outputs so the
+        % next launch on this dataset remembers the panel tuning.
+        % saveKiaPrefs() writes to RES_Sorted/kiaSort_curate_prefs.mat
+        % and is best-effort (never throws), so a pref-write failure
+        % doesn't mask the data-save success message above.
+        saveKiaPrefs();
 
         uialert(parentFig,'Curated sorted data saved successfully!','Success','Icon','success')
         disp('Saved Curated Data');
@@ -1645,9 +4468,57 @@ refreshLabels();
         end
     end
 
+    function tf = plotUsesCosmetic()
+        % Plot types whose appearance depends on ampScale / lineWidth /
+        % alphaLevel. Cosmetic-only callbacks early-out when we are
+        % showing a plot type that ignores them (CCG / ISI / Density),
+        % saving a wasted full redraw.
+        tf = any(strcmpi(plotType, {'Waveform','Trace','Amplitude', ...
+                                    'PCs','Features','Multiple'}));
+    end
+
+    function tf = wfFastPathReady()
+        % True iff plotWaveforms has populated wfPlotCache and every
+        % cached line handle is still valid (not deleted by a later
+        % redraw of a different plot type).
+        tf = strcmpi(plotType,'Waveform') && ~isempty(wfPlotCache) ...
+             && isfield(wfPlotCache,'lines') && ~isempty(wfPlotCache.lines);
+        if tf
+            for ii = 1:numel(wfPlotCache.lines)
+                hs = wfPlotCache.lines{ii};
+                if isempty(hs) || ~all(isvalid(hs))
+                    tf = false;
+                    return;
+                end
+            end
+        end
+    end
+
     function updateScale(sVal)
         ampScale = sVal;
-        plotOption();
+        if wfFastPathReady()
+            % Fast path: rescale the existing line YData in place.
+            % set(handles, {'YData'}, cellOfRows) is a single MATLAB
+            % call per channel-group, instead of one call per line.
+            for ii = 1:numel(wfPlotCache.lines)
+                hs = wfPlotCache.lines{ii};
+                us = wfPlotCache.unscaledY{ii};
+                yo = wfPlotCache.yOff(ii);
+                yScaled = us * sVal + yo;
+                nRows = size(yScaled, 1);
+                if nRows == 1
+                    set(hs(1), 'YData', yScaled);
+                else
+                    nUse = min(nRows, numel(hs));
+                    if nUse > 0
+                        ydCells = mat2cell(yScaled(1:nUse,:), ones(nUse,1), size(yScaled,2));
+                        set(hs(1:nUse), {'YData'}, ydCells);
+                    end
+                end
+            end
+        elseif plotUsesCosmetic()
+            plotOption();
+        end
     end
 
     function updateLineWidth(sVal)
@@ -1655,7 +4526,15 @@ refreshLabels();
             sVal = eps;
         end
         lineWidth = sVal;
-        plotOption();
+        if wfFastPathReady()
+            for ii = 1:numel(wfPlotCache.lines)
+                hs   = wfPlotCache.lines{ii};
+                lw   = sVal * (1 + double(wfPlotCache.isMain(ii)));   % main = 2×
+                set(hs, 'LineWidth', lw);
+            end
+        elseif plotUsesCosmetic()
+            plotOption();
+        end
     end
 
     function updateAlphaLevel(sVal)
@@ -1663,7 +4542,15 @@ refreshLabels();
             sVal = eps;
         end
         alphaLevel = sVal;
-        plotOption();
+        if wfFastPathReady()
+            for ii = 1:numel(wfPlotCache.lines)
+                hs  = wfPlotCache.lines{ii};
+                rgb = wfPlotCache.rgb(ii,:);
+                set(hs, 'Color', [rgb, sVal]);
+            end
+        elseif plotUsesCosmetic()
+            plotOption();
+        end
     end
 
     function updateRealignSpikes(sVal)
@@ -1996,20 +4883,22 @@ disimlarityScore(15,14)
             thisCol = colGroup(thisGroup);
             thisRow = rowGroup(thisGroup);
 
-            % Calculate which page contains these units
+            % Calculate which page contains each unit, then land on the
+            % page of the HIGHER-firing-rate member (the merge target),
+            % so its radio button is rendered and can be selected
+            % below. This guarantees the auto-selected target is always
+            % visible regardless of whether the pair sits on one or two
+            % pages.
             targetPageCol = ceil(thisCol / PAGE_SIZE);
             targetPageRow = ceil(thisRow / PAGE_SIZE);
-
-            % If both units are on different pages, navigate to the first one's page
-            if targetPageCol ~= currentPage && targetPageRow ~= currentPage
-                currentPage = max(targetPageCol,targetPageRow);
+            if preprocessed.firingRate(thisCol) >= preprocessed.firingRate(thisRow)
+                targetPage = targetPageCol;
+            else
+                targetPage = targetPageRow;
+            end
+            if targetPage ~= currentPage
+                currentPage = targetPage;
                 onChangePage(0); % Refresh page without changing page number
-            elseif targetPageCol ~= currentPage
-                currentPage = max(targetPageCol,targetPageRow);
-                onChangePage(0);
-            elseif targetPageRow ~= currentPage
-                currentPage = max(targetPageCol,targetPageRow);
-                onChangePage(0);
             end
 
             chkBoxVis(thisCol) = 1;
@@ -2069,6 +4958,208 @@ disimlarityScore(15,14)
         changeuifParAll(pairNum);
         end
         plotOption()
+    end
+
+    function [aArr, bArr] = currentAutoPairList()
+        % Resolve the audit arrays for whichever target the user
+        % picked from the Auto-panel dropdown. Two return shapes:
+        %   PAIR-mode: aArr and bArr are equal-length index vectors
+        %              and the walker highlights both per click.
+        %   UNIT-mode: bArr is empty; aArr is a list of unit
+        %              indices and the walker highlights one per
+        %              click.
+        switch autoPairType
+            case 'Overlap removed'
+                aArr = autoOverlapDroppedK;
+                bArr = autoOverlapTriggerJ;
+            case 'CCG cleaned'
+                % Legacy walker target; the dropdown no longer
+                % exposes this, but a hot-reload could still set
+                % autoPairType to it -- handle gracefully.
+                aArr = autoCCGStripCont;
+                bArr = autoCCGStripClean;
+            case {'SUA+','SUA','MUA+','MUA'}
+                % Unit-class walker. Iterate every surviving unit
+                % whose unitIsolation matches the dropdown value.
+                aArr = unitsByIsolation(autoPairType);
+                bArr = [];
+            case 'NaN'
+                % Dropped / unclassified units: anything with NaN
+                % groupList OR an explicit 'NA' isolation flag. We
+                % unique() because zero-rate dropped units may carry
+                % both markers and we don't want duplicate stops.
+                isoNA = strcmp(unitIsolation, 'NA');
+                if numel(isoNA) ~= numel(groupList)
+                    isoNA = false(size(groupList));
+                end
+                aArr = unique(find(isnan(groupList(:)) | isoNA(:)));
+                bArr = [];
+            otherwise   % 'Merged'
+                aArr = autoMergedPrimary;
+                bArr = autoMergedAbsorbed;
+        end
+    end
+
+    function idx = unitsByIsolation(isoStr)
+        % Return the indices of every surviving unit whose
+        % unitIsolation cell exactly matches isoStr. Skips NaN
+        % groupList slots so the unit-class walker only stops at
+        % units that still exist on the page.
+        idx = [];
+        if isempty(unitIsolation), return; end
+        n = numel(unitIsolation);
+        for ii = 1:n
+            if ii > numel(groupList) || isnan(groupList(ii)), continue; end
+            if strcmp(unitIsolation{ii}, isoStr)
+                idx(end+1,1) = ii; %#ok<AGROW>
+            end
+        end
+    end
+
+    function tf = isUnitModePairType(typeStr)
+        % True for dropdown items that walk a flat list of units
+        % rather than (left,right) pairs.
+        tf = any(strcmp(typeStr, {'SUA+','SUA','MUA+','MUA','NaN'}));
+    end
+
+    function onSelectMergedPairs(direction)
+        % Walker over the targets the user picked from the dropdown.
+        % Pair-mode targets (Merged / Overlap removed) keep their
+        % (primary, absorbed) shape and the walker highlights BOTH
+        % units. Unit-mode targets (SUA+ / SUA / MUA+ / MUA / NaN)
+        % carry a flat list of unit indices and the walker
+        % highlights ONE unit per click.
+        [aArr, bArr] = currentAutoPairList();
+        nPairs = numel(aArr);
+        if nPairs == 0
+            % Nothing to walk; just reset the counter UI and bail out.
+            if exist('uifAutoPair','var') && isvalid(uifAutoPair)
+                uifAutoPair.Value = '0';
+            end
+            if exist('uifAutoPair2','var') && isvalid(uifAutoPair2)
+                uifAutoPair2.Value = '/0';
+            end
+            return;
+        end
+
+        thisIdx = lastAutoPair + direction;
+        if thisIdx < 1 || thisIdx > nPairs
+            % Wrap-style behaviour matches the Similarity walker: if we
+            % run off either end, snap back to a valid range and stop
+            % stepping further.
+            thisIdx = max(1, min(nPairs, thisIdx));
+        end
+
+        unitMode  = isempty(bArr) || numel(bArr) ~= numel(aArr);
+        primaryIdx = aArr(thisIdx);
+        if unitMode
+            absorbedIdx = [];
+        else
+            absorbedIdx = bArr(thisIdx);
+        end
+
+        % Land on the page that contains the primary so its row is
+        % rendered, then highlight one or two constituents depending
+        % on the walker mode.
+        targetPage = ceil(primaryIdx / PAGE_SIZE);
+        if targetPage ~= currentPage
+            currentPage = targetPage;
+            onChangePage(0);
+        end
+
+        selected_order        = [];
+        onAllSelectChecked(false);
+        onAllVisChecked(false);
+
+        chkBoxVis(primaryIdx)     = 1;
+        chkBoxSelect(primaryIdx)  = 1;
+        if ~unitMode
+            chkBoxVis(absorbedIdx)    = 1;
+            chkBoxSelect(absorbedIdx) = 1;
+            selected_order            = [primaryIdx, absorbedIdx];
+        else
+            selected_order            = primaryIdx;
+        end
+
+        if isvalid(groupVisCheckboxes(primaryIdx)) && isprop(groupVisCheckboxes(primaryIdx),'Value')
+            groupVisCheckboxes(primaryIdx).Value    = true;
+            groupSelectCheckboxes(primaryIdx).Value = true;
+            cP = getGroupColor(groupList(primaryIdx));
+            groupVisCheckboxes(primaryIdx).FontColor    = cP;
+            groupVisCheckboxes(primaryIdx).FontWeight   = 'Bold';
+            groupSelectCheckboxes(primaryIdx).FontColor = cP;
+            groupSelectCheckboxes(primaryIdx).FontWeight = 'Bold';
+            lblChannelHandles(primaryIdx).BackgroundColor = cP;
+            lblChannelHandles(primaryIdx).FontColor       = bestTextColorFor(cP);
+        end
+        if ~unitMode && isvalid(groupVisCheckboxes(absorbedIdx)) && ...
+                isprop(groupVisCheckboxes(absorbedIdx),'Value')
+            groupVisCheckboxes(absorbedIdx).Value    = true;
+            groupSelectCheckboxes(absorbedIdx).Value = true;
+            cA = getGroupColor(groupList(absorbedIdx));
+            groupVisCheckboxes(absorbedIdx).FontColor    = cA;
+            groupVisCheckboxes(absorbedIdx).FontWeight   = 'Bold';
+            groupSelectCheckboxes(absorbedIdx).FontColor = cA;
+            groupSelectCheckboxes(absorbedIdx).FontWeight = 'Bold';
+            lblChannelHandles(absorbedIdx).BackgroundColor = cA;
+            lblChannelHandles(absorbedIdx).FontColor       = bestTextColorFor(cA);
+        end
+
+        if isvalid(groupRadioButtons(primaryIdx)) && isprop(groupRadioButtons(primaryIdx),'Value')
+            groupRadioButtons(primaryIdx).Value = true;
+        end
+
+        lastAutoPair = thisIdx;
+        if exist('uifAutoPair','var') && isvalid(uifAutoPair)
+            uifAutoPair.Value  = num2str(thisIdx);
+        end
+        if exist('uifAutoPair2','var') && isvalid(uifAutoPair2)
+            uifAutoPair2.Value = sprintf('/%d', nPairs);
+        end
+        plotOption();
+    end
+
+    function changeAutoPair(val)
+        % Editable counter on the Auto panel: jump to a specific pair
+        % by typing its index. Mirrors the parsing from changeuifPar.
+        % Honors the dropdown's current Pair-type selection.
+        [aArr, ~] = currentAutoPairList();
+        nPairs = numel(aArr);
+        if nPairs == 0, return; end
+        if isnumeric(val)
+            target = val;
+        else
+            target = str2double(val);
+        end
+        if isnan(target), return; end
+        target = round(target);
+        target = max(1, min(nPairs, target));
+        lastAutoPair = target - 1;        % onSelectMergedPairs(+1) lands on `target`
+        onSelectMergedPairs(1);
+    end
+
+    function setAutoPairType(val)
+        % Switch which list the Auto Next/Prev walker traverses.
+        % Resets the walker state, refreshes the /total counter, and
+        % retitles the counter label so the user can see at a glance
+        % whether the walker is in pair-mode (#Pair) or unit-mode
+        % (#Unit).
+        autoPairType = val;
+        lastAutoPair = 0;
+        if exist('uifAutoPair','var') && isvalid(uifAutoPair)
+            uifAutoPair.Value = '0';
+        end
+        if exist('uifAutoPair2','var') && isvalid(uifAutoPair2)
+            [aArr, ~] = currentAutoPairList();
+            uifAutoPair2.Value = sprintf('/%d', numel(aArr));
+        end
+        if exist('lblAutoPair','var') && isvalid(lblAutoPair)
+            if isUnitModePairType(val)
+                lblAutoPair.Text = 'Unit #:';
+            else
+                lblAutoPair.Text = 'Pair #:';
+            end
+        end
     end
 
     function updatePolarity(ddVal)
@@ -2210,6 +5301,9 @@ disimlarityScore(15,14)
             case 'Multiple'
                 multipleCheckbox('on');
                 plotMultiple();
+            case 'Amp Dist'
+                multipleCheckbox('off');
+                plotAmpDistribution();
         end
     end
 
@@ -2258,6 +5352,611 @@ disimlarityScore(15,14)
         end
         multiplePlotOrder = unique(multiplePlotOrder,'stable');
         plotOption();
+    end
+
+    function plotTable(panelOption)
+        % Sortable per-unit summary table. Renders into the parent
+        % panel passed as panelOption -- in normal use this is the
+        % standalone-table window's content panel (openTableWindow).
+        % The empty-arg path lower down is legacy from when Table
+        % used to be a plot type and rendered into axChannels; it's
+        % still here as a safe fallback if anyone calls plotTable
+        % without an argument. Click any column header to sort
+        % (built-in uitable behaviour via ColumnSortable); click
+        % the same header again to flip the direction. Notes
+        % column is editable in place.
+        if nargin < 1
+            panelOption = [];
+        end
+        if isempty(panelOption)
+            if strcmp(lastPlotted,'Table')
+                delete(allchild(axChannels));
+            else
+                delete(allchild(axChannels));
+                delete(axChannels);
+                axChannels = uipanel(bottomRightGrid,'BorderType','none',...
+                    'BackgroundColor',figColor);
+                axChannels.Layout.Column = [2 3];
+                axChannels.Layout.Row    = [1 3];
+                applyColorScheme(axChannels, figColor);
+            end
+            plotAxis = axChannels;
+            lastPlotted = plotType;
+        else
+            plotAxis = panelOption;
+            try, delete(allchild(plotAxis)); catch, end
+        end
+
+        % Build per-row data. Every unit appears -- including ones
+        % the user has removed (groupList(i) == NaN). Removed rows
+        % get ISO = "REM" so they stay searchable / sortable,
+        % and paintSelectedTableRows draws them in italic grey so
+        % they read as visually inactive without leaving the
+        % table. Restoring via Undo / Reset re-fills their cells
+        % on the next refresh.
+        snrAllT = 1 + detectblity;
+        liveIdx = (1:numGroups).';
+        nLive   = numGroups;
+        removedMask = isnan(groupList(:));
+
+        labels   = double(groupList(:));
+        channels = double(channelList(:));
+        rates    = double(preprocessed.firingRate(:));
+        isis     = double(preprocessed.isiViolation(:));
+        snrs     = double(snrAllT(:));
+        stables  = (double(stable_length(:,2)) - double(stable_length(:,1))) ...
+                   / max(trialLength,eps) * 100;
+        isolats  = strings(nLive, 1);
+        notesC   = strings(nLive, 1);
+        for ii = 1:nLive
+            if removedMask(ii)
+                isolats(ii) = "REM";
+            elseif ii <= numel(unitIsolation) && (ischar(unitIsolation{ii}) || isstring(unitIsolation{ii}))
+                isolats(ii) = string(unitIsolation{ii});
+            else
+                isolats(ii) = "NA";
+            end
+            if ii <= numel(unitNotes) && (ischar(unitNotes{ii}) || isstring(unitNotes{ii}))
+                notesC(ii) = string(unitNotes{ii});
+            end
+        end
+
+        % Single-line headers so the unit label sits inline with
+        % the metric name (compact, no "(Hz)" floating below).
+        % Target column is absent: clicking a row sets the merge
+        % target radio in the main GUI; MATLAB's own focused-cell
+        % highlight shows where the cursor is.
+        colNames = { 'G', 'ID', 'Ch', 'Rate (Hz)', 'ISI (%)', ...
+                     'SNR', 'ISO', 'Stable', 'Notes' };
+
+        % Notes (col 9) is the only editable column.
+        nCols        = 9;
+        editableMask = false(1, nCols);
+        editableMask(9) = true;
+
+        % We use a CELL-ARRAY Data so ColumnFormat = 'bank' is
+        % actually honoured. uitable silently ignores ColumnFormat
+        % when Data is a MATLAB `table`, which is why earlier
+        % versions of this code showed full double precision in
+        % Rate / ISI / SNR / Stable. Cells are still typed (numeric
+        % vs char) so each column header still sorts by its native
+        % type -- the 'bank' format only changes display, not sort.
+        rows = cell(nLive, nCols);
+        for ii = 1:nLive
+            rows{ii, 1} = double(liveIdx(ii));
+            rows{ii, 2} = labels(ii);
+            rows{ii, 3} = channels(ii);
+            rows{ii, 4} = rates(ii);
+            rows{ii, 5} = isis(ii);
+            rows{ii, 6} = snrs(ii);
+            rows{ii, 7} = char(isolats(ii));
+            rows{ii, 8} = stables(ii);
+            rows{ii, 9} = char(notesC(ii));
+        end
+
+        % 'fit' shrinks each column to its widest value so the
+        % table reads compact. Notes is given an explicit cap so
+        % a single long note can't blow the whole table wider
+        % than the figure. 'bank' = fixed-point with two decimals
+        % (e.g. 12.50, 0.07).
+        colWidths  = repmat({'fit'}, 1, nCols);
+        colWidths{9} = 180;     % Notes capped to keep the table compact
+        colFormats = {'numeric','numeric','numeric', ...
+                      'bank','bank','bank', ...
+                      'char','bank','char'};
+
+        try
+            tbl = uitable(plotAxis, ...
+                'Units','normalized','Position',[0 0 1 1], ...
+                'Data', rows, ...
+                'ColumnName', colNames, ...
+                'ColumnWidth', colWidths, ...
+                'ColumnFormat', colFormats, ...
+                'ColumnEditable', editableMask, ...
+                'ColumnSortable', true(1,nCols), ...
+                'RowName', [], ...
+                'CellSelectionCallback', @onTableCellSelect, ...
+                'CellEditCallback',      @onTableCellEdit);
+            applyColorScheme(tbl, figColor);
+            tableHandle = tbl;
+            paintSelectedTableRows();
+        catch ME
+            warning('Table render failed: %s', ME.message);
+        end
+    end
+
+    function paintSelectedTableRows()
+        % Repaint per-row background colours on the most recent
+        % table view so selected units stand out using their group
+        % colour (with auto-chosen text colour for contrast).
+        % Called both at table render and on every selection toggle.
+        if isempty(tableHandle) || ~isgraphics(tableHandle), return; end
+        tbl = tableHandle;
+        try
+            % Wipe any previous styling so deselected rows revert
+            % to the default theme.
+            removeStyle(tbl);
+        catch
+            % Older MATLAB versions may not support removeStyle on
+            % a freshly-created table -- ignore.
+        end
+
+        % Build a map from unit index to row position (handles
+        % column-header sort, which reorders the displayed rows).
+        if isa(tbl.Data, 'table')
+            idxCol = double(tbl.Data{:, 1});
+        else
+            idxCol = nan(size(tbl.Data, 1), 1);
+            for r = 1:size(tbl.Data, 1)
+                v = tbl.Data{r, 1};
+                if isnumeric(v) && isscalar(v)
+                    idxCol(r) = double(v);
+                elseif ischar(v) || isstring(v)
+                    idxCol(r) = str2double(v);
+                end
+            end
+        end
+
+        % Removed units (groupList(k) is NaN) stay in the table so
+        % users can still see them. Paint those rows italic-grey
+        % first; selection styling below can override that on any
+        % row that's both removed and still chkBoxSelect-ticked.
+        try
+            removedStyle = uistyle('FontAngle','italic', ...
+                'FontColor',[0.55 0.55 0.55]);
+            for k = find(isnan(groupList(:))).'
+                r = find(idxCol == k, 1);
+                if isempty(r), continue; end
+                addStyle(tbl, removedStyle, 'row', r);
+            end
+        catch
+            % uistyle/addStyle not available -> just skip the
+            % grey-out; the ISO="REM" tag still flags the row.
+        end
+
+        selUnits = find(chkBoxSelect(:));
+        for ii = 1:numel(selUnits)
+            k = selUnits(ii);
+            if k > numel(groupList) || isnan(groupList(k)), continue; end
+            r = find(idxCol == k, 1);
+            if isempty(r), continue; end
+            try
+                c   = getGroupColor(groupList(k));
+                tc  = bestTextColorFor(c);
+                stl = uistyle('BackgroundColor', c, 'FontColor', tc);
+                addStyle(tbl, stl, 'row', r);
+            catch
+                % uistyle / addStyle missing -> fall through, no
+                % colour highlight on this MATLAB release.
+            end
+        end
+    end
+
+    function openTableWindow()
+        % Pop the curation table out into its own uifigure. Because
+        % it lives in a separate window, the per-unit selection
+        % handlers and the multi-plot redraw never touch it -- so
+        % the user's column sort, scroll position and cell focus
+        % all survive across selection changes. Singleton: a
+        % second click brings the existing window to the front
+        % rather than spawning a duplicate.
+        %
+        % The window also carries:
+        %   * A Spike Group Controller toolbar (Remove / Merge /
+        %     Split / Limit / Isolation / Undo / Reset / Notes)
+        %     so the user can curate from inside the table window
+        %     without switching back to the main GUI.
+        %   * The same Ctrl+letter keyboard shortcuts as the main
+        %     figure (R/M/T/K/U/D/L/E/H/N/P/S/[ ]/Up/Down/...).
+        %   * Plain Space toggles the focused unit's Vis/Select.
+        %
+        % WindowStyle is set to 'alwaysontop' so the table stays
+        % above the main GUI until the user closes it. MATLAB
+        % releases that don't accept that value just fall through
+        % to a normal window via the try/catch.
+        if ~isempty(tableFigure) && isgraphics(tableFigure)
+            try, figure(tableFigure); catch, end
+            return;
+        end
+        % Initial width is sized to the table's content. The eight
+        % numeric/short columns auto-fit and the Notes column is
+        % capped at 180 px (see plotTable), so the table itself
+        % needs roughly 600 px. The figure remains user-resizable
+        % if longer notes warrant a wider window.
+        tableFigure = uifigure( ...
+            'Name','Curation Table', ...
+            'Position',[200 200 620 660], ...
+            'Color',figColor);
+        applyColorScheme(tableFigure, figColor);
+        tableFigure.WindowKeyPressFcn = @keyPressHandler;
+        try
+            tableFigure.WindowStyle = 'alwaysontop';
+        catch
+            % MATLAB version doesn't support 'alwaysontop' for
+            % uifigure (added in R2023b). Fall back to a normal
+            % window -- the user can still bring it forward by
+            % clicking it.
+        end
+
+        winGrid = uigridlayout(tableFigure,[3 1], ...
+            'RowHeight',{'fit','fit','1x'}, ...
+            'ColumnWidth',{'1x'}, ...
+            'Padding',[6 6 6 6], ...
+            'RowSpacing',4);
+        applyColorScheme(winGrid, figColor);
+
+        % --- Row 1: window controls (Refresh / Help / Close) -----
+        toolRow = uigridlayout(winGrid,[1 4], ...
+            'ColumnWidth',{'fit','fit','fit','1x'}, ...
+            'RowHeight',{'fit'}, ...
+            'Padding',[0 0 0 0], ...
+            'ColumnSpacing',6);
+        toolRow.Layout.Row = 1;
+        applyColorScheme(toolRow, figColor);
+
+        btnRefresh = uibutton(toolRow,'Text','Refresh', ...
+            'Tooltip','Reload the table from the latest curation state.', ...
+            'ButtonPushedFcn',@(btn,ev) refreshTableWindow());
+        btnRefresh.Layout.Column = 1;
+        applyColorScheme(btnRefresh, figColor);
+
+        btnHelp = uibutton(toolRow,'Text','Help', ...
+            'Tooltip','How to select units, set the target, sort, and read columns.', ...
+            'ButtonPushedFcn',@(btn,ev) showTableHelp());
+        btnHelp.Layout.Column = 2;
+        applyColorScheme(btnHelp, figColor);
+
+        btnClose = uibutton(toolRow,'Text','Close', ...
+            'Tooltip','Close the table window.', ...
+            'ButtonPushedFcn',@(btn,ev) delete(tableFigure));
+        btnClose.Layout.Column = 3;
+        applyColorScheme(btnClose, figColor);
+
+        % --- Row 2: Spike Group Controller buttons ---------------
+        % Same actions as the main GUI's top button row, wired to
+        % the same handlers so toggles / undos / resets all flow
+        % through the existing logic. After each one we refresh
+        % the table data (data may have changed) and repaint
+        % selection rows.
+        ctrlRow = uigridlayout(winGrid,[1 9], ...
+            'ColumnWidth',repmat({'1x'}, 1, 9), ...
+            'RowHeight',{'fit'}, ...
+            'Padding',[0 0 0 0], ...
+            'ColumnSpacing',4);
+        ctrlRow.Layout.Row = 2;
+        applyColorScheme(ctrlRow, figColor);
+
+        btnTblRemove = uibutton(ctrlRow,'Text','Remove', ...
+            'Tooltip','Remove the selected units. Ctrl+D', ...
+            'ButtonPushedFcn',@(b,e) tblWindowAct(@onRemove));
+        btnTblRemove.Layout.Column = 1;
+        applyColorScheme(btnTblRemove, figColor);
+
+        btnTblMerge = uibutton(ctrlRow,'Text','Merge', ...
+            'Tooltip','Merge selected units into the radio-button choice. Ctrl+M', ...
+            'ButtonPushedFcn',@(b,e) tblWindowAct(@onMerge));
+        btnTblMerge.Layout.Column = 2;
+        applyColorScheme(btnTblMerge, figColor);
+
+        btnTblSplit = uibutton(ctrlRow,'Text','Split', ...
+            'Tooltip','Split the selected unit(s). Ctrl+T', ...
+            'ButtonPushedFcn',@(b,e) tblWindowAct(@onSplit));
+        btnTblSplit.Layout.Column = 3;
+        applyColorScheme(btnTblSplit, figColor);
+
+        btnTblLimit = uibutton(ctrlRow,'Text','Limit', ...
+            'Tooltip','Trim selected units to their stable interval. Ctrl+L', ...
+            'ButtonPushedFcn',@(b,e) tblWindowAct(@onAutoCut));
+        btnTblLimit.Layout.Column = 4;
+        applyColorScheme(btnTblLimit, figColor);
+
+        btnTblIso = uibutton(ctrlRow,'Text','Isolation', ...
+            'Tooltip','Cycle isolation label (SUA+/SUA/MUA+/MUA). Ctrl+K', ...
+            'ButtonPushedFcn',@(b,e) tblWindowAct(@onMUA));
+        btnTblIso.Layout.Column = 5;
+        applyColorScheme(btnTblIso, figColor);
+
+        btnTblUndo = uibutton(ctrlRow,'Text','Undo', ...
+            'Tooltip','Revert selected units. Ctrl+U', ...
+            'ButtonPushedFcn',@(b,e) tblWindowAct(@onUndo));
+        btnTblUndo.Layout.Column = 6;
+        applyColorScheme(btnTblUndo, figColor);
+
+        btnTblReset = uibutton(ctrlRow,'Text','Reset', ...
+            'Tooltip','Reset all edits. Ctrl+R', ...
+            'ButtonPushedFcn',@(b,e) tblWindowAct(@onReset));
+        btnTblReset.Layout.Column = 7;
+        applyColorScheme(btnTblReset, figColor);
+
+        btnTblNotes = uibutton(ctrlRow,'Text','Notes', ...
+            'Tooltip','Edit the unit''s note. Ctrl+E', ...
+            'ButtonPushedFcn',@(b,e) tblWindowAct(@onEditNotes));
+        btnTblNotes.Layout.Column = 8;
+        applyColorScheme(btnTblNotes, figColor);
+
+        btnTblDeselect = uibutton(ctrlRow,'Text','Deselect', ...
+            'Tooltip','Untick all selected units. Ctrl+H', ...
+            'ButtonPushedFcn',@(b,e) tblWindowAct(@onDeselect));
+        btnTblDeselect.Layout.Column = 9;
+        applyColorScheme(btnTblDeselect, figColor);
+
+        % --- Row 3: the table itself -----------------------------
+        tableContentPanel = uipanel(winGrid, ...
+            'BorderType','none','BackgroundColor',figColor);
+        tableContentPanel.Layout.Row = 3;
+        applyColorScheme(tableContentPanel, figColor);
+
+        % Render the table into the panel. plotTable accepts a
+        % parent panel as its argument, sets tableHandle for the
+        % paintSelectedTableRows hook, and wires onTableCellSelect.
+        plotTable(tableContentPanel);
+
+        % When the user closes the figure (X button), clear our
+        % closure handles so the next "Open table" click spawns a
+        % fresh window instead of trying to reuse a dead handle.
+        tableFigure.CloseRequestFcn = @(src,evt) onTableFigureClose(src);
+    end
+
+    function tblWindowAct(actionFcn)
+        % Run a Spike Group Controller action from inside the
+        % table window, then bring the table data + row colours
+        % back into sync. Most actions mutate groupList /
+        % unitIsolation / sortedRes, so we re-render the table
+        % rather than try to patch in place. Selection state lives
+        % in chkBoxSelect, which the actions update directly.
+        try, actionFcn(); catch ME, fprintf('table-window action failed: %s\n', ME.message); end
+        try, refreshTableWindow(); catch, end
+    end
+
+    function onTableFigureClose(src)
+        try
+            if ~isempty(tableHandle) && isgraphics(tableHandle) && ...
+                    isequal(ancestor(tableHandle,'figure'), src)
+                tableHandle = [];
+            end
+        catch
+        end
+        tableContentPanel = [];
+        tableFigure       = [];
+        try, delete(src); catch, end
+    end
+
+    function refreshTableWindow()
+        % Re-render the standalone table from the current curation
+        % state (groupList, channelList, isolation, notes, ...).
+        % Note: this rebuild does reset the user's column sort -- it
+        % only fires when the user explicitly clicks Refresh, so
+        % that's the explicit trade-off (data is fresher, sort
+        % gets cleared).
+        if ~isempty(tableContentPanel) && isgraphics(tableContentPanel)
+            plotTable(tableContentPanel);
+        end
+    end
+
+    function showTableHelp()
+        % Pop a small help dialog that explains the curation table.
+        % Anchored on tableFigure when it's alive, otherwise
+        % parentFig, so it always sits on top of the right window.
+        if ~isempty(tableFigure) && isgraphics(tableFigure)
+            anchor = tableFigure;
+        else
+            anchor = parentFig;
+        end
+        msg = sprintf([ ...
+            'Curation Table\n' ...
+            '\n' ...
+            'Select a unit (toggle Vis + Select):\n' ...
+            '  Click a row to focus it, then press SPACE.\n' ...
+            '  Selected rows are tinted with the unit''s group colour.\n' ...
+            '  Press SPACE again on the same row to deselect it.\n' ...
+            '\n' ...
+            'Set the merge target (radio button equivalent):\n' ...
+            '  Just click any cell in the row -- the row your cursor\n' ...
+            '  is on becomes the target. Merge into target via the\n' ...
+            '  Merge button or Ctrl+M.\n' ...
+            '\n' ...
+            'Edit a note:\n' ...
+            '  Double-click the Notes cell, type your text, then\n' ...
+            '  press Enter or click outside the cell to commit.\n' ...
+            '  Notes are saved with the rest of the curation when\n' ...
+            '  you press Ctrl+S (Save).\n' ...
+            '\n' ...
+            'Sort:\n' ...
+            '  Click any column header to sort by that column.\n' ...
+            '  Click again to flip ascending/descending.\n' ...
+            '  Click another header to sort by it instead.\n' ...
+            '  Numeric columns sort numerically (not as strings).\n' ...
+            '  The Refresh button and curation actions rebuild the\n' ...
+            '  table and reset the sort.\n' ...
+            '\n' ...
+            'Columns:\n' ...
+            '  G        Internal unit handle (group index).\n' ...
+            '  ID       Unit label after merges.\n' ...
+            '  Ch       Main channel.\n' ...
+            '  Rate     Mean firing rate (Hz).\n' ...
+            '  ISI      Refractory-period violation rate (%%).\n' ...
+            '  SNR      Signal-to-noise ratio.\n' ...
+            '  ISO      Isolation tier (SUA+/SUA/MUA+/MUA/NA).\n' ...
+            '  Stable   Stable-window length as a percentage of\n' ...
+            '           the recording.\n' ...
+            '  Notes    Free-text notes; double-click to edit.\n' ...
+            '\n' ...
+            'Numeric columns are shown to two decimals; sort still\n' ...
+            'uses native numeric ordering.\n' ...
+            '\n' ...
+            'Removed units: italic grey, ISO = "REM".\n' ...
+            'Bring them back with Ctrl+U (Undo) or Ctrl+R (Reset).\n' ...
+            '\n' ...
+            'Keyboard (with the table window focused):\n' ...
+            '  SPACE                  toggle Vis+Select on focused row\n' ...
+            '  Ctrl+D                 Remove\n' ...
+            '  Ctrl+M                 Merge into target\n' ...
+            '  Ctrl+T                 Split\n' ...
+            '  Ctrl+L                 Limit (auto-trim)\n' ...
+            '  Ctrl+K                 cycle Isolation tier\n' ...
+            '  Ctrl+U                 Undo selected\n' ...
+            '  Ctrl+R                 Reset all edits\n' ...
+            '  Ctrl+H                 Deselect all\n' ...
+            '  Ctrl+E                 edit Notes (radio-selected unit)\n' ...
+            '  Ctrl+S                 Save curation\n' ...
+            '  Ctrl+P / Ctrl+N        previous / next unit\n' ...
+            '  Ctrl+Up / Ctrl+Down    Auto walker\n' ...
+            '  Ctrl+[ / Ctrl+]        Similarity walker\n' ...
+            '  Ctrl+Left / Ctrl+Right page back / forward\n' ...
+            '  Ctrl+/                 show full shortcuts list\n' ...
+            ]);
+        try
+            uialert(anchor, msg, 'Curation Table Help', 'Icon', 'info');
+        catch
+            % Fallback for older MATLAB releases without uialert.
+            msgbox(msg, 'Curation Table Help', 'help');
+        end
+    end
+
+    function onTableCellSelect(src, evt)
+        % Click handler for the curation table. The model:
+        %   * Clicking ANY cell sets that row's unit as the merge
+        %     target (mirrors the radio button in the main GUI).
+        %     We don't touch src.Data here -- assigning into the
+        %     Data property re-applies the underlying row order
+        %     and would silently undo a column-header sort, so
+        %     setMergeTarget alone is the entire effect of a
+        %     click. MATLAB's native focused-cell highlight
+        %     shows the user which row their cursor sits on.
+        %   * Vis / Select toggling is reserved for the SPACE key
+        %     (see toggleTableFocusedSelection), so a sort or a
+        %     casual click never flips a unit's selection.
+        try
+            if isempty(evt.Indices), return; end
+            row = evt.Indices(1);
+            if row < 1, return; end
+            if isa(src.Data, 'table')
+                if row > height(src.Data), return; end
+                unitIdx = double(src.Data{row, 1});
+            else
+                if row > size(src.Data, 1), return; end
+                v = src.Data{row, 1};
+                if isnumeric(v)
+                    unitIdx = double(v);
+                else
+                    unitIdx = str2double(v);
+                end
+            end
+            if isempty(unitIdx) || ~isfinite(unitIdx) || ...
+                    unitIdx < 1 || unitIdx > numGroups
+                return;
+            end
+            setMergeTarget(unitIdx);
+        catch
+        end
+    end
+
+    function toggleUnitSelect(unitIdx)
+        % Flip Vis / Select for unitIdx and route the radio + page.
+        % Shared between Idx-column click and Space-key handler.
+        if isempty(unitIdx) || ~isfinite(unitIdx) || ...
+                unitIdx < 1 || unitIdx > numGroups
+            return;
+        end
+        if chkBoxSelect(unitIdx)
+            chkBoxSelect(unitIdx) = 0;
+            chkBoxVis(unitIdx)    = 0;
+            selected_order(selected_order == unitIdx) = [];
+            if unitIdx <= numel(groupSelectCheckboxes) && ...
+                    isvalid(groupSelectCheckboxes(unitIdx)) && ...
+                    isprop(groupSelectCheckboxes(unitIdx),'Value')
+                groupSelectCheckboxes(unitIdx).Value = false;
+                groupVisCheckboxes(unitIdx).Value    = false;
+            end
+        else
+            chkBoxSelect(unitIdx) = 1;
+            chkBoxVis(unitIdx)    = 1;
+            if ~ismember(unitIdx, selected_order)
+                selected_order(end+1) = unitIdx;
+            end
+            tgtPage = ceil(unitIdx / PAGE_SIZE);
+            if tgtPage ~= currentPage
+                currentPage = tgtPage;
+                onChangePage(0);
+            end
+            if unitIdx <= numel(groupSelectCheckboxes) && ...
+                    isvalid(groupSelectCheckboxes(unitIdx)) && ...
+                    isprop(groupSelectCheckboxes(unitIdx),'Value')
+                groupSelectCheckboxes(unitIdx).Value = true;
+                groupVisCheckboxes(unitIdx).Value    = true;
+            end
+            if unitIdx <= numel(groupRadioButtons) && ...
+                    isvalid(groupRadioButtons(unitIdx)) && ...
+                    isprop(groupRadioButtons(unitIdx),'Value')
+                groupRadioButtons(unitIdx).Value = true;
+            end
+        end
+    end
+
+    function setMergeTarget(unitIdx)
+        % Set the merge-target radio for unitIdx. The radio buttons
+        % live in a uibuttongroup so MATLAB clears the others
+        % automatically when we set one.
+        if isempty(unitIdx) || ~isfinite(unitIdx) || ...
+                unitIdx < 1 || unitIdx > numGroups
+            return;
+        end
+        if unitIdx <= numel(groupRadioButtons) && ...
+                isgraphics(groupRadioButtons(unitIdx)) && ...
+                isvalid(groupRadioButtons(unitIdx)) && ...
+                isprop(groupRadioButtons(unitIdx),'Value')
+            groupRadioButtons(unitIdx).Value = true;
+        end
+    end
+
+    function onTableCellEdit(src, evt)
+        % Notes column is editable in-place; write through to
+        % unitNotes so the change persists into Save. Read the
+        % unit's index from the row's Idx cell (column 1) so a
+        % post-sort reorder routes the edit to the correct unit.
+        try
+            if isempty(evt.Indices), return; end
+            row = evt.Indices(1);
+            col = evt.Indices(2);
+            % Notes is always the last column (col 9 here).
+            if isa(src.Data, 'table')
+                nCols   = width(src.Data);
+                unitIdx = double(src.Data{row, 1});
+            else
+                nCols   = size(src.Data, 2);
+                unitIdx = double(src.Data{row, 1});
+            end
+            if col ~= nCols, return; end
+            if isempty(unitIdx) || ~isfinite(unitIdx) || ...
+                    unitIdx < 1 || unitIdx > numGroups
+                return;
+            end
+            if numel(unitNotes) < unitIdx
+                unitNotes(end+1:unitIdx) = {''};
+            end
+            unitNotes{unitIdx} = char(evt.NewData);
+        catch
+        end
     end
 
     function plotMultiple()
@@ -2353,20 +6052,199 @@ disimlarityScore(15,14)
                         multiPlotPanels(k).Title = 'Presence Ratio:';
                         plotDensity(multiPlotPanels(k))
                     case 6
+                        multiPlotPanels(k).Title = 'Amp Distribution';
+                        plotAmpDistribution(multiPlotPanels(k))
+                    case 7
                         multiPlotPanels(k).Title = 'Channel PC';
                         plotChannelPCA(multiPlotPanels(k))
-                    case 7
+                    case 8
                         multiPlotPanels(k).Title = 'Trace';
                         plot_on_Signal(multiPlotPanels(k))
-                    case 8
+                    case 9
                         multiPlotPanels(k).Title = 'Features';
                         plotFeatures(multiPlotPanels(k))
                 end
+                addMultiPlotGripHandles(k);
             end
         end
 
         lastMultiPlotOrder = multiplePlotOrder;
         reScaledFlag = false;
+    end
+
+    function addMultiPlotGripHandles(k)
+        % Two small overlay buttons live on each multi-plot cell so the
+        % user can rearrange and resize cells directly. The swap button
+        % (top-right) marks the cell on first click and swaps with the
+        % next click. The resize button (bottom-right) enters drag mode
+        % so the next mouse motion drives gridMultiple's row height /
+        % column width for that cell, committed on the next click.
+        % SizeChangedFcn keeps both buttons pinned to the corners
+        % whenever the cell or the figure resizes -- and we chain any
+        % pre-existing SizeChangedFcn so we don't clobber other layout
+        % handlers the plot helpers may have installed.
+        if ~isvalid(multiPlotPanels(k)), return; end
+        panel = multiPlotPanels(k);
+        try
+            sz = panel.InnerPosition(3:4);
+        catch
+            sz = [160 80];
+        end
+        if isempty(sz) || any(sz <= 0), sz = [160 80]; end
+
+        swapColor = [0.55 0.55 0.55];
+        if multiSwapPendingK == k
+            swapColor = [1 0.55 0];   % highlight when this cell is the pending source
+        end
+
+        swapBtn = uibutton(panel,'Text',char(8644),...
+            'FontSize',8,...
+            'BackgroundColor',swapColor,...
+            'Tooltip','Click to mark for swap; click another cell''s grip to swap.',...
+            'ButtonPushedFcn',@(~,~) onMultiSwapClicked(k));
+
+        resizeBtn = uibutton(panel,'Text',char(8690),...
+            'FontSize',8,...
+            'BackgroundColor',[0.55 0.55 0.55],...
+            'Tooltip','Click to start drag-resize, move mouse, click again to commit.',...
+            'ButtonPushedFcn',@(~,~) onMultiResizeClicked(k));
+
+        repositionMultiGripHandles(panel, swapBtn, resizeBtn);
+
+        prevFcn = panel.SizeChangedFcn;
+        panel.SizeChangedFcn = @(src,evt) chainedMultiGripResize(src, evt, prevFcn, swapBtn, resizeBtn);
+    end
+
+    function chainedMultiGripResize(panel, evt, prevFcn, swapBtn, resizeBtn)
+        repositionMultiGripHandles(panel, swapBtn, resizeBtn);
+        if ~isempty(prevFcn)
+            try
+                if isa(prevFcn, 'function_handle')
+                    prevFcn(panel, evt);
+                end
+            catch
+            end
+        end
+    end
+
+    function repositionMultiGripHandles(panel, swapBtn, resizeBtn)
+        if ~isvalid(panel), return; end
+        try
+            sz = panel.InnerPosition(3:4);
+        catch
+            sz = [160 80];
+        end
+        if isempty(sz) || any(sz <= 0), sz = [160 80]; end
+        btnW = 14; btnH = 14;     % 20% smaller than the original 18 px
+        if isvalid(swapBtn)
+            swapBtn.Position = [max(1,sz(1)-btnW-2), max(1,sz(2)-btnH-2), btnW, btnH];
+        end
+        if isvalid(resizeBtn)
+            resizeBtn.Position = [max(1,sz(1)-btnW-2), 2, btnW, btnH];
+        end
+    end
+
+    function onMultiSwapClicked(k)
+        if multiSwapPendingK == 0
+            multiSwapPendingK = k;
+            if isvalid(multiPlotPanels(k))
+                multiPlotPanels(k).BorderColor = [1 0.55 0];
+                multiPlotPanels(k).BorderType  = 'line';
+            end
+        elseif multiSwapPendingK == k
+            if isvalid(multiPlotPanels(k))
+                multiPlotPanels(k).BorderColor = 1-figColor;
+            end
+            multiSwapPendingK = 0;
+        else
+            a = multiSwapPendingK;
+            b = k;
+            multiSwapPendingK = 0;
+            swapMultiPanels(a, b);
+        end
+    end
+
+    function swapMultiPanels(a, b)
+        if a < 1 || b < 1 || a == b, return; end
+        if a > numel(multiplePlotOrder) || b > numel(multiplePlotOrder), return; end
+        tmp = multiplePlotOrder(a);
+        multiplePlotOrder(a) = multiplePlotOrder(b);
+        multiplePlotOrder(b) = tmp;
+        % Force a clean rebuild so the panels regenerate in the new
+        % order; the lastMultiPlotOrder reset is the existing rebuild
+        % trigger inside plotMultiple.
+        lastMultiPlotOrder = [];
+        plotMultiple();
+    end
+
+    function onMultiResizeClicked(k)
+        if multiResizeDrag.active
+            endMultiResizeDrag();
+            return;
+        end
+        if isempty(gridMultiple) || ~isvalid(gridMultiple), return; end
+        if ~isvalid(multiPlotPanels(k)), return; end
+
+        pnl = multiPlotPanels(k);
+        cellPx = getpixelposition(pnl);
+
+        multiResizeDrag.active     = true;
+        multiResizeDrag.k          = k;
+        multiResizeDrag.startMouse = parentFig.CurrentPoint;
+        multiResizeDrag.cellW      = cellPx(3);
+        multiResizeDrag.cellH      = cellPx(4);
+        multiResizeDrag.rowIdx     = pnl.Layout.Row(1);
+        multiResizeDrag.colIdx     = pnl.Layout.Column(1);
+        multiResizeDrag.startRH    = gridMultiple.RowHeight;
+        multiResizeDrag.startCW    = gridMultiple.ColumnWidth;
+        multiResizeDrag.origMotionFcn = parentFig.WindowButtonMotionFcn;
+        multiResizeDrag.origDownFcn   = parentFig.WindowButtonDownFcn;
+
+        parentFig.WindowButtonMotionFcn = @(~,~) onMultiResizeMotion();
+        parentFig.WindowButtonDownFcn   = @(~,~) endMultiResizeDrag();
+        try, parentFig.Pointer = 'fleur'; catch, end
+    end
+
+    function onMultiResizeMotion()
+        if ~multiResizeDrag.active || isempty(gridMultiple) || ~isvalid(gridMultiple)
+            return;
+        end
+        cur = parentFig.CurrentPoint;
+        deltaX = cur(1) - multiResizeDrag.startMouse(1);
+        deltaY = cur(2) - multiResizeDrag.startMouse(2);
+        % In figure coords y grows upward, so dragging the bottom-right
+        % grip "down" (negative deltaY) shrinks height, "up" grows it.
+        newW = max(60, multiResizeDrag.cellW + deltaX);
+        newH = max(60, multiResizeDrag.cellH - deltaY);
+        rowH = multiResizeDrag.startRH;
+        colW = multiResizeDrag.startCW;
+        if multiResizeDrag.rowIdx >= 1 && multiResizeDrag.rowIdx <= numel(rowH)
+            rowH{multiResizeDrag.rowIdx} = newH;
+        end
+        if multiResizeDrag.colIdx >= 1 && multiResizeDrag.colIdx <= numel(colW)
+            colW{multiResizeDrag.colIdx} = newW;
+        end
+        try
+            gridMultiple.RowHeight   = rowH;
+            gridMultiple.ColumnWidth = colW;
+        catch
+        end
+    end
+
+    function endMultiResizeDrag()
+        if ~multiResizeDrag.active, return; end
+        multiResizeDrag.active = false;
+        try, parentFig.WindowButtonMotionFcn = multiResizeDrag.origMotionFcn; catch, end
+        try, parentFig.WindowButtonDownFcn   = multiResizeDrag.origDownFcn;   catch, end
+        try, parentFig.Pointer = 'arrow'; catch, end
+
+        % Re-run plotMultiple so each cell's plot regenerates against
+        % its new pixel dimensions. The rebuild guard inside
+        % plotMultiple is keyed on lastMultiPlotOrder + reScaledFlag,
+        % both unchanged here, so gridMultiple is preserved (our pixel
+        % RowHeight/ColumnWidth survive) while the per-cell dispatch
+        % loop still fires and redraws axes/legends to fit.
+        try, plotMultiple(); catch, end
     end
 
     function normalizeTimeAmp()
@@ -2399,7 +6277,15 @@ disimlarityScore(15,14)
         if isnan(lbl)
             c = [0.6 0.6 0.6]; % gray
         else
-            idx = mod(round(lbl)-1, numGroups) + 1;
+            % colorMapAll is built once at load with the original
+            % numGroups; Split can grow numGroups beyond that, so
+            % wrap on the colour map's actual length, not numGroups.
+            nMap = size(colorMapAll,1);
+            if nMap < 1
+                c = [0.6 0.6 0.6];
+                return;
+            end
+            idx = mod(round(lbl)-1, nMap) + 1;
             c   = colorMapAll(idx,:);
         end
     end
@@ -2502,8 +6388,19 @@ disimlarityScore(15,14)
         [sy, sx] = size(mappedData.Data.data);
 
         xDataRange = round(xWindowStart * cfg.samplingFrequency)+1 : min([round(xWindowEnd * cfg.samplingFrequency), round((xWindowStart+maxLimit) * cfg.samplingFrequency), sx]);
-        yDataRange = max(1, yWindowStart) : min(yWindowEnd, sy);
-        yDataRange = yDataRange(chan_wave_inclusion(yDataRange));
+
+        % Restrict yDataRange to channels actually covered by the
+        % selected neurons' waveform footprints. Falls back to the
+        % slider window if nothing is selected.
+        if ~isempty(selected_order)
+            selChans = unique(channelPlot(selected_order, :));
+            selChans = selChans(selChans >= 1 & selChans <= sy);
+            yDataRange = sort(selChans(:))';
+            yDataRange = yDataRange(chan_wave_inclusion(yDataRange));
+        else
+            yDataRange = max(1, yWindowStart) : min(yWindowEnd, sy);
+            yDataRange = yDataRange(chan_wave_inclusion(yDataRange));
+        end
 
         minYAx = 1E6;
         maxYAx = -1E6;
@@ -2661,8 +6558,12 @@ disimlarityScore(15,14)
             end
         end
 
-        xDataRange = round(xWindowStart * cfg.samplingFrequency)+1 : min(round(xWindowEnd * cfg.samplingFrequency), num_Samples);
-        length(xDataRange)
+        % Feature plot spans the FULL recording on its time (X) axis -
+        % a small visible window (e.g. xStepDropdown = 0.1 s) is great
+        % for the Trace view but useless for the Feature view, where
+        % drift / quality-over-time is the whole point. We still keep
+        % the y-window slider for the channel (Z) axis.
+        xDataRange = round(1:num_Samples);
         yDataRange = max(1, yWindowStart) : min(yWindowEnd, numChannels);
         yDataRange = yDataRange(chan_wave_inclusion(yDataRange));
 
@@ -2673,7 +6574,16 @@ disimlarityScore(15,14)
         unifiedLabels = sortedRes.unifiedLabels(inRange_idx);
         spike_idx = sortedRes.spike_idx(inRange_idx);
         spike_features = sortedRes.features(inRange_idx,:);
+        % Pad to at least 2 feature columns. Some configs (e.g. when the
+        % sorter only kept PC1) leave a single-column features matrix,
+        % and the scatter3 below indexes column 2 unconditionally.
+        if size(spike_features, 2) < 2
+            spike_features = [spike_features, zeros(size(spike_features,1), 1)];
+        end
         norm_spike_features = mapminmax(spike_features', -.5, .5)';
+        if size(norm_spike_features, 2) < 2
+            norm_spike_features = [norm_spike_features, zeros(size(norm_spike_features,1), 1)];
+        end
 
         hold(plotAxis,'on')
 
@@ -2686,7 +6596,16 @@ disimlarityScore(15,14)
                 plot_spike_idx = spike_idx(scatterIdx);
                 if ~isempty(plot_spike_idx)
                     c = getGroupColor(groupList(k));
-                    scatter3(plotAxis, plot_spike_idx/cfg.samplingFrequency,norm_spike_features(scatterIdx,1),channelList(k)+norm_spike_features(scatterIdx,2),...
+                    if isnan(channelList(k)) && k >= 1 && k <= numel(originalChannelList) ...
+                            && ~isnan(originalChannelList(k))
+                        chBase = originalChannelList(k);
+                    else
+                        chBase = channelList(k);
+                    end
+                    if isnan(chBase), chBase = 1; end
+                    scatter3(plotAxis, plot_spike_idx/cfg.samplingFrequency, ...
+                        norm_spike_features(scatterIdx,1), ...
+                        chBase + norm_spike_features(scatterIdx,2),...
                         25,'markerfacecolor',c,'markeredgecolor','none')
                 end
             end
@@ -2695,7 +6614,7 @@ disimlarityScore(15,14)
         hold(plotAxis,'off')
 
 
-        axis(plotAxis,'tight',[xWindowStart xWindowEnd -.5 .5 yWindowStart-.5 yWindowEnd+.5 ]);
+        axis(plotAxis,'tight',[1/cfg.samplingFrequency trialLength -.5 .5 yWindowStart-.5 yWindowEnd+.5 ]);
         yTicksIntervals = round((yWindowEnd-yWindowStart)/10);
         yTicksIntervals = max(yTicksIntervals,1);
         set(plotAxis,'ztick',[yWindowStart:yTicksIntervals:yWindowEnd])
@@ -2753,9 +6672,17 @@ tic
         if ~isempty(selected_order) && ~isequal(selected_order, selected_order_last)
             lastSel = selected_order(end);
             chVals  = channelPlot(lastSel,:);
+            % NaN-marked units have channelPlot = NaN. Fall back to the
+            % unit's pre-curation channel so the y-window auto-scroll
+            % still lands on the right band when the user re-ticks an
+            % undone / removed group.
+            if all(isnan(chVals)) && lastSel >= 1 && lastSel <= numel(originalChannelList) ...
+                    && ~isnan(originalChannelList(lastSel))
+                chVals = originalChannelList(lastSel) + (-numChannelPlot:numChannelPlot);
+            end
             minVal  = min(chVals) - 1;
             maxVal  = max(chVals) + 1;
-            if ~isempty(minVal)
+            if ~isempty(minVal) && ~isnan(minVal) && ~isnan(maxVal)
                 if minVal(end) < yWindowStart
                     yWindowStart = max(floor(minVal(end)),1);
                     yWindowEnd   = min(yWindowStart + str2double(yStepDropdown.Value), numChannels);
@@ -2809,20 +6736,52 @@ tic
 
         unifiedLabels = sortedRes.unifiedLabels(inRange);
         spike_idx     = sortedRes.spike_idx(inRange);
+        % originalUnifiedLabels is preserved at load time, so even when
+        % merging has rewritten sortedRes.unifiedLabels we can still
+        % look up each constituent unit's original spike train. This is
+        % what lets us plot every merged-into constituent as a separate
+        % waveform (same colour, same slot).
+        if exist('originalUnifiedLabels','var') && numel(originalUnifiedLabels) == numel(sortedRes.unifiedLabels)
+            origLabels = originalUnifiedLabels(inRange);
+        else
+            origLabels = sortedRes.unifiedLabels(inRange);
+        end %#ok<NODEF>
+        % Spikes that the Auto cleanup (Phase 4c) flagged as
+        % contaminated are now sortedRes.unifiedLabels == -1. Exclude
+        % them from waveform display so the user sees the cleaned
+        % unit, while originalUnifiedLabels still keeps them for
+        % Reset / Undo.
+        currLabels = sortedRes.unifiedLabels(inRange);
+        notMarked  = currLabels ~= -1;
         [~, spike_idx] = ismember(spike_idx, xDataRange);
 
-        persistent cachedInputData lastXDataRange lastYDataRange
-        if isempty(cachedInputData) || ~isequal(lastXDataRange,xDataRange) || ~isequal(lastYDataRange,yDataRange)
-            inputData       = double(mappedData.Data.data(channel_mapping(yDataRange), xDataRange));
-            lastXDataRange  = xDataRange;
-            lastYDataRange  = yDataRange;
-            cachedInputData = inputData;
-        else
-            inputData = cachedInputData;
+        % Cache both the raw viewport read AND its bandpass-filtered
+        % counterpart so that cosmetic redraws (scale / alpha / line
+        % width sliders, group selection toggles, ...) reuse the heavy
+        % filtfilt result instead of recomputing it on every plotOption.
+        % Names are prefixed wf* to avoid clashing with the parent
+        % function's `cachedFilteredData` persistent (which is owned by
+        % the keypress / Trace path).
+        persistent wfCachedRaw wfCachedFiltered wfLastXRange wfLastYRange wfLastBandpass
+        rangeChanged = isempty(wfCachedRaw) || ...
+                       ~isequal(wfLastXRange, xDataRange) || ...
+                       ~isequal(wfLastYRange, yDataRange);
+        if rangeChanged
+            wfCachedRaw      = double(mappedData.Data.data(channel_mapping(yDataRange), xDataRange));
+            wfCachedFiltered = [];
+            wfLastXRange     = xDataRange;
+            wfLastYRange     = yDataRange;
         end
 
         if strcmp(plotFilterType,'filtered')
-            inputData = bandpass_filter_GUI(inputData', cfg.bandpass, cfg.samplingFrequency)';
+            if isempty(wfCachedFiltered) || ~isequal(wfLastBandpass, cfg.bandpass)
+                wfCachedFiltered = bandpass_filter_GUI(wfCachedRaw', ...
+                    cfg.bandpass, cfg.samplingFrequency)';
+                wfLastBandpass = cfg.bandpass;
+            end
+            inputData = wfCachedFiltered;
+        else
+            inputData = wfCachedRaw;
         end
 
         if isempty(maxSignal)
@@ -2833,39 +6792,132 @@ tic
         normIn = inputData ./ maxSignal;
 
         chanPlotList = [];
-        isplotIdx    = [];
         hold(plotAxis,'on');
 
-        plotCount = 0; minAx = inf; maxAx = -inf;
+        % Reset the fast-path cache for this redraw. We only enable the
+        % fast path in single-plot mode (plotType == 'Waveform'); the
+        % Multiple layout would need per-panel handle bookkeeping that
+        % isn't worth the complexity for that view.
+        canFastPath = ~strcmp(plotType,'Multiple');
+        if canFastPath
+            wfPlotCache = struct('lines', {{}}, 'unscaledY', {{}}, ...
+                                 'yOff', [], 'isMain', logical([]), ...
+                                 'rgb', zeros(0,3), 'axis', plotAxis);
+        end
+
+        % Auto-expand selected_order to include every group that merged
+        % into the same effective label. This way, ticking the primary
+        % of a merged unit also brings up its absorbed constituents'
+        % waveforms as separate traces (same colour, same slot).
+        expandedOrder = [];
+        seenK = false(numGroups, 1);
+        for kk = selected_order(:)'
+            if kk < 1 || kk > numGroups || seenK(kk), continue; end
+            seenK(kk) = true;
+            expandedOrder(end+1,1) = kk;        %#ok<AGROW>
+            ekk = effLabel(kk);
+            if isnan(ekk), continue; end
+            for kj = 1:numGroups
+                if seenK(kj), continue; end
+                if isequal(effLabel(kj), ekk)
+                    seenK(kj) = true;
+                    expandedOrder(end+1,1) = kj;%#ok<AGROW>
+                end
+            end
+        end
+
+        % Slot bookkeeping.
+        %   Overlay OFF: each unit (including each constituent of a
+        %   merged group) gets its own horizontal slot, so the user can
+        %   eyeball whether a merge was reasonable side-by-side.
+        %   Overlay ON: every unit collapses into a single slot and
+        %   only colour distinguishes them.
+        if isempty(expandedOrder)
+            ekVec = [];
+        else
+            ekVec = effLabelVec(expandedOrder);
+        end
+        nUnits = numel(expandedOrder);
+        if plotOverlay
+            slotPerK  = zeros(nUnits, 1);
+            uniqPlots = 1;
+        else
+            slotPerK  = (0:nUnits-1)';
+            uniqPlots = max(nUnits, 1);
+        end
+
+        plotCount = 0;            % preserved for empty-plot bookkeeping
+        minAx = inf; maxAx = -inf;
         max_YAx = -inf; min_YAx = inf;
-        uniqPlots = numel(unique(groupList(selected_order)));
 
-        if any(spike_idx) && ~isempty(selected_order)
-            for k = selected_order
-                if ismember(groupList(k), isplotIdx)
+        if any(spike_idx) && ~isempty(expandedOrder)
+            for kIdx = 1:numel(expandedOrder)
+                k    = expandedOrder(kIdx);
+                ek   = ekVec(kIdx);
+                slot = slotPerK(kIdx);
+
+                % Spike-row selection for this unit:
+                %   * Merged constituents: filter via originalUnifiedLabels
+                %     == originalGroupList(k) so each unit's pre-merge
+                %     spikes stay distinct, AND restrict to rows whose
+                %     CURRENT label still equals groupList(k) so a
+                %     subsequent Split that moved some spikes to a new
+                %     label doesn't leak them back into the parent.
+                %   * Split-created units: originalGroupList(k) is NaN
+                %     by design (the unit didn't exist pre-curation),
+                %     so the originalUnifiedLabels-based query returns
+                %     nothing. Fall through to the current label.
+                %   * Phase-4c stripped rows (unifiedLabels == -1) are
+                %     dropped via notMarked.
+                origLab        = originalGroupList(k);
+                currLab        = groupList(k);
+                if isnan(currLab)
+                    plot_spike_idx = [];
+                else
+                    currLabels = sortedRes.unifiedLabels(inRange);
+                    if isnan(origLab)
+                        plot_spike_idx = spike_idx((currLabels == currLab) & notMarked);
+                    else
+                        plot_spike_idx = spike_idx( ...
+                            (origLabels == origLab) & ...
+                            (currLabels == currLab) & notMarked);
+                    end
+                end
+
+                % Channel-footprint lookup. For NaN-marked (removed)
+                % units channelList(k) is NaN, so channelPlot(k,:) is
+                % all-NaN and ismember would discard everything --
+                % the unit's gray waveform would never render. Fall
+                % back to the unit's pre-curation channel so it can
+                % still be inspected.
+                if k >= 1 && k <= numGroups && ~isnan(channelList(k))
+                    chBase = channelList(k);
+                elseif k >= 1 && k <= numel(originalChannelList)
+                    chBase = originalChannelList(k);
+                else
+                    chBase = NaN;
+                end
+                if isnan(chBase) || chBase < 1
                     continue;
                 end
-                isplotIdx = [isplotIdx; groupList(k)];
-
-                plot_spike_idx = spike_idx(unifiedLabels == groupList(k));
-                if isempty(plot_spike_idx)
-                    chPlot = channelPlot(k, :);
-                    chPlot = chPlot(ismember(chPlot, yDataRange));
-                    min_t  = waveformXaxis + (uniqPlots/3) * min(xNorm_adj(chPlot));
-                    min_t  = min_t + 1.1 * plotCount * range(min_t);
-                    max_t  = waveformXaxis + (uniqPlots/3) * max(xNorm_adj(chPlot));
-                    max_t  = max_t + 1.1 * plotCount * range(max_t);
-                    plotCount = plotCount + 1;
-                    continue;
-                end
-
-                chPlot = channelPlot(k, :);
+                chPlot = chBase + (-numChannelPlot:numChannelPlot);
                 chPlot = chPlot(ismember(chPlot, yDataRange));
                 if ~any(chPlot)
                     continue;
                 end
-                chanPlotList = [chanPlotList, chPlot];
-                c = getGroupColor(groupList(k));
+                % Colour rule:
+                %   * NaN-marked (removed) units always draw in a flat
+                %     gray so it is obvious they have been deselected
+                %     by Auto / manual Remove, even though the user
+                %     can still inspect their waveform.
+                %   * Otherwise colour by the effective label so every
+                %     constituent of a merged group draws in the
+                %     merge colour.
+                if k >= 1 && k <= numGroups && isnan(groupList(k))
+                    c = [0.55 0.55 0.55];
+                else
+                    c = getGroupColor(ek);
+                end
 
                 spike_indices = plot_spike_idx(:);
                 numSpikes     = numel(spike_indices);
@@ -2874,7 +6926,11 @@ tic
                     numSpikes     = numel(spike_indices);
                 end
 
-                all_indices = spike_indices + spike_Xaxis;
+                if isempty(spike_indices)
+                    all_indices = zeros(0, numel(spike_Xaxis));
+                else
+                    all_indices = spike_indices + spike_Xaxis;
+                end
                 numChPlots  = numel(chPlot);
 
                 if ~plotMean
@@ -2883,16 +6939,70 @@ tic
                     Waveforms = nan(numSpikes, numChPlots, numel(spike_Xaxis));
                 end
 
-                for cIdx = 1:numChPlots
-                    chan  = chPlot(cIdx);
-                    rowIdx = find(yDataRange == chan, 1);
-                    validIndices = all_indices > 0 & all_indices <= size(inputData,2);
-                    for sIdx = 1:numSpikes
-                        if all(validIndices(sIdx,:))
-                            Waveforms(sIdx, cIdx, :) = ampScale * normIn(rowIdx, all_indices(sIdx,:));
-                        end
+                % Vectorised read of every in-window snippet for this
+                % unit: slice the cached normIn array per channel in a
+                % single call instead of touching each (spike, sample)
+                % cell individually. Replaces a numChPlots × numSpikes
+                % scalar inner loop.
+                wfLen = numel(spike_Xaxis);
+                validRow = all(all_indices > 0 & all_indices <= size(inputData,2), 2);
+                if any(validRow)
+                    idxValid = all_indices(validRow, :);
+                    nValid   = size(idxValid,1);
+                    for cIdx = 1:numChPlots
+                        chan  = chPlot(cIdx);
+                        rowIdx = find(yDataRange == chan, 1);
+                        if isempty(rowIdx), continue; end
+                        slab  = ampScale * normIn(rowIdx, idxValid);    % nValid × wfLen
+                        Waveforms(validRow, cIdx, :) = reshape(slab, nValid, 1, wfLen);
                     end
                 end
+
+                % Fallback for low-rate units: when the visible window
+                % contains fewer in-window spikes than the user asked
+                % for, pull additional spikes from anywhere in the
+                % recording. We read each extra snippet directly from
+                % the memory-mapped data (with a small filter pad to
+                % avoid edge ringing) and append them to Waveforms.
+                % Triggered only when needed, so the fast path on
+                % high-rate units is unaffected.
+                needed = max(0, numWaveforms - numSpikes);
+                if ~plotMean && needed > 0
+                    % Split-created units have origLab = NaN; fall back
+                    % to the current sortedRes label so we can still
+                    % find their spikes.
+                    if isnan(origLab)
+                        usedLocal = spike_idx(currLabels == currLab);
+                        lookupLab = currLab;
+                        useCurrent = true;
+                    else
+                        usedLocal = spike_idx(origLabels == origLab);
+                        lookupLab = origLab;
+                        useCurrent = false;
+                    end
+                    [extraWf, nAdded] = readExtraWaveforms(lookupLab, ...
+                        usedLocal, needed, chPlot, xDataRange, useCurrent);
+                    if nAdded > 0
+                        Waveforms = cat(1, Waveforms, extraWf);
+                        numSpikes = size(Waveforms, 1);
+                    end
+                end
+
+                % Nothing to draw for this unit even after the fallback:
+                % bookkeep the slot extents so other units stay aligned,
+                % then move on.
+                if size(Waveforms, 1) == 0
+                    min_t = waveformXaxis + (uniqPlots/3) * min(xNorm_adj(chPlot));
+                    min_t = min_t + 1.1 * slot * range(min_t);
+                    max_t = waveformXaxis + (uniqPlots/3) * max(xNorm_adj(chPlot));
+                    max_t = max_t + 1.1 * slot * range(max_t);
+                    minAx = min(minAx, min(min_t));
+                    maxAx = max(maxAx, max(max_t));
+                    plotCount = plotCount + 1;
+                    continue;
+                end
+
+                chanPlotList = [chanPlotList, chPlot];
 
                 if plotMean
                     Waveforms = mean(Waveforms, 1, 'omitnan');
@@ -2901,20 +7011,42 @@ tic
                 for cIdx = 1:numChPlots
                     chan = chPlot(cIdx);
                     t = waveformXaxis + (uniqPlots) * xNorm_adj(chan);
-                    t = t + 1.1 * plotCount * range(t);
+                    t = t + 1.1 * slot * range(t);
                     minAx = min(minAx, min(t));
                     maxAx = max(maxAx, max(t));
-                    wf = squeeze(Waveforms(:, cIdx, :)) + yNorm_adj(chan);
+                    wfRaw   = squeeze(Waveforms(:, cIdx, :));
+                    if size(Waveforms,1) == 1
+                        wfRaw = wfRaw(:)';   % keep the row orientation for single-trace mean
+                    end
+                    yChan   = yNorm_adj(chan);
+                    wf      = wfRaw + yChan;
 
-                    min_YAx = min(min_YAx, yNorm_adj(chan)-1);
-                    max_YAx = max(max_YAx, yNorm_adj(chan)+1);
-                    if chan == channelList(k)
-                        plot(plotAxis, t, wf', 'Color', [c, alphaLevel], 'LineWidth', lineWidth*2);
+                    min_YAx = min(min_YAx, yChan-1);
+                    max_YAx = max(max_YAx, yChan+1);
+                    isMainCh = (chan == channelList(k));
+                    if isMainCh
+                        hL = plot(plotAxis, t, wf', 'Color', [c, alphaLevel], 'LineWidth', lineWidth*2);
                     else
-                        plot(plotAxis, t, wf', 'Color', [c, alphaLevel], 'LineWidth', lineWidth);
+                        hL = plot(plotAxis, t, wf', 'Color', [c, alphaLevel], 'LineWidth', lineWidth);
+                    end
+                    if canFastPath
+                        % wfRaw already has ampScale baked in; divide it
+                        % out so the cache stores the unit-amplitude
+                        % version, ready to be re-multiplied by a new
+                        % ampScale on the fast path.
+                        if ampScale ~= 0
+                            unscaled = wfRaw / ampScale;
+                        else
+                            unscaled = wfRaw;
+                        end
+                        wfPlotCache.lines{end+1,1}     = hL;
+                        wfPlotCache.unscaledY{end+1,1} = unscaled;
+                        wfPlotCache.yOff(end+1,1)      = yChan;
+                        wfPlotCache.isMain(end+1,1)    = isMainCh;
+                        wfPlotCache.rgb(end+1,:)       = c(:)';
                     end
                     plot(plotAxis, [t(round(end/2)) t(round(end/2))], ...
-                        [yNorm_adj(chan)-1 yNorm_adj(chan)+1], ...
+                        [yChan-1 yChan+1], ...
                         'Color', 1-figColor, 'LineWidth', lineWidth/10, 'LineStyle', '-');
                 end
                 plotCount = plotCount + 1;
@@ -2946,6 +7078,77 @@ tic
     toc
     end
 
+    function [extraWf, nAdded] = readExtraWaveforms(origLab, alreadyUsedLocal, needed, chPlot, xDataRangeIn, useCurrent)
+        % Read additional spike waveforms for a low-rate unit when the
+        % current viewport does not contain enough spikes. Each chunk
+        % is read with a filter pad so bandpass_filter_GUI does not
+        % introduce edge ringing inside the spike window. Returns an
+        % (nAdded × numel(chPlot) × numel(spike_Xaxis)) array.
+        %
+        % useCurrent (optional, default false): when true, search
+        % sortedRes.unifiedLabels for origLab instead of
+        % originalUnifiedLabels. Used for Split-created units, whose
+        % originalUnifiedLabels never carried the new label.
+        if nargin < 6, useCurrent = false; end
+        nAdded  = 0;
+        extraWf = zeros(0, numel(chPlot), numel(spike_Xaxis));
+        if needed <= 0, return; end
+
+        % All spikes for this unit (regardless of viewport). When
+        % we resolve via originalUnifiedLabels we ALSO have to drop
+        % rows whose current label is -1 -- those are spikes the
+        % CCG cleanup phase stripped, and pulling them in here was
+        % the reason a previously-cleaned unit looked "contaminated"
+        % again after save+reload (the in-viewport pass was
+        % filtering -1 correctly, but if the requested waveform
+        % count exceeded the viewport, this helper backfilled
+        % from anywhere in the recording -- including the rows
+        % the cleanup had stripped).
+        if useCurrent
+            allSpkK = sortedRes.spike_idx(sortedRes.unifiedLabels == origLab);
+        else
+            allSpkK = sortedRes.spike_idx(originalUnifiedLabels == origLab & ...
+                                          sortedRes.unifiedLabels ~= -1);
+        end
+        allSpkK = allSpkK(allSpkK > numSpikeSamples & ...
+                          allSpkK <= num_Samples - numSpikeSamples);
+        if isempty(allSpkK), return; end
+
+        % Drop spikes already drawn from the cached viewport.
+        usedGlobal = [];
+        if ~isempty(alreadyUsedLocal) && ~isempty(xDataRangeIn)
+            valid = alreadyUsedLocal > 0 & alreadyUsedLocal <= numel(xDataRangeIn);
+            usedGlobal = xDataRangeIn(alreadyUsedLocal(valid));
+        end
+        candidates = setdiff(allSpkK(:), usedGlobal(:));
+        if isempty(candidates), return; end
+
+        nExtra = min(needed, numel(candidates));
+        if numel(candidates) > nExtra
+            extraSpikes = candidates(randperm(numel(candidates), nExtra));
+        else
+            extraSpikes = candidates;
+        end
+
+        filterPad = max(numSpikeSamples * 4, 256);
+        extraWf   = nan(nExtra, numel(chPlot), numel(spike_Xaxis));
+        for sIdx = 1:nExtra
+            spk = extraSpikes(sIdx);
+            readStart = max(1, spk - numSpikeSamples - filterPad);
+            readEnd   = min(num_Samples, spk + numSpikeSamples + filterPad);
+            chunk = double(mappedData.Data.data(channel_mapping(chPlot), readStart:readEnd));
+            if strcmp(plotFilterType,'filtered')
+                chunk = bandpass_filter_GUI(chunk', cfg.bandpass, cfg.samplingFrequency)';
+            end
+            centerIdx = spk - readStart + 1;
+            snipIdx   = centerIdx + spike_Xaxis;
+            if all(snipIdx >= 1 & snipIdx <= size(chunk,2))
+                extraWf(sIdx, :, :) = ampScale * chunk(:, snipIdx) ./ maxSignal;
+            end
+        end
+        nAdded = nExtra;
+    end
+
     function plotCCG(panelOption)
         disp('--- Plot CCG called ---');
 
@@ -2969,7 +7172,7 @@ tic
         end
 
 
-        plotList = unique(groupList(selected_order));
+        plotList = unique(effLabelVec(selected_order));
         if strcmp(plotType,'Multiple')
         numCCG = min(numel(plotList),8);
         else
@@ -3039,7 +7242,7 @@ tic
             plotAxis = panelOption;
         end
 
-        plotList = unique(groupList(selected_order));
+        plotList = unique(effLabelVec(selected_order));
         numISI = min(numel(plotList),10);
 
         if numISI
@@ -3110,6 +7313,228 @@ tic
     end
 
 
+    function plotAmpDistribution(panelOption)
+        % Per-unit RMS amplitude distribution. For each visible
+        % unit we sample up to maxSpikes spikes, read each spike's
+        % snippet on the unit's MAIN channel only, crop to a tight
+        % ±0.5 ms window around the alignment sample, and take the
+        % per-spike RMS (sqrt(mean(snip.^2))). RMS is the energy
+        % of the spike inside the window, so it stays meaningful
+        % even when a single sample is noisy -- the previous
+        % max(abs(...)) variant got fooled by single-sample
+        % transients and ranked clearly-bigger units below smaller
+        % ones. RMS also remains polarity-agnostic so negative-
+        % and positive-going spikes are summarised the same way.
+        %
+        % All reads use the curated label (sortedRes.unifiedLabels
+        % == groupList(k)), so cleaned spikes (label set to -1) are
+        % automatically excluded -- the visualisation always
+        % reflects the post-curation spike train of each unit.
+        %
+        % We picked main-channel
+        % over multi-channel RMS because:
+        %   * It's the standard amplitude metric in spike sorters
+        %     (Phy / KiloSort all gate on it).
+        %   * Off-footprint channels mostly contribute noise, which
+        %     would dilute a tight per-unit distribution.
+        %   * One channel per spike => 1/N the memmap I/O of the
+        %     full footprint read, so the plot stays interactive
+        %     even with many visible units.
+        %
+        % Each unit's distribution is rendered as a kernel-density
+        % patch with FaceAlpha 0.5 so overlapping curves stay
+        % legible. Tight, single-mode = clean unit. Long tail or
+        % bimodal = drift / contamination / merge candidate.
+        if nargin < 1, panelOption = []; end
+
+        % --- Set up axes (mirrors plotISI / plotDensity). --------
+        if isempty(panelOption)
+            if strcmp(lastPlotted, 'Amp Dist')
+                delete(allchild(axChannels));
+            else
+                delete(allchild(axChannels));
+                delete(axChannels);
+                axChannels = uipanel(bottomRightGrid,'BorderType','none', ...
+                    'BackgroundColor',figColor);
+                axChannels.Layout.Column = [1 5];
+                axChannels.Layout.Row    = [1 5];
+                applyColorScheme(axChannels, figColor);
+            end
+            plotAxis = uiaxes(axChannels,'Units','normalized','Position',[0 0 1 1]);
+            lastPlotted = plotType;
+        else
+            plotAxis = uiaxes(panelOption,'Units','normalized','Position',[0 0 1 1]);
+        end
+        applyColorScheme(plotAxis, figColor);
+        hold(plotAxis,'on');
+        title(plotAxis,'Per-spike RMS distribution','Color',1-figColor);
+        % Match the density panel: no axis frame, ticks, or labels.
+        % The colour-coded curves and title are enough to read the
+        % plot, and a clean axis-less layout sits better in the
+        % multi-plot grid.
+        set(plotAxis,'Color',figColor, ...
+            'XColor','none','YColor','none', ...
+            'XTick',[],'YTick',[],'Box','off');
+        xlabel(plotAxis,'');
+        ylabel(plotAxis,'');
+
+        visUnits = find(chkBoxVis);
+        if isempty(visUnits)
+            text(plotAxis, 0.5, 0.5, 'No visible units', ...
+                'Units','normalized','HorizontalAlignment','center', ...
+                'Color', 1-figColor);
+            hold(plotAxis,'off');
+            return;
+        end
+
+        if isempty(mappedData)
+            if isfield(cfg,'inputFolder') && isfield(cfg,'outputFolder')
+                try
+                    mappedData = map_input_file(cfg.fullFilePath, cfg);
+                catch
+                    text(plotAxis,0.5,0.5,'Data file not accessible', ...
+                        'Units','normalized','HorizontalAlignment','center', ...
+                        'Color', 1-figColor);
+                    hold(plotAxis,'off');
+                    return;
+                end
+            else
+                hold(plotAxis,'off');
+                return;
+            end
+        end
+
+        nDataChans   = size(mappedData.Data.data, 1);
+        nSamplesData = size(mappedData.Data.data, 2);
+        windowSize   = 2*numSpikeSamples + 1;
+        relIdx       = -numSpikeSamples:numSpikeSamples;
+        % Per-unit sample cap. Bumped to 1000 because the KDE
+        % visibly wobbles below ~500 samples; the single-channel
+        % fancy-indexed read scales linearly with sample count and
+        % stays under ~10 ms per unit at 1000.
+        maxSpikes    = 1000;
+        % Tight per-spike window for the amplitude estimate. The
+        % full 2*numSpikeSamples+1 snippet (~2 ms wide) is too
+        % wide -- a noise transient or the tail of a coupled spike
+        % at one of the edges drags max-min up and made well-
+        % isolated big-amplitude units look smaller than they
+        % actually are. We keep only the central +/-0.5 ms slice
+        % around the spike's alignment sample, which is where the
+        % action-potential peak/trough actually sits.
+        centerIdx    = numSpikeSamples + 1;     % spike alignment sample
+        halfTight    = round(0.0005 * cfg.samplingFrequency);
+        tightStart   = max(1, centerIdx - halfTight);
+        tightEnd     = min(windowSize, centerIdx + halfTight);
+
+        unitAmps   = cell(numel(visUnits),1);
+        unitColors = nan(numel(visUnits),3);
+        for vi = 1:numel(visUnits)
+            k = visUnits(vi);
+            if k > numel(groupList)   || isnan(groupList(k)),   continue; end
+            if k > numel(channelList) || isnan(channelList(k)), continue; end
+
+            kLabel = groupList(k);
+            kRows  = find(sortedRes.unifiedLabels == kLabel);
+            if numel(kRows) < 5, continue; end
+
+            spkPos = round(double(sortedRes.spike_idx(kRows)));
+            edgeOK = spkPos > numSpikeSamples & ...
+                     spkPos <= nSamplesData - numSpikeSamples;
+            spkPos = spkPos(edgeOK);
+            if numel(spkPos) < 5, continue; end
+
+            % Random sample (sorted) so the sample reflects firing
+            % across the whole recording, not just the start.
+            nSamp = min(numel(spkPos), maxSpikes);
+            if numel(spkPos) > nSamp
+                rIdx    = randperm(numel(spkPos), nSamp);
+                sampPos = sort(spkPos(rIdx));
+            else
+                sampPos = sort(spkPos);
+            end
+
+            % Main-channel only. Check the channel index and
+            % memmap-row index for sanity before doing the read.
+            chCenter = round(channelList(k));
+            if chCenter < 1 || chCenter > numChannels, continue; end
+            if chCenter > numel(channel_mapping),      continue; end
+            chMap = channel_mapping(chCenter);
+            if ~isfinite(chMap) || chMap < 1 || chMap > nDataChans
+                continue;
+            end
+            chMap = round(chMap);
+
+            % Single fancy-indexed read of every (mainCh, sample)
+            % we need for this unit, reshaped so row i = spike i's
+            % snippet. We build the index matrix as
+            % windowSize x nSamp on purpose so MATLAB's column-
+            % major flatten emits "spike1's window, then spike2's
+            % window, ..." -- if we built it nSamp x windowSize the
+            % flatten interleaves values across spikes (one offset
+            % from every spike, then the next offset, ...) and the
+            % reshape downstream packs values from many different
+            % spikes into each "row", which silently scrambled the
+            % RMS so amplitude no longer reflected unit size.
+            try
+                spikeIdxMat = relIdx(:) + sampPos(:)';      % windowSize x nSamp, each column = one spike's window
+                allIdx      = spikeIdxMat(:)';              % spike-major flatten
+                slab        = double(mappedData.Data.data(chMap, allIdx));
+                slab2D      = reshape(slab, windowSize, numel(sampPos))';   % nSamp x windowSize
+                tightSlab   = slab2D(:, tightStart:tightEnd);
+                ampVals     = sqrt(mean(tightSlab.^2, 2));
+            catch
+                continue;
+            end
+            ampVals = ampVals(isfinite(ampVals));
+            if numel(ampVals) < 5, continue; end
+
+            unitAmps{vi}     = ampVals;
+            unitColors(vi,:) = getGroupColor(kLabel);
+        end
+
+        nonEmpty = find(~cellfun(@isempty, unitAmps));
+        if isempty(nonEmpty)
+            text(plotAxis,0.5,0.5,'Not enough spikes for any visible unit', ...
+                'Units','normalized','HorizontalAlignment','center', ...
+                'Color', 1-figColor);
+            hold(plotAxis,'off');
+            return;
+        end
+
+        % Common x-grid covering the bulk of every distribution; we
+        % use 1st/99th percentiles (with a 5% pad) so an isolated
+        % giant outlier on one unit doesn't squish every other
+        % curve against the y-axis.
+        allValues = vertcat(unitAmps{nonEmpty});
+        xMin = prctile(allValues,1);
+        xMax = prctile(allValues,99);
+        if ~isfinite(xMin) || ~isfinite(xMax) || xMax <= xMin
+            xMin = min(allValues);
+            xMax = max(allValues);
+        end
+        if xMax <= xMin, xMax = xMin + 1; end
+        pad  = 0.05 * (xMax - xMin);
+        xPts = linspace(xMin - pad, xMax + pad, 256);
+
+        for vi = nonEmpty(:)'
+            ampVals = unitAmps{vi};
+            c       = unitColors(vi,:);
+            try
+                [f, xi] = ksdensity(ampVals, xPts);
+            catch
+                continue;
+            end
+            patch(plotAxis, [xi, fliplr(xi)], [f, zeros(1,numel(f))], ...
+                c, 'FaceAlpha', 0.5, 'EdgeColor', c, ...
+                'LineWidth', 1.0, 'EdgeAlpha', 0.85);
+        end
+
+        axis(plotAxis,'tight');
+        box(plotAxis,'off');
+        hold(plotAxis,'off');
+    end
+
+
     function plotDensity(panelOption)
         disp('--- Plot density called ---');
 
@@ -3131,7 +7556,7 @@ tic
             plotAxis = panelOption;
         end
 
-        plotList = unique(groupList(selected_order));
+        plotList = unique(effLabelVec(selected_order));
         numDen = min(numel(plotList), 10);
 
         if numDen
@@ -3154,7 +7579,7 @@ tic
                                 spike_idx = [unique(spike_idx_i); unique(spike_idx_j)];
                             end
                             [DenCenters{groupID_i, groupID_j}, DenCounts{groupID_i, groupID_j}, presence_ratio(groupID_i, groupID_j)] = ...
-                                presenceRatio(spike_idx, cfg.samplingFrequency, trialLength, round(trialLength/(2*ccgLag)), smoothN);
+                                presenceRatio(spike_idx, cfg.samplingFrequency, trialLength, max(1, round(trialLength/(2*ccgLag))), smoothN);
                         end
 
                         tiledAX{iDen,jDen} = nexttile(tileforDen);
@@ -3199,6 +7624,15 @@ tic
                             addNewPositionCallback(hRedLine, @(p) redLineCallback(p, groupID_i));
                             hold(tiledAX{iDen,jDen}, 'off');
                             xlim(tiledAX{iDen,jDen},[min(DenCenters{groupID_i, groupID_j})-range(DenCenters{groupID_i, groupID_j})/20 max(DenCenters{groupID_i, groupID_j})+range(DenCenters{groupID_i, groupID_j})/20]);
+                            % Hide axis lines, ticks and labels.
+                            % The bars, title and the interactive
+                            % imlines stay visible because they're
+                            % drawn as separate graphics objects --
+                            % only the axis frame is suppressed.
+                            set(tiledAX{iDen,jDen}, 'XColor','none', 'YColor','none', ...
+                                'XTick',[], 'YTick',[], 'Box','off');
+                            xlabel(tiledAX{iDen,jDen},'');
+                            ylabel(tiledAX{iDen,jDen},'');
                         else
                             xlim(tiledAX{iDen,jDen},[min(DenCenters{groupID_i, groupID_j})-range(DenCenters{groupID_i, groupID_j})/20 max(DenCenters{groupID_i, groupID_j})+range(DenCenters{groupID_i, groupID_j})/20]);
                             axis(tiledAX{iDen,jDen},'off')
@@ -3415,9 +7849,9 @@ tic
                             max_YAx = max(max_YAx,yNorm_adj(chan)+1);
 
                             if chan == channelList(k)
-                                scatter(plotAxis,xScatter,yScatter,lineWidth*10,'filled','MarkerFaceColor',c,'MarkerEdgeColor',c,'MarkerFaceAlpha',alphaLevel, 'MarkerEdgeAlpha', alphaLevel)
+                                scatter(plotAxis,xScatter,yScatter,lineWidth*100,'filled','MarkerFaceColor',c,'MarkerEdgeColor',c,'MarkerFaceAlpha',min(alphaLevel*2,1), 'MarkerEdgeAlpha', min(alphaLevel*2,1))
                             else
-                                scatter(plotAxis,xScatter,yScatter,lineWidth*5,'filled','MarkerFaceColor',c,'MarkerEdgeColor',c,'MarkerFaceAlpha',alphaLevel, 'MarkerEdgeAlpha', alphaLevel)
+                                scatter(plotAxis,xScatter,yScatter,lineWidth*50,'filled','MarkerFaceColor',c,'MarkerEdgeColor',c,'MarkerFaceAlpha',min(alphaLevel*2,1), 'MarkerEdgeAlpha', min(alphaLevel*2,1))
                             end
 
                         end
@@ -3510,7 +7944,7 @@ tic
                 classPolarity = double(mainPolarity(k));
                 classPolarity(classPolarity==1) = -1;
                 classPolarity(classPolarity==0) = 1;
-                scatterIdx = find(unifiedLabels == groupList(k));
+                scatterIdx = find(unifiedLabels == effLabel(k));
                 if length(scatterIdx) > 5E4
                     scatterIdx = scatterIdx(randperm(length(scatterIdx), 5E4));
                 end
@@ -3518,7 +7952,7 @@ tic
                 if ~isempty(plot_spike_idx)
                     c = getGroupColor(groupList(k));
                     scatter(plotAxis, plot_spike_idx/cfg.samplingFrequency,classPolarity * abs(norm_spike_amplitude(scatterIdx)),...
-                        lineWidth * 2.5,'markerfacecolor',c,'markeredgecolor','none')
+                        lineWidth * 25,'markerfacecolor',c,'markeredgecolor','none','MarkerFaceAlpha',min(alphaLevel*2,1))
                 end
             end
         end
@@ -3533,6 +7967,12 @@ tic
 
     function updatePlotType(newVal)
         plotType = newVal;
+        % Non-trace plots default to a 100 s time window; the trace
+        % plot keeps whatever step the user set.
+        if ~strcmpi(plotType, 'Trace')
+            xStepDropdown.Value = '100';
+            updateXWindow(xSlider.Value, xStepDropdown.Value);
+        end
         disp(['Plot type set to ', plotType]);
         plotOption();
     end
@@ -3638,14 +8078,37 @@ tic
         plotOption();
     end
 
+    function updatePlotOverlay(val)
+        % Toggle between overlay (all groups in one column, distinguished
+        % by colour) and side-by-side (each group in its own column).
+        plotOverlay = logical(val);
+        disp(['Overlay = ', mat2str(plotOverlay)]);
+        plotOption();
+    end
+
 
     function preprocessSortedData()
-        % Vectorized preprocessing
+        % Vectorized preprocessing.
+        % If a unit has been marked removed (groupList(i) = NaN), fall
+        % back to the unit's pre-curation spike train so the displayed
+        % ISI never becomes NaN -- the user still sees the original
+        % unit quality even after a Remove / Auto sweep, and Reset /
+        % Undo / a second Auto pass restore meaningful values.
         for i = 1:numGroups
             groupID_i = groupList(i);
-            spike_idx_i = sortedRes.spike_idx(sortedRes.unifiedLabels == groupID_i);
-            [~, ~, preprocessed.isiViolation(i,1)] = getISIViolations(spike_idx_i, cfg.samplingFrequency, thresholdISI);
-            preprocessed.firingRate(i,1) = numel(spike_idx_i)./trialLength;
+            if isnan(groupID_i)
+                origLab     = originalGroupList(i);
+                spike_idx_i = sortedRes.spike_idx(originalUnifiedLabels == origLab);
+            else
+                spike_idx_i = sortedRes.spike_idx(sortedRes.unifiedLabels == groupID_i);
+            end
+            if isempty(spike_idx_i)
+                preprocessed.isiViolation(i,1) = 0;
+                preprocessed.firingRate(i,1)   = 0;
+            else
+                [~, ~, preprocessed.isiViolation(i,1)] = getISIViolations(spike_idx_i, cfg.samplingFrequency, thresholdISI);
+                preprocessed.firingRate(i,1) = numel(spike_idx_i)./trialLength;
+            end
         end
         preprocessed.logFiringRate = log(preprocessed.firingRate);
     end
@@ -3688,9 +8151,15 @@ tic
                 mean_sample_waveforms = [];
 
                 if ~isempty(channels)
+                    % 200 spikes per group (doubled from 100) gives a
+                    % more stable PCA / mean-waveform estimate at a
+                    % small extra read cost. The stability is what
+                    % feeds the similarity / amp-variance gates that
+                    % the Auto pipeline relies on.
+                    maxSpikesPerGroup = 200;
                     for jChan = 1:length(channels)
                         spike_idx_i = sortedRes.spike_idx(sortedRes.unifiedLabels == groupList(channels(jChan)));
-                        numSamples = min(length(spike_idx_i),100);
+                        numSamples = min(length(spike_idx_i),maxSpikesPerGroup);
                         sampled_idx = datasample(spike_idx_i, numSamples,'Replace',false);
                         waveform_idx = sampled_idx(:) + [-numSpikeSamples:numSpikeSamples];
                         inputData = double(mappedData.Data.data(channel_mapping(iChan), waveform_idx'));
@@ -3766,6 +8235,69 @@ tic
         plotOption();
     end
 
+    function saveKiaPrefs()
+        % Build the prefs struct from current closure state and write
+        % it next to the curated output (cfg.outputFolder/RES_Sorted).
+        % Called from onSave (so tuning is checkpointed every time
+        % the user hits Save) and from onParentClose (so a dirty
+        % session that hasn't yet been Saved still gets its prefs
+        % captured). Never throws -- prefs are best-effort.
+        try
+            prefs = struct();
+            prefs.plotType       = plotType;
+            prefs.plotFilterType = plotFilterType;
+            prefs.numWaveforms   = numWaveforms;
+            prefs.plotMean       = plotMean;
+            prefs.plotOverlay    = plotOverlay;
+            prefs.ccgLag         = ccgLag;
+            prefs.smoothN        = smoothN;
+            prefs.thresholdISI   = thresholdISI;
+            prefs.ampScale       = ampScale;
+            prefs.lineWidth      = lineWidth;
+            prefs.alphaLevel     = alphaLevel;
+            prefs.exportType     = exportType;
+            % Auto-curation panel state.
+            prefs.autoDistVal     = autoDistVal;
+            prefs.autoSimVal      = autoSimVal;
+            prefs.autoAmpVal      = autoAmpVal;
+            prefs.autoIsiVal      = autoIsiVal;
+            prefs.autoOverlapFrac = autoOverlapFrac;
+            prefs.autoIsiBudget   = autoIsiBudget;
+            prefs.autoPCVal       = autoPCVal;
+            prefs.autoCCGRatio    = autoCCGRatio;
+            prefs.autoLagTightMs           = autoLagTightMs;
+            prefs.autoLagConsistencyFrac   = autoLagConsistencyFrac;
+            prefs.autoPairType    = autoPairType;
+
+            saveDir = projectPrefsDir;
+            if isempty(saveDir) || ~ischar(saveDir)
+                % Fallback if cfg.outputFolder went missing somehow.
+                saveDir = getKiaPrefsDir();
+            end
+            if ~exist(saveDir, 'dir'), mkdir(saveDir); end
+            save(fullfile(saveDir, 'kiaSort_curate_prefs.mat'), 'prefs');
+        catch
+            % Pref save failure is non-fatal.
+        end
+    end
+
+    function onParentClose(src, evt, prevFcn) %#ok<INUSD>
+        % Persist user prefs when the figure closes, then chain to any
+        % previously-installed CloseRequestFcn (or the default delete).
+        saveKiaPrefs();
+        % Chain to any previous CloseRequestFcn so we don't strip
+        % MATLAB's default close behaviour.
+        try
+            if ~isempty(prevFcn) && isa(prevFcn,'function_handle')
+                feval(prevFcn, src, evt);
+            else
+                delete(src);
+            end
+        catch
+            try, delete(src); catch, end
+        end
+    end
+
 end
 
 
@@ -3799,5 +8331,23 @@ if brightness < 0.5
     tc = [1 1 1];
 else
     tc = [0 0 0];
+end
+end
+
+function d = getKiaPrefsDir()
+% Cross-platform location for the curate-GUI's persistent prefs file.
+% Falls back to the temp dir if the home directory is somehow not
+% writable (e.g. read-only mount).
+try
+    if ispc
+        d = fullfile(getenv('USERPROFILE'), '.kiaSort');
+    else
+        d = fullfile(getenv('HOME'), '.kiaSort');
+    end
+    if isempty(d) || strcmp(d, '.kiaSort')
+        d = fullfile(tempdir, 'kiaSort');
+    end
+catch
+    d = fullfile(tempdir, 'kiaSort');
 end
 end
