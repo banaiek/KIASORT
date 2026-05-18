@@ -404,7 +404,7 @@ try
             left_diff       = [Inf; diff(dist_temp)];
             right_diff      = [diff(dist_temp); Inf];
 
-            valid_idx  = (left_diff > sample_spike_distance) & (right_diff > sample_spike_distance);
+            valid_idx  = (left_diff > sample_spike_distance) & (right_diff > sample_spike_distance) & valid_idx;
 
 
             out.spk_Val_full            = tmp_val(valid_idx);
