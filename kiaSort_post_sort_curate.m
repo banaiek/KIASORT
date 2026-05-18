@@ -524,7 +524,8 @@ end
 % Spike-time alignment: when the similarity metric finds a non-zero
 % best-lag, the absorbed unit's spike times are shifted by -bestLag so
 % the merged ACG's lag-0 bin really sits at lag zero (matches GUI).
-nMerge = 0;
+nMerge     = 0;
+spkChanged = false;
 % Working remap from "label as it was" -> "label as it is now after
 % any merges already applied this run". Allows transitive collapse.
 mergedTo = containers.Map('KeyType', 'double', 'ValueType', 'double');
@@ -553,7 +554,7 @@ if opt.merging
             M2 = numel(mw1);
             if M2 < 5 || numel(mw2) ~= M2, continue; end
             maxLag = max(1, round(M2/4));
-            [simScore, ~] = max_half_corr(mw1(:)', mw2(:)', 1, M2, maxLag, 0);
+            [simScore, bestLag] = max_half_corr(mw1(:)', mw2(:)', 1, M2, maxLag, 0);
             if ~isfinite(simScore) || simScore < opt.xcorrThreshold, continue; end
 
             ampDiff = local_ampSimilarity(mw1(:)', mw2(:)');
@@ -575,9 +576,23 @@ if opt.merging
             if nI >= nJ
                 primaryLab  = labI;
                 absorbedLab = labJ;
+                shiftSign   = -1;     % absorbed = J; max_half_corr lag = "J leads I", shift J by -bestLag
             else
                 primaryLab  = labJ;
                 absorbedLab = labI;
+                shiftSign   = +1;     % absorbed = I; I leads J by -bestLag, shift I by +bestLag
+            end
+
+            if isfinite(bestLag) && bestLag ~= 0
+                absRows = (lbl_all == absorbedLab);
+                if any(absRows)
+                    shifted = spk_all(absRows) + shiftSign * bestLag;
+                    nSamp = max(spk_all);
+                    shifted(shifted < 1)     = 1;
+                    shifted(shifted > nSamp) = nSamp;
+                    spk_all(absRows) = shifted;
+                    spkChanged = true;
+                end
             end
 
             lbl_all(lbl_all == absorbedLab) = primaryLab;
@@ -593,7 +608,7 @@ if opt.merging
 end
 
 % ---- Write back if anything changed ------------------------------------
-changed = (nClean > 0) || (nMerge > 0);
+changed = (nClean > 0) || (nMerge > 0) || spkChanged;
 if changed
     try
         if exist(unifiedLabelsH5, 'file')
@@ -601,6 +616,14 @@ if changed
         end
         h5create(unifiedLabelsH5, '/unifiedLabels', size(lbl_all), 'Datatype', 'double');
         h5write(unifiedLabelsH5,  '/unifiedLabels', lbl_all);
+
+        if spkChanged
+            if exist(spikeIdxH5, 'file')
+                delete(spikeIdxH5);
+            end
+            h5create(spikeIdxH5, '/spike_idx', size(spk_all), 'Datatype', 'double');
+            h5write(spikeIdxH5,  '/spike_idx', spk_all);
+        end
     catch ME
         if opt.verbose
             fprintf('Post-sort curate: H5 write failed (%s).\n', ME.message);

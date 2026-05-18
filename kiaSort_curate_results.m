@@ -3545,18 +3545,12 @@ refreshLabels();
                         mergeChannel = channelList(primary);
                         absLab       = groupList(absorbed);
 
-                        % For the XCorr metric we want the absorbed
-                        % cluster's spike times shifted into the
-                        % primary's frame before they get relabelled,
-                        % otherwise two units whose templates differ
-                        % only by a sorter-introduced sub-ms offset
-                        % merge into a smeared ACG (the lag-0 bin
-                        % isn't really at lag 0). KL / Bhatta don't
-                        % carry a lag, so we leave spike times alone
-                        % for those metrics. originalSpikeIdx is
-                        % untouched so Reset / Undo restore the
-                        % original timing.
-                        if strcmp(distanceEstType, 'XCorr') && ~isnan(mergeChannel)
+                        % Align absorbed spike times to primary frame
+                        % using shared-channel XCorr lag. Done for every
+                        % merge regardless of the similarity metric the
+                        % user selected. originalSpikeIdx is untouched
+                        % so Reset / Undo restore the original timing.
+                        if ~isnan(mergeChannel)
                             mwA = localMeanWaveform(primary, mergeChannel);
                             mwB = localMeanWaveform(absorbed, mergeChannel);
                             if ~isempty(mwA) && ~isempty(mwB) && ...
