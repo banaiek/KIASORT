@@ -172,6 +172,58 @@ for i=1:numUniqueClusters
     meanClusterWaveform(i,:,:)  = mean(waveform(idx,:,:), 1, 'omitmissing');
 end
 
+% Drop small clusters whose per-spike maxima are concentrated on one
+% channel but scattered in time -- likely formed from overlapping spikes
+% of other (larger) classes.
+sizes_valid = clusterSampleCounts(uniqueLabels >= 0);
+if ~isempty(sizes_valid)
+    sizeThr       = 0.10 * max(sizes_valid);
+    chanFracThr   = 0.80;
+    timeJitterThr = max(3, round(T / 5));
+
+    for i = 1:numUniqueClusters
+        L = uniqueLabels(i);
+        if L < 0 || clusterSampleCounts(i) >= sizeThr, continue; end
+        idx = find(labels == L);
+        if numel(idx) < 5, continue; end
+        [maxPerCh, maxTimePerCh] = max(abs(waveform(idx, :, :)), [], 3);
+        [~, mainCh] = max(maxPerCh, [], 2);
+        modeCh = mode(mainCh);
+        if mean(mainCh == modeCh) < chanFracThr, continue; end
+        times_on_dom = double(maxTimePerCh(mainCh == modeCh, modeCh));
+        if numel(times_on_dom) < 5, continue; end
+        if std(times_on_dom) <= timeJitterThr, continue; end
+        labels(idx)      = -1;
+        trainingLbl(idx) = -1;
+    end
+
+    survivingLbls = unique(labels(labels >= 0));
+    if ~isempty(survivingLbls)
+        newLbls     = -ones(size(labels));
+        newTraining = -ones(size(trainingLbl));
+        for k = 1:numel(survivingLbls)
+            newLbls(labels == survivingLbls(k))           = k;
+            newTraining(trainingLbl == survivingLbls(k))  = k;
+        end
+        labels      = newLbls;
+        trainingLbl = newTraining;
+
+        uniqueLabels        = unique(labels);
+        numUniqueClusters   = length(uniqueLabels);
+        class_polarity      = zeros(numUniqueClusters, 1);
+        clusterSampleCounts = zeros(numUniqueClusters, 1);
+        meanClusterWaveform = zeros([numUniqueClusters, size(waveform, [2, 3])]);
+        for ii = 1:numUniqueClusters
+            cMask = labels == uniqueLabels(ii);
+            clusterSampleCounts(ii)     = sum(cMask);
+            meanClusterWaveform(ii,:,:) = mean(waveform(cMask, :, :), 1, 'omitmissing');
+            if uniqueLabels(ii) >= 0
+                class_polarity(ii, 1) = mode(spk_ID_full(cMask));
+            end
+        end
+    end
+end
+
 templateWaveforms = zeros([numUniqueClusters, numTemplatesPerCluster, C, T]);
 templateWeights = zeros(numUniqueClusters, numTemplatesPerCluster);
 
@@ -296,16 +348,16 @@ stablePoints = clusterRelabeling.stablePoints;
 for i = 1:length(uniqueLabels)
     trainingLbl(labels==uniqueLabels(i) & spk_idx_full < stablePoints(i,1) & spk_idx_full > stablePoints(i,2))=-1;
     class_idx = labels==uniqueLabels(i);
-    lowPrc = prctile(ampVals(class_idx),5);
-    highPrc = prctile(ampVals(class_idx),95);
+    lowPrc  = prctile(ampVals(class_idx), 1);
+    highPrc = prctile(ampVals(class_idx), 99);
     trainingLbl(labels==uniqueLabels(i) & (ampVals < lowPrc | ampVals > highPrc)) = -1;
 
     if class_polarity(i) == 1
-        low_thr(i) = 0.25 * lowPrc;
-        high_thr(i) = 2 * highPrc;
+        low_thr(i)  = max(0.5 * lowPrc,  0);
+        high_thr(i) = max(2   * highPrc, 0);
     else
-        low_thr(i) = 0.25 * highPrc;
-        high_thr(i) = 2 * lowPrc;
+        low_thr(i)  = min(0.5 * highPrc, 0);
+        high_thr(i) = min(2   * lowPrc,  0);
     end
 end
 

@@ -107,6 +107,9 @@ DenCounts = cell(numGroups,numGroups);
 presence_ratio = zeros(numGroups,numGroups);
 numChannels = min(length(chan_wave_inclusion),length(channel_mapping));
 selectUnits = groupList;
+% Unit# navigation walks the shown (nonzero-rate) groups by default; a
+% channel inclusion/exclusion filter overrides it with its own set.
+chanFilterActive = false;
 chanLabel = cell(numChannels, 1);
 stable_length = [ones(numGroups,1), trialLength * ones(numGroups,1)];
 maxSignal = [];
@@ -120,7 +123,8 @@ chanLabel = arrayfun(@(x) sprintf('Ch %d',x), 1:numChannels, 'UniformOutput', fa
 % Initialize pagination variables for group list display
 PAGE_SIZE = 50; % Number of groups to display per page
 currentPage = 1;
-totalPages = ceil(numGroups/PAGE_SIZE);
+displayedGroups = (1:numGroups)';
+totalPages = max(1, ceil(numel(displayedGroups)/PAGE_SIZE));
 
 ccgLag = 100;
 smoothN = 0;
@@ -192,7 +196,8 @@ try
                     chkBoxVis(end+1:nUnitSaved,1)    = false;
                     selectUnits = [selectUnits; nan(extra,1)];
                     numGroups   = nUnitSaved;
-                    totalPages  = ceil(numGroups / PAGE_SIZE);
+                    displayedGroups = (1:numGroups)';
+                    totalPages  = max(1, ceil(numel(displayedGroups) / PAGE_SIZE));
                     % Per-pair caches grow on demand so just size them now.
                     xcorr_vals(numGroups,numGroups)   = {[]};
                     isiCounts(numGroups,numGroups)    = {[]};
@@ -416,9 +421,9 @@ lblSplitMethod.Layout.Column = 5;
 applyColorScheme(lblSplitMethod, figColor);
 
 ddSplitMethod = uidropdown(topButtonLayout, ...
-    'Items',{'K-means','GMM','Graph'}, ...
+    'Items',{'K-means','GMM','Graph','UMAP+DBSCAN'}, ...
     'Value', splitMethod, ...
-    'Tooltip','Clustering method used by Split.', ...
+    'Tooltip','Clustering method used by Split. UMAP+DBSCAN falls back to PCA+DBSCAN when UMAP is unavailable.', ...
     'ValueChangedFcn', @(dd,ev) setSplitMethod(dd.Value));
 ddSplitMethod.Layout.Row = 2;
 ddSplitMethod.Layout.Column = 5;
@@ -589,16 +594,22 @@ autoIsiVal      = 1.0;     % max ISI violation %
 autoOverlapFrac = 0.10;    % coincidence overlap fraction (Phase: removal)
 autoIsiBudget   = 1.5;     % merged-ISI budget (Phase: merge)
 autoPCVal       = 0.30;    % PC-distance gate (Phase: merge)
-autoCCGRatio    = 2;       % CCG peak / baseline-median ratio (Phase: cleaning)
+autoCCGRatio    = 5;       % CCG peak / baseline-median ratio (Phase: cleaning)
 % Timing-consistency gate (Phase: cleaning). After CCG peak-at-zero
 % triggers, the contaminated side's coincident-spike lags (relative to
 % the nearest clean-side spike) must cluster tightly around their
-% median: at least autoLagConsistencyFrac of them within +-autoLagTightMs
-% of the median lag. Random coincidences spread the lags evenly inside
-% the +-0.5 ms window; a real sorter-introduced duplicate produces a
-% sharp sub-ms peak. Only the consistent-lag subset is stripped.
+% median, and that median must itself sit near zero. Random coincidences
+% spread the lags evenly inside the +-0.5 ms window; a real sorter-
+% introduced duplicate produces a sharp sub-ms peak. Only the
+% consistent-lag subset is stripped.
 autoLagTightMs         = 0.2;
 autoLagConsistencyFrac = 0.75;
+% Cleaning acts only on similar-quality pairs (|SNR_k - SNR_j| <
+% autoCCGSnrDiff); larger gaps belong to overlap removal. The lower
+% firing-rate side is the one stripped, capped at autoCCGMaxStripFrac
+% of its spikes per pair.
+autoCCGSnrDiff         = 0.3;
+autoCCGMaxStripFrac    = 0.5;
 
 % Pull saved Auto-panel values from the prefs file so the user gets
 % their tuning back on the next launch. Each guard verifies the
@@ -727,9 +738,9 @@ applyColorScheme(autoPanel, figColor);
 % uigridlayout doesn't support).
 %
 %       Col 1   Col 2  Col 3  Col 4    Col 5   Col 6  Col 7   Col 8  Col 9   Col 10 (Auto)
-% R1:   CCG:    Sim:   Amp:   PC Dist: ----- gap PairType: -- (spans 6-8) -- gap   Auto
+% R1:   Dist:   Sim:   Amp:   PC Dist: ----- gap PairType: -- (spans 6-8) -- gap   Auto
 % R2:   [v]     [v]    [v]    [v]      ----- gap [dropdown] - (spans 6-8) -- gap   (Auto)
-% R3:   Overlap:ISI %: Budget:Dist:    ----- gap Prev    Pair #:  (empty)   gap   (Auto)
+% R3:   Overlap:ISI %: Budget:CCG:     ----- gap Prev    Pair #:  (empty)   gap   (Auto)
 % R4:   [v]     [v]    [v]    [v]      ----- gap Next    [v]      /0        gap   (Auto)
 autoLayout = uigridlayout(autoPanel,[4 10], ...
     'ColumnWidth',{60, 75, 65, 65, 0, 28, 50, 30, 0, 75}, ...
@@ -739,25 +750,22 @@ autoLayout = uigridlayout(autoPanel,[4 10], ...
     'Padding',[5 5 5 5]);
 applyColorScheme(autoLayout, figColor);
 
-% --- Top half (rows 1-2): similarity-related parameters -----------
-% --- CCG peak/median ratio (col 1 top, directly above Overlap) ---
+% --- CCG peak/median ratio (bottom-right slot) ---
 % Lag-zero CCG peak must exceed autoCCGRatio times the median of
 % the off-zero bins for cleanup to fire on a candidate pair.
-% Paired with Overlap below so both coincidence-related gates
-% live in the leftmost column.
 lblAutoCCG = uilabel(autoLayout,'Text','CCG:',...
     'FontWeight','bold','HorizontalAlignment','Left');
-lblAutoCCG.Layout.Row = 1;
-lblAutoCCG.Layout.Column = 1;
+lblAutoCCG.Layout.Row = 3;
+lblAutoCCG.Layout.Column = 4;
 applyColorScheme(lblAutoCCG, figColor);
 
 uiAutoCCG = uieditfield(autoLayout,'numeric','Value',autoCCGRatio, ...
     'Limits',[0.5 10], ...
-    'Tooltip','CCG lag-0 peak / baseline-median ratio. Higher = stricter. Default 1.5.',...
+    'Tooltip','CCG lag-0 peak / baseline-median ratio. Higher = stricter. Default 5.',...
     'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
     'ValueChangedFcn',@(ui,ev)setAutoCCGRatio(ui.Value));
-uiAutoCCG.Layout.Row = 2;
-uiAutoCCG.Layout.Column = 1;
+uiAutoCCG.Layout.Row = 4;
+uiAutoCCG.Layout.Column = 4;
 applyColorScheme(uiAutoCCG, figColor);
 
 lblAutoSim = uilabel(autoLayout,'Text','Similarity:',...
@@ -902,12 +910,11 @@ uiAutoBudget.Layout.Row = 4;
 uiAutoBudget.Layout.Column = 3;
 applyColorScheme(uiAutoBudget, figColor);
 
-% Dist sits in the rightmost bottom-half slot, mirroring the Auto
-% button position above it.
+% Dist sits in the top-left slot.
 lblAutoDist = uilabel(autoLayout,'Text','Dist (µm):',...
     'FontWeight','bold','HorizontalAlignment','Left');
-lblAutoDist.Layout.Row = 3;
-lblAutoDist.Layout.Column = 4;
+lblAutoDist.Layout.Row = 1;
+lblAutoDist.Layout.Column = 1;
 applyColorScheme(lblAutoDist, figColor);
 
 uiAutoDist = uieditfield(autoLayout,'numeric','Value',autoDistVal, ...
@@ -915,8 +922,8 @@ uiAutoDist = uieditfield(autoLayout,'numeric','Value',autoDistVal, ...
     'Tooltip','Max y-distance (µm) between two units. Smaller = stricter.',...
     'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
     'ValueChangedFcn',@(ui,ev)setAutoDistVal(ui.Value));
-uiAutoDist.Layout.Row = 4;
-uiAutoDist.Layout.Column = 4;
+uiAutoDist.Layout.Row = 2;
+uiAutoDist.Layout.Column = 1;
 applyColorScheme(uiAutoDist, figColor);
 
 % Pair walker (mirrors the Similarity Processing panel's Next/Prev
@@ -1128,7 +1135,7 @@ uifUnit.Layout.Row=2;
 uifUnit.Layout.Column=9;
 applyColorScheme(uifUnit, figColor);
 
-uifUnit2 = uieditfield(middleButtonLayout,'Value',['/' num2str(numGroups)],'Editable','off',...
+uifUnit2 = uieditfield(middleButtonLayout,'Value',['/' num2str(length(selectUnits))],'Editable','off',...
     'ValueChangedFcn',@(ui,ev)changeuifUnitAll(ui.Value,0));
 uifUnit2.Layout.Row=2;
 uifUnit2.Layout.Column=10;
@@ -1220,13 +1227,13 @@ applyColorScheme(checkPanel, figColor);
 
 % Calculate page index ranges for pagination
 startIdx = (currentPage-1) * PAGE_SIZE + 1;
-endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-visibleGroups = startIdx:endIdx;
+endIdx = min(startIdx + PAGE_SIZE - 1, numel(displayedGroups));
+visibleGroups = displayedGroups(max(1,startIdx):endIdx);
 visibleRows = length(visibleGroups) + 1;  % +1 for the "All" row
 
-mainCheckGrid = uigridlayout(checkPanel, [visibleRows, 9], ...
+mainCheckGrid = uigridlayout(checkPanel, [visibleRows, 10], ...
     'RowHeight', repmat({'fit'},1,visibleRows), ...
-    'ColumnWidth', repmat({'fit'},1,9), ...
+    'ColumnWidth', repmat({'fit'},1,10), ...
     'RowSpacing',2, ...
     'Scrollable','on',...
     'ColumnSpacing',5, ...
@@ -1235,6 +1242,7 @@ applyColorScheme(mainCheckGrid, figColor);
 
 % Arrays for UI handles - only initialize for visible groups to save memory
 lblGroupHandles       = gobjects(numGroups,1);
+lblIdHandles          = gobjects(numGroups,1);
 lblChannelHandles     = gobjects(numGroups,1);
 groupVisCheckboxes    = gobjects(numGroups,1);
 groupSelectCheckboxes = gobjects(numGroups,1);
@@ -1255,7 +1263,7 @@ radioGroupBG = uibuttongroup(mainCheckGrid, ...
     'Title','', ...
     'Scrollable','on');
 radioGroupBG.Layout.Row = [2 visibleRows];
-radioGroupBG.Layout.Column = 9;
+radioGroupBG.Layout.Column = 10;
 applyColorScheme(radioGroupBG, figColor);
 rowPixelHeight = 25;
 rowOffsetTop   = 5;
@@ -1263,39 +1271,44 @@ rowOffsetTop   = 5;
 lblMerge = uilabel(mainCheckGrid,'Text','Merge To:',...
     'FontWeight','bold');
 lblMerge.Layout.Row = 1;
-lblMerge.Layout.Column = 9;
+lblMerge.Layout.Column = 10;
 applyColorScheme(lblMerge, figColor);
 
 % all selection row
+lblIdHdr = uilabel(mainCheckGrid,'Text','ID:','FontWeight','bold');
+lblIdHdr.Layout.Row = 1;
+lblIdHdr.Layout.Column = 1;
+applyColorScheme(lblIdHdr, figColor);
+
 lblAll = uilabel(mainCheckGrid,'Text','G #:',...
     'FontWeight','bold');
 lblAll.Layout.Row = 1;
-lblAll.Layout.Column = 1;
+lblAll.Layout.Column = 2;
 applyColorScheme(lblAll, figColor);
 
 lblChannel = uilabel(mainCheckGrid,'Text','Ch#:','FontWeight','bold');
 lblChannel.Layout.Row = 1;
-lblChannel.Layout.Column = 2;
+lblChannel.Layout.Column = 3;
 applyColorScheme(lblChannel, figColor);
 
 lblunitIsolation = uilabel(mainCheckGrid,'Text','Iso:','FontWeight','bold');
 lblunitIsolation.Layout.Row = 1;
-lblunitIsolation.Layout.Column = 3;
+lblunitIsolation.Layout.Column = 4;
 applyColorScheme(lblunitIsolation, figColor);
 
 lblunitRate = uilabel(mainCheckGrid,'Text','Rate:','FontWeight','bold');
 lblunitRate.Layout.Row = 1;
-lblunitRate.Layout.Column = 4;
+lblunitRate.Layout.Column = 5;
 applyColorScheme(lblunitRate, figColor);
 
 lblSNR = uilabel(mainCheckGrid,'Text','SNR:','FontWeight','bold');
 lblSNR.Layout.Row = 1;
-lblSNR.Layout.Column = 5;
+lblSNR.Layout.Column = 6;
 applyColorScheme(lblSNR, figColor);
 
 lblISIV = uilabel(mainCheckGrid,'Text','ISIV %:');
 lblISIV.Layout.Row = 1;
-lblISIV.Layout.Column = 6;
+lblISIV.Layout.Column = 7;
 applyColorScheme(lblISIV, figColor);
 
 chkAllVis = uicheckbox(mainCheckGrid,'Text','Vis. All',...
@@ -1303,14 +1316,14 @@ chkAllVis = uicheckbox(mainCheckGrid,'Text','Vis. All',...
     'Value',false,...
     'ValueChangedFcn',@(cb,ev)onAllVisChecked(cb.Value));
 chkAllVis.Layout.Row = 1;
-chkAllVis.Layout.Column = 7;
+chkAllVis.Layout.Column = 8;
 applyColorScheme(chkAllVis, figColor);
 
 chkAllSel = uicheckbox(mainCheckGrid,'Text','Sel. All',...
     'FontWeight','bold',...
     'ValueChangedFcn',@(cb,ev)onAllSelectChecked(cb.Value));
 chkAllSel.Layout.Row = 1;
-chkAllSel.Layout.Column = 8;
+chkAllSel.Layout.Column = 9;
 applyColorScheme(chkAllSel, figColor);
 
 yRow1 = (visibleRows-1)*rowPixelHeight + rowOffsetTop;  % visibleRows-1 from the bottom
@@ -1857,16 +1870,10 @@ refreshLabels();
         if ~isfinite(row) || row < 1, return; end
         if isa(tableHandle.Data, 'table')
             if row > height(tableHandle.Data), return; end
-            unitIdx = double(tableHandle.Data{row, 1});
         else
             if row > size(tableHandle.Data, 1), return; end
-            v = tableHandle.Data{row, 1};
-            if isnumeric(v)
-                unitIdx = double(v);
-            else
-                unitIdx = str2double(v);
-            end
         end
+        unitIdx = tableUnitIdx(tableHandle.Data{row, 1}, tableHandle.Data{row, 2});
         toggleUnitSelect(unitIdx);
         try, paintSelectedTableRows(); catch, end
         try, plotOption(); catch, end
@@ -1882,7 +1889,7 @@ refreshLabels();
             'Keyboard shortcuts (Ctrl + key):\n\n', ...
             '  D    Remove selected units (Delete)\n', ...
             '  M    Merge selected units\n', ...
-            '  T    Split selected unit (PCA + GMM)\n', ...
+            '  T    Split selected unit\n', ...
             '  K    Cycle isolation tier of selected units\n', ...
             '  U    Undo selected units (also dissolves merge group)\n', ...
             '  R    Reset every edit (with confirmation)\n', ...
@@ -1910,8 +1917,30 @@ refreshLabels();
     function changeuifPageSize(val)
         PAGE_SIZE = str2double(val);
         currentPage = 1;
-        totalPages = ceil(numGroups/PAGE_SIZE);
+        recomputeDisplayedGroups();
         onChangePage(0);
+    end
+
+    function recomputeDisplayedGroups()
+        mask = preprocessed.firingRate(:) > 0 & ~isnan(groupList(:));
+        displayedGroups = find(mask);
+        totalPages = max(1, ceil(numel(displayedGroups) / PAGE_SIZE));
+        if currentPage > totalPages, currentPage = totalPages; end
+        % Default Unit# navigation walks exactly the shown groups, in the
+        % same order as their displayed Group ID (1..#shown).
+        if ~chanFilterActive
+            selectUnits = displayedGroups;
+        end
+    end
+
+    function vg = currentPageVisibleGroups()
+        s = (currentPage-1) * PAGE_SIZE + 1;
+        e = min(s + PAGE_SIZE - 1, numel(displayedGroups));
+        if s > numel(displayedGroups)
+            vg = displayedGroups([]);
+        else
+            vg = displayedGroups(s:e);
+        end
     end
 
     function goToPage(target)
@@ -1961,15 +1990,13 @@ refreshLabels();
             delete(mainCheckGrid);
 
             % Calculate new visible groups
-            startIdx = (currentPage-1) * PAGE_SIZE + 1;
-            endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-            visibleGroups = startIdx:endIdx;
+            visibleGroups = currentPageVisibleGroups();
             visibleRows = length(visibleGroups) + 1;  % +1 for the "All" row
 
             % Create new grid
-            mainCheckGrid = uigridlayout(checkPanel, [visibleRows, 9], ...
+            mainCheckGrid = uigridlayout(checkPanel, [visibleRows, 10], ...
                 'RowHeight', repmat({'fit'},1,visibleRows), ...
-                'ColumnWidth', repmat({'fit'},1,9), ...
+                'ColumnWidth', repmat({'fit'},1,10), ...
                 'RowSpacing',2, ...
                 'Scrollable','on',...
                 'ColumnSpacing',5, ...
@@ -1981,7 +2008,7 @@ refreshLabels();
                 'Title','', ...
                 'Scrollable','on');
             radioGroupBG.Layout.Row = [2 visibleRows];
-            radioGroupBG.Layout.Column = 9;
+            radioGroupBG.Layout.Column = 10;
             applyColorScheme(radioGroupBG, figColor);
 
             % Recreate header row
@@ -2001,11 +2028,10 @@ refreshLabels();
             % page, point the buttongroup's SelectedObject at its radio
             % so onMerge has a live target even when the merge partner
             % lives on another page.
-            startIdx = (currentPage-1) * PAGE_SIZE + 1;
-            endIdx   = min(startIdx + PAGE_SIZE - 1, numGroups);
-            for k = startIdx:endIdx
-                if chkBoxSelect(k) && isvalid(groupRadioButtons(k))
-                    radioGroupBG.SelectedObject = groupRadioButtons(k);
+            visGrpSel = currentPageVisibleGroups();
+            for kSel = visGrpSel(:)'
+                if chkBoxSelect(kSel) && isgraphics(groupRadioButtons(kSel))
+                    radioGroupBG.SelectedObject = groupRadioButtons(kSel);
                     break;
                 end
             end
@@ -2019,35 +2045,40 @@ refreshLabels();
 
 % Function to create header row in the group list
     function recreateHeaderRow()
+        lblIdHdr = uilabel(mainCheckGrid,'Text','ID:','FontWeight','bold');
+        lblIdHdr.Layout.Row = 1;
+        lblIdHdr.Layout.Column = 1;
+        applyColorScheme(lblIdHdr, figColor);
+
         lblAll = uilabel(mainCheckGrid,'Text','G #:',...
             'FontWeight','bold');
         lblAll.Layout.Row = 1;
-        lblAll.Layout.Column = 1;
+        lblAll.Layout.Column = 2;
         applyColorScheme(lblAll, figColor);
 
         lblChannel = uilabel(mainCheckGrid,'Text','Ch#:','FontWeight','bold');
         lblChannel.Layout.Row = 1;
-        lblChannel.Layout.Column = 2;
+        lblChannel.Layout.Column = 3;
         applyColorScheme(lblChannel, figColor);
 
         lblunitIsolation = uilabel(mainCheckGrid,'Text','Iso:','FontWeight','bold');
         lblunitIsolation.Layout.Row = 1;
-        lblunitIsolation.Layout.Column = 3;
+        lblunitIsolation.Layout.Column = 4;
         applyColorScheme(lblunitIsolation, figColor);
 
         lblunitRate = uilabel(mainCheckGrid,'Text','Rate:','FontWeight','bold');
         lblunitRate.Layout.Row = 1;
-        lblunitRate.Layout.Column = 4;
+        lblunitRate.Layout.Column = 5;
         applyColorScheme(lblunitRate, figColor);
 
         lblSNR = uilabel(mainCheckGrid,'Text','SNR:','FontWeight','bold');
         lblSNR.Layout.Row = 1;
-        lblSNR.Layout.Column = 5;
+        lblSNR.Layout.Column = 6;
         applyColorScheme(lblSNR, figColor);
 
         lblISIV = uilabel(mainCheckGrid,'Text','ISIV %:');
         lblISIV.Layout.Row = 1;
-        lblISIV.Layout.Column = 6;
+        lblISIV.Layout.Column = 7;
         applyColorScheme(lblISIV, figColor);
 
         chkAllVis = uicheckbox(mainCheckGrid,'Text','Vis. All',...
@@ -2055,84 +2086,89 @@ refreshLabels();
             'Value',false,...
             'ValueChangedFcn',@(cb,ev)onAllVisChecked(cb.Value));
         chkAllVis.Layout.Row = 1;
-        chkAllVis.Layout.Column = 7;
+        chkAllVis.Layout.Column = 8;
         applyColorScheme(chkAllVis, figColor);
 
         chkAllSel = uicheckbox(mainCheckGrid,'Text','Sel. All',...
             'FontWeight','bold',...
             'ValueChangedFcn',@(cb,ev)onAllSelectChecked(cb.Value));
         chkAllSel.Layout.Row = 1;
-        chkAllSel.Layout.Column = 8;
+        chkAllSel.Layout.Column = 9;
         applyColorScheme(chkAllSel, figColor);
 
         lblMerge = uilabel(mainCheckGrid,'Text','Merge To:',...
             'FontWeight','bold');
         lblMerge.Layout.Row = 1;
-        lblMerge.Layout.Column = 9;
+        lblMerge.Layout.Column = 10;
         applyColorScheme(lblMerge, figColor);
     end
 
 % Create UI elements for visible groups
     function createGroupUiElements()
-        startIdx = (currentPage-1) * PAGE_SIZE + 1;
-        endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-        visibleGroups = startIdx:endIdx;
+        visibleGroups = currentPageVisibleGroups();
 
         for i = 1:length(visibleGroups)
             iG = visibleGroups(i);
             rowIdx = i + 1;  % +1 because row 1 is the header
+
+            % contiguous group id (rank among shown / nonzero groups)
+            lblIdHandles(iG) = uilabel(mainCheckGrid, ...
+                'Text', sprintf('%d', (currentPage-1)*PAGE_SIZE + i),...
+                'FontWeight','bold','FontColor',1-figColor);
+            lblIdHandles(iG).Layout.Row = rowIdx;
+            lblIdHandles(iG).Layout.Column = 1;
 
             % group list
             lblGroupHandles(iG) = uilabel(mainCheckGrid, ...
                 'Text', sprintf('G: %d', groupList(iG)),...
                 'FontWeight','bold');
             lblGroupHandles(iG).Layout.Row = rowIdx;
-            lblGroupHandles(iG).Layout.Column = 1;
+            lblGroupHandles(iG).Layout.Column = 2;
 
             % channel list
             lblChannelHandles(iG) = uilabel(mainCheckGrid, ...
                 'Text', sprintf('Ch %d', channelList(iG)),...
                 'FontWeight','bold');
             lblChannelHandles(iG).Layout.Row = rowIdx;
-            lblChannelHandles(iG).Layout.Column = 2;
+            lblChannelHandles(iG).Layout.Column = 3;
 
             lblIsolation(iG) = uilabel(mainCheckGrid, ...
                 'Text', unitIsolation{iG},...
                 'FontWeight','bold');
             lblIsolation(iG).Layout.Row = rowIdx;
-            lblIsolation(iG).Layout.Column = 3;
+            lblIsolation(iG).Layout.Column = 4;
 
             lblRate(iG) = uilabel(mainCheckGrid, ...
                 'Text', sprintf('%.1f',preprocessed.firingRate(iG)),...
                 'FontWeight','bold','FontColor',1-figColor);
             lblRate(iG).Layout.Row = rowIdx;
-            lblRate(iG).Layout.Column = 4;
+            lblRate(iG).Layout.Column = 5;
 
             lblDetectablity(iG) = uilabel(mainCheckGrid, ...
                 'Text', sprintf('%.1f',1 + detectblity(iG)),...
                 'FontWeight','bold','FontColor',1-figColor);
             lblDetectablity(iG).Layout.Row = rowIdx;
-            lblDetectablity(iG).Layout.Column = 5;
+            lblDetectablity(iG).Layout.Column = 6;
 
             lblISIViolation(iG) = uilabel(mainCheckGrid, ...
                 'Text', sprintf('%.1f',preprocessed.isiViolation(iG)),...
                 'FontWeight','bold','FontColor',1-figColor);
             lblISIViolation(iG).Layout.Row = rowIdx;
-            lblISIViolation(iG).Layout.Column = 6;
+            lblISIViolation(iG).Layout.Column = 7;
 
             % visualization checkboxes
             groupVisCheckboxes(iG) = uicheckbox(mainCheckGrid,...
                 'Value',chkBoxVis(iG), 'Text','Vis.',...
                 'ValueChangedFcn',@(cb,ev)onVisCheckboxChanged(iG));
             groupVisCheckboxes(iG).Layout.Row = rowIdx;
-            groupVisCheckboxes(iG).Layout.Column = 7;
+            groupVisCheckboxes(iG).Layout.Column = 8;
 
             % selection checkboxes
             groupSelectCheckboxes(iG) = uicheckbox(mainCheckGrid,...
                 'Text','Select','Value',chkBoxSelect(iG),...
                 'ValueChangedFcn',@(cb,ev)onSelectCheckboxChanged(iG));
             groupSelectCheckboxes(iG).Layout.Row = rowIdx;
-            groupSelectCheckboxes(iG).Layout.Column = 8;
+            groupSelectCheckboxes(iG).Layout.Column = 9;
 
             % radio buttons
             yPos = (length(visibleGroups) - i )*rowPixelHeight + rowOffsetTop;
@@ -2145,9 +2181,7 @@ refreshLabels();
 
 % Update visibility status based on current selection
     function refreshVisibility()
-        startIdx = (currentPage-1) * PAGE_SIZE + 1;
-        endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-        visibleGroups = startIdx:endIdx;
+        visibleGroups = currentPageVisibleGroups();
 
         for i = 1:length(visibleGroups)
             iG = visibleGroups(i);
@@ -2174,30 +2208,31 @@ refreshLabels();
             selected_order = [];
         end
 
-        startIdx = (currentPage-1) * PAGE_SIZE + 1;
-        endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-        visibleGroups = startIdx:endIdx;
+        visibleGroups = currentPageVisibleGroups();
 
-        % Batch update UI elements
         for idx = 1:length(visibleGroups)
             k = visibleGroups(idx);
+            if ~isgraphics(groupVisCheckboxes(k)), continue; end
             groupVisCheckboxes(k).Value = val;
-
             if val
                 c = getGroupColor(groupList(k));
                 groupVisCheckboxes(k).FontColor = c;
                 groupVisCheckboxes(k).FontWeight ='Bold';
-                lblChannelHandles(k).BackgroundColor = c;
-                lblChannelHandles(k).FontColor = bestTextColorFor(c);
+                if isgraphics(lblChannelHandles(k))
+                    lblChannelHandles(k).BackgroundColor = c;
+                    lblChannelHandles(k).FontColor = bestTextColorFor(c);
+                end
             else
                 groupVisCheckboxes(k).FontColor = 1-figColor;
                 groupVisCheckboxes(k).FontWeight ='normal';
-                lblChannelHandles(k).BackgroundColor = 'none';
-                lblChannelHandles(k).FontColor = 1-figColor;
+                if isgraphics(lblChannelHandles(k))
+                    lblChannelHandles(k).BackgroundColor = 'none';
+                    lblChannelHandles(k).FontColor = 1-figColor;
+                end
             end
         end
 
-        drawnow limitrate;  % Update UI in batch
+        drawnow limitrate;
         plotOption();
     end
 
@@ -2208,30 +2243,31 @@ refreshLabels();
         else
             chkBoxSelect(:) = 0;
         end
-        
-        startIdx = (currentPage-1) * PAGE_SIZE + 1;
-        endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-        visibleGroups = startIdx:endIdx;
 
-        % Batch update UI elements
+        visibleGroups = currentPageVisibleGroups();
+
         for idx = 1:length(visibleGroups)
             k = visibleGroups(idx);
+            if ~isgraphics(groupSelectCheckboxes(k)), continue; end
             groupSelectCheckboxes(k).Value = val;
-
             if val
                 c = getGroupColor(groupList(k));
                 groupSelectCheckboxes(k).FontColor = c;
                 groupSelectCheckboxes(k).FontWeight ='Bold';
-                lblChannelHandles(k).BackgroundColor = c;
-                lblChannelHandles(k).FontColor = bestTextColorFor(c);
+                if isgraphics(lblChannelHandles(k))
+                    lblChannelHandles(k).BackgroundColor = c;
+                    lblChannelHandles(k).FontColor = bestTextColorFor(c);
+                end
             else
                 groupSelectCheckboxes(k).FontColor = 1-figColor;
                 groupSelectCheckboxes(k).FontWeight ='normal';
-                lblChannelHandles(k).BackgroundColor = 'none';
-                lblChannelHandles(k).FontColor = 1-figColor;
+                if isgraphics(lblChannelHandles(k))
+                    lblChannelHandles(k).BackgroundColor = 'none';
+                    lblChannelHandles(k).FontColor = 1-figColor;
+                end
             end
         end
-        drawnow limitrate;  % Update UI in batch
+        drawnow limitrate;
     end
 
     function onVisCheckboxChanged(idx)
@@ -2405,11 +2441,12 @@ refreshLabels();
         selected_order = [];
 
         % Uncheck all selection and visibility for current page
-        startIdx = (currentPage-1) * PAGE_SIZE + 1;
-        endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-        for k = startIdx:endIdx
-            if isvalid(groupSelectCheckboxes(k))
+        visPageGrp = currentPageVisibleGroups();
+        for k = visPageGrp(:)'
+            if isgraphics(groupSelectCheckboxes(k))
                 groupSelectCheckboxes(k).Value = false;
+            end
+            if isgraphics(groupVisCheckboxes(k))
                 groupVisCheckboxes(k).Value = false;
             end
         end
@@ -2473,8 +2510,8 @@ refreshLabels();
     function onSplit()
         % Split each ticked unit into N sub-clusters (set in the Split
         % options dropdown / num-clusters field next to the toolbar)
-        % via PCA on multi-channel waveforms + the chosen clustering
-        % method (GMM / kmeans / hierarchical). Sub-clusters get
+        % via the chosen method (K-means / GMM / Graph / UMAP+DBSCAN)
+        % run on the loaded per-spike features + amplitude. Sub-clusters get
         % fresh labels = max(groupList,'omitnan') + 1, +2, ... ; the
         % highest-amplitude (highest-SNR) sub-cluster keeps the
         % original label so the user's "primary" identity is stable.
@@ -2519,6 +2556,22 @@ refreshLabels();
             end
         end
 
+        % Split clusters on per-spike features loaded from the result
+        % (features.h5 + amplitude.h5). Both must align with spike_idx.
+        haveFeat = isfield(sortedRes,'features') && ~isempty(sortedRes.features) && ...
+                   size(sortedRes.features,1) == numel(sortedRes.spike_idx) && ...
+                   isfield(sortedRes,'amplitude') && ~isempty(sortedRes.amplitude) && ...
+                   numel(sortedRes.amplitude) == numel(sortedRes.spike_idx);
+        if ~haveFeat
+            try
+                uialert(parentFig, ['Cannot split: per-spike features ' ...
+                    '(features.h5 / amplitude.h5) are missing or do not match ' ...
+                    'the spike count.'], 'Split');
+            catch
+            end
+            return;
+        end
+
         nSplitDone = 0;
         newSelected = [];
         for k = selectedIdx(:)'
@@ -2530,278 +2583,94 @@ refreshLabels();
             nSpikesK  = numel(kRows);
             if nSpikesK < 50, continue; end   % too few to split reliably
 
-            % --- Cluster the unit's spikes ---------------------------
-            % Preferred path: cluster directly on the per-spike PCA
-            % features the sorter already saved into sortedRes.features.
-            % That avoids reading 1000+ snippets from the memmap and
-            % running a fresh PCA per click; it also keeps the split
-            % working in the same feature space the sorter uses, so
-            % cluster boundaries are consistent with the upstream
-            % decisions. We fall back to the old "read snippets +
-            % run pca() on the fly" path only when the features matrix
-            % is missing, the wrong size, or has too many non-finite
-            % rows for the unit.
-            nClusters  = max(2, splitNumClusters);
-            chCenter   = channelList(k);
-            allRowsK   = kRows;
-            assignment = nan(numel(allRowsK), 1);
-            uniqClusts = [];
-            keepClust  = [];
-            newClusts  = [];
+            % Features come straight from the sorter result: the first 3
+            % loaded feature columns + per-spike amplitude, z-scored so
+            % amplitude doesn't dominate. No waveform re-reading -- the
+            % features already exist for every spike.
+            nClusters = max(2, splitNumClusters);
+            chCenter  = channelList(k);
+            allRowsK  = kRows;
 
-            useFeatures = isfield(sortedRes,'features') && ...
-                          ~isempty(sortedRes.features) && ...
-                          size(sortedRes.features,1) == numel(sortedRes.unifiedLabels);
-            if useFeatures
-                % Take EVERY feature column the sorter saved -- the
-                % more dimensions the clusterer sees, the closer the
-                % split decision tracks the sorter's own feature
-                % space. We only pad to 2 columns for the corner case
-                % where the sorter kept just PC1; otherwise the full
-                % matrix flows straight in.
-                feat = double(sortedRes.features(allRowsK, :));
-                finiteRow = all(isfinite(feat), 2);
-                if sum(finiteRow) < 50
-                    useFeatures = false;
-                else
-                    feat = feat(finiteRow, :);
-                    if size(feat, 2) < 2
-                        feat = [feat, zeros(size(feat,1), 1)];
-                    end
-                    finiteIdx = find(finiteRow);
-                    clustLabels = [];
-                    try
-                        switch lower(splitMethod)
-                            case 'gmm'
-                                gm = fitgmdist(feat, nClusters, ...
-                                    'RegularizationValue', 0.01, ...
-                                    'Replicates', 3, ...
-                                    'Options', statset('MaxIter', 200));
-                                clustLabels = cluster(gm, feat);
-                            case {'graph','community','spectral'}
-                                % Graph-based clustering on a kNN
-                                % similarity graph. spectralcluster
-                                % builds the affinity graph, computes
-                                % the Laplacian eigenvectors and runs
-                                % k-means in eigenspace, so it picks
-                                % up cluster shapes a vanilla k-means
-                                % would smear together (curved or
-                                % non-convex feature manifolds).
-                                clustLabels = spectralcluster(feat, nClusters);
-                            otherwise   % 'K-means' or anything unknown
-                                clustLabels = kmeans(feat, nClusters, ...
-                                    'Replicates', 3, ...
-                                    'Options', statset('MaxIter', 200));
-                        end
-                    catch
-                        try
-                            clustLabels = kmeans(feat, nClusters, 'Replicates', 3, ...
-                                'Options', statset('MaxIter', 200));
-                        catch
-                            useFeatures = false;
-                        end
-                    end
-                    if useFeatures && (isempty(clustLabels) || numel(unique(clustLabels)) < 2)
-                        useFeatures = false;
-                    end
-                    if useFeatures
-                        assignment(finiteIdx) = clustLabels;
-                        % Rank clusters by mean peak-to-peak on the
-                        % unit's main channel. We only need ~50 spikes
-                        % per cluster to estimate amplitude reliably,
-                        % so this is a single small vectorised memmap
-                        % read per cluster -- a fraction of the cost
-                        % of the old path's full waveform matrix read.
-                        uniqClusts = unique(clustLabels(:))';
-                        ampClust   = zeros(numel(uniqClusts), 1);
-                        if ~isnan(chCenter) && chCenter >= 1 && chCenter <= numChannels && ...
-                                chCenter <= numel(channel_mapping) && ...
-                                ~isempty(mappedData)
-                            chMap = channel_mapping(round(chCenter));
-                            if isfinite(chMap) && chMap >= 1 && ...
-                                    chMap <= size(mappedData.Data.data, 1)
-                                chMap       = round(chMap);
-                                windowSize  = 2*numSpikeSamples + 1;
-                                relIdx      = -numSpikeSamples:numSpikeSamples;
-                                nSamplesAll = size(mappedData.Data.data, 2);
-                                for ci = 1:numel(uniqClusts)
-                                    cVal  = uniqClusts(ci);
-                                    cIdxs = finiteIdx(clustLabels == cVal);
-                                    if isempty(cIdxs), continue; end
-                                    nSamp = min(numel(cIdxs), 50);
-                                    cSamp = cIdxs(randperm(numel(cIdxs), nSamp));
-                                    spkPos = round(double( ...
-                                        sortedRes.spike_idx(allRowsK(cSamp))));
-                                    spkPos = spkPos(spkPos > numSpikeSamples & ...
-                                                    spkPos <= nSamplesAll - numSpikeSamples);
-                                    if isempty(spkPos), continue; end
-                                    try
-                                        idxMat = relIdx(:) + spkPos(:)';
-                                        slab   = double(mappedData.Data.data( ...
-                                            chMap, idxMat(:)'));
-                                        slab2D = reshape(slab, windowSize, ...
-                                            numel(spkPos))';
-                                        ampClust(ci) = mean( ...
-                                            max(slab2D,[],2) - min(slab2D,[],2));
-                                    catch
-                                    end
-                                end
-                            end
-                        end
-                        [~, ampOrder] = sort(ampClust, 'descend');
-                        keepClust     = uniqClusts(ampOrder(1));
-                        newClusts     = uniqClusts(ampOrder(2:end));
-                    end
-                end
+            nFeatLoad = min(3, size(sortedRes.features, 2));
+            if nFeatLoad < 1, continue; end
+            featLoad  = double(sortedRes.features(allRowsK, 1:nFeatLoad));
+            ampLoad   = double(sortedRes.amplitude(allRowsK));
+            feat_raw  = [featLoad, ampLoad(:)];
+            feat_raw(~isfinite(feat_raw)) = 0;
+            feat_mean = mean(feat_raw, 1);
+            feat_std  = max(std(feat_raw, 0, 1), eps);
+            feat      = (feat_raw - feat_mean) ./ feat_std;
+
+            % Fit the clusterer on a subsample for the heavier methods;
+            % the rest are assigned by nearest centroid in this same
+            % feature space.
+            sampleCap = min(nSpikesK, 2000);
+            if nSpikesK > sampleCap
+                sampleSel = sort(randperm(nSpikesK, sampleCap))';
+            else
+                sampleSel = (1:nSpikesK)';
             end
+            featFit = feat(sampleSel, :);
+            ampFit  = ampLoad(sampleSel);
 
-            if ~useFeatures
-                % --- Fallback: read snippets + PCA on the fly --------
-                chList   = max(1, chCenter - numChannelPlot) : min(numChannels, chCenter + numChannelPlot);
-                nChans   = numel(chList);
-                wfLen    = 2*numSpikeSamples + 1;
-
-                sampleCap = min(nSpikesK, 1000);
-                if nSpikesK > sampleCap
-                    samplePos = kRows(randperm(nSpikesK, sampleCap));
-                else
-                    samplePos = kRows;
+            clustLabels = [];
+            try
+                switch lower(splitMethod)
+                    case 'gmm'
+                        gm = fitgmdist(featFit, nClusters, ...
+                            'RegularizationValue', 0.01, ...
+                            'Replicates', 10, ...
+                            'Options', statset('MaxIter', 300), ...
+                            'CovarianceType','full', ...
+                            'SharedCovariance', false);
+                        clustLabels = cluster(gm, featFit);
+                    case {'graph','community','spectral'}
+                        clustLabels = spectralcluster(featFit, nClusters);
+                    case {'umap+dbscan','umap','dbscan'}
+                        clustLabels = umapDbscanCluster(featFit, nClusters);
+                    otherwise
+                        clustLabels = kmeans(featFit, nClusters, ...
+                            'Start','plus', ...
+                            'Replicates', 10, ...
+                            'Options', statset('MaxIter', 300));
                 end
-                sampleSpkIdx = sortedRes.spike_idx(samplePos);
-                edgeOK = sampleSpkIdx > numSpikeSamples & sampleSpkIdx <= num_Samples - numSpikeSamples;
-                samplePos    = samplePos(edgeOK);
-                sampleSpkIdx = sampleSpkIdx(edgeOK);
-                if numel(sampleSpkIdx) < 50, continue; end
-
-                wfMatrix = zeros(numel(sampleSpkIdx), nChans * wfLen);
-                for s = 1:numel(sampleSpkIdx)
-                    spkPos = sampleSpkIdx(s);
-                    snip = double(mappedData.Data.data(channel_mapping(chList), ...
-                        spkPos - numSpikeSamples : spkPos + numSpikeSamples));
-                    if strcmp(plotFilterType,'filtered')
-                        try
-                            snip = bandpass_filter_GUI(snip', cfg.bandpass, cfg.samplingFrequency)';
-                        catch
-                        end
-                    end
-                    wfMatrix(s, :) = snip(:)';
-                end
-
+            catch
                 try
-                    nComp = min(5, size(wfMatrix,2)-1);
-                    [~, score, ~] = pca(wfMatrix, 'NumComponents', max(2, nComp));
+                    clustLabels = kmeans(featFit, nClusters, ...
+                        'Start','plus', 'Replicates', 10, ...
+                        'Options', statset('MaxIter', 300));
                 catch
                     continue;
                 end
-                clustLabels = [];
-                try
-                    switch lower(splitMethod)
-                        case 'gmm'
-                            gm = fitgmdist(score, nClusters, ...
-                                'RegularizationValue', 0.01, ...
-                                'Replicates', 3, ...
-                                'Options', statset('MaxIter', 200));
-                            clustLabels = cluster(gm, score);
-                        case {'graph','community','spectral'}
-                            clustLabels = spectralcluster(score, nClusters);
-                        otherwise   % 'K-means' or anything unknown
-                            clustLabels = kmeans(score, nClusters, ...
-                                'Replicates', 3, ...
-                                'Options', statset('MaxIter', 200));
-                    end
-                catch
-                    try
-                        clustLabels = kmeans(score, nClusters, 'Replicates', 3, ...
-                            'Options', statset('MaxIter', 200));
-                    catch
-                        continue;
-                    end
-                end
-                if isempty(clustLabels) || numel(unique(clustLabels)) < 2
-                    continue;
-                end
-
-                mainColIdx = find(chList == chCenter, 1);
-                if isempty(mainColIdx), mainColIdx = ceil(nChans/2); end
-                mainCols   = ((mainColIdx-1)*wfLen + 1) : (mainColIdx*wfLen);
-                uniqClusts = unique(clustLabels(:))';
-                nClustActual = numel(uniqClusts);
-                ampClust   = zeros(nClustActual, 1);
-                clustMeans = zeros(nClustActual, size(score,2));
-                for ci = 1:nClustActual
-                    cVal = uniqClusts(ci);
-                    mask = clustLabels == cVal;
-                    if ~any(mask), continue; end
-                    wfClust       = wfMatrix(mask, mainCols);
-                    ampClust(ci)  = mean(max(wfClust, [], 2) - min(wfClust, [], 2));
-                    clustMeans(ci,:) = mean(score(mask, :), 1, 'omitnan');
-                end
-                [~, ampOrder] = sort(ampClust, 'descend');
-                keepClust     = uniqClusts(ampOrder(1));
-                newClusts     = uniqClusts(ampOrder(2:end));
-
-                sampledMask  = false(numel(allRowsK), 1);
-                sampledMask(ismember(allRowsK, samplePos)) = true;
-                unsampledRows = allRowsK(~sampledMask);
-
-                [~, sampledOrderInAll] = ismember(samplePos, allRowsK);
-                valid = sampledOrderInAll > 0;
-                assignment(sampledOrderInAll(valid)) = clustLabels(valid);
-
-                if ~isempty(unsampledRows)
-                    stepBatch = 200;
-                    try
-                        coeffFull = pca(wfMatrix, 'NumComponents', size(score,2));
-                    catch
-                        coeffFull = [];
-                    end
-                    if ~isempty(coeffFull)
-                        wfMean = mean(wfMatrix,1);
-                        for off = 1:stepBatch:numel(unsampledRows)
-                            batch    = unsampledRows(off:min(off+stepBatch-1, end));
-                            spkBatch = sortedRes.spike_idx(batch);
-                            keep     = spkBatch > numSpikeSamples & spkBatch <= num_Samples - numSpikeSamples;
-                            spkBatch = spkBatch(keep);
-                            batch    = batch(keep);
-                            if isempty(batch), continue; end
-                            bWf = zeros(numel(batch), nChans * wfLen);
-                            for s = 1:numel(batch)
-                                snip = double(mappedData.Data.data(channel_mapping(chList), ...
-                                    spkBatch(s) - numSpikeSamples : spkBatch(s) + numSpikeSamples));
-                                if strcmp(plotFilterType,'filtered')
-                                    try
-                                        snip = bandpass_filter_GUI(snip', cfg.bandpass, cfg.samplingFrequency)';
-                                    catch
-                                    end
-                                end
-                                bWf(s,:) = snip(:)';
-                            end
-                            try
-                                bScore = (bWf - wfMean) * coeffFull;
-                                dist = pdist2(bScore, clustMeans);
-                                [~, nearest] = min(dist, [], 2);
-                                assignClust = uniqClusts(nearest);
-                                [~, batchOrder] = ismember(batch, allRowsK);
-                                ok = batchOrder > 0;
-                                assignment(batchOrder(ok)) = assignClust(ok);
-                            catch
-                            end
-                        end
-                    end
-                end
+            end
+            if isempty(clustLabels) || numel(unique(clustLabels)) < 2
+                continue;
             end
 
-            % Default any leftover unassigned spike to the largest
-            % observed cluster so we don't lose them.
-            unassigned = isnan(assignment);
-            if any(unassigned)
-                obs  = assignment(~unassigned);
-                if ~isempty(obs)
-                    uObs = unique(obs);
-                    cnts = arrayfun(@(c) sum(obs == c), uObs);
-                    [~, biggest] = max(cnts);
-                    assignment(unassigned) = uObs(biggest);
-                end
+            % Highest-amplitude cluster keeps the original label; the rest
+            % become new units.
+            uniqClusts   = unique(clustLabels(:))';
+            nClustActual = numel(uniqClusts);
+            ampClust     = zeros(nClustActual, 1);
+            clustMeans   = zeros(nClustActual, size(feat, 2));
+            for ci = 1:nClustActual
+                mask = clustLabels == uniqClusts(ci);
+                if ~any(mask), continue; end
+                ampClust(ci)     = mean(ampFit(mask));
+                clustMeans(ci,:) = mean(featFit(mask, :), 1, 'omitnan');
+            end
+            [~, ampOrder] = sort(abs(ampClust), 'descend');
+            keepClust     = uniqClusts(ampOrder(1)); %#ok<NASGU>
+            newClusts     = uniqClusts(ampOrder(2:end));
+
+            % Assign every spike to its nearest cluster centroid.
+            assignment            = nan(numel(allRowsK), 1);
+            assignment(sampleSel) = clustLabels;
+            unsampled = find(isnan(assignment));
+            if ~isempty(unsampled)
+                distU = pdist2(feat(unsampled, :), clustMeans);
+                [~, nearest] = min(distU, [], 2);
+                assignment(unsampled) = uniqClusts(nearest);
             end
 
             % Skip degenerate splits where every spike landed in one
@@ -2857,7 +2726,7 @@ refreshLabels();
                 presence_ratio(:,newK) = 0;
 
                 numGroups   = newK;
-                totalPages  = ceil(numGroups / PAGE_SIZE);
+                recomputeDisplayedGroups();
 
                 sortedRes.unifiedLabels(rowsForNewLabel) = newLabel;
                 sortedRes.channelNum(rowsForNewLabel)    = chCenter;
@@ -2882,6 +2751,22 @@ refreshLabels();
         try, refreshCCG();           catch, end
         try, refreshISI();           catch, end
         try, refreshDensity();       catch, end
+
+        % Invalidate pair / unit walkers and the similarity matrix --
+        % their stored indices reference the pre-split unit set, so
+        % stepping through them now shows units with the wrong content.
+        autoMergedPrimary    = [];
+        autoMergedAbsorbed   = [];
+        autoOverlapDroppedK  = [];
+        autoOverlapTriggerJ  = [];
+        autoCCGStripCont     = [];
+        autoCCGStripClean    = [];
+        lastAutoPair         = 0;
+        rowGroup             = [];
+        colGroup             = [];
+        lastGroup            = 0;
+        disimlarityScore     = sparse(numGroups, numGroups);
+        ampSimilarity        = sparse(numGroups, numGroups);
 
         % Auto-tick the new sub-cluster slots so the user sees both
         % halves of every split unit side-by-side after the operation.
@@ -3043,10 +2928,7 @@ refreshLabels();
             trimmedAny = true;
         end
         if trimmedAny
-            totalPages = max(1, ceil(numGroups / PAGE_SIZE));
-            if currentPage > totalPages
-                currentPage = totalPages;
-            end
+            recomputeDisplayedGroups();
         end
 
         % channelList was just restored above for the dissolved units;
@@ -3413,42 +3295,27 @@ refreshLabels();
                     [d1_kj, d2_kj] = nearest_distances(spk_k, spk_j);
                     coincMask_k    = min(d1_kj, d2_kj) <= coincSamples;
 
-                    % CCG peak triggered. Pick the lower-SNR side as
-                    % the contaminated unit. Treat NaN SNR as "very
-                    % low" so a NaN-detectability unit is always the
-                    % contaminated side (otherwise NaN <= x is false
-                    % and we would silently mark the better unit).
+                    % CCG peak triggered. Only clean similar-quality
+                    % pairs: a large SNR gap belongs to overlap removal,
+                    % not spike stripping. Within the pair, strip the
+                    % lower firing-rate (fewer-spike) side -- the likely
+                    % fragment. NaN SNR is treated as 0.
                     sk = snrAll(k); if isnan(sk), sk = 0; end
                     sj = snrAll(j); if isnan(sj), sj = 0; end
-                    if sk < sj
+                    if abs(sk - sj) >= autoCCGSnrDiff, continue; end
+                    if numel(spk_k) <= numel(spk_j)
                         contIdx    = k;
                         cleanIdx   = j;
                         cont_rows  = spk_k_rows;
                         cont_coinc = coincMask_k;
                         signedLag  = autoSignedNearestLag(spk_k, spk_j);
-                    elseif sk > sj
+                    else
                         contIdx    = j;
                         cleanIdx   = k;
                         cont_rows  = spk_j_rows;
                         [d1_jk, d2_jk] = nearest_distances(spk_j, spk_k);
                         cont_coinc     = min(d1_jk, d2_jk) <= coincSamples;
                         signedLag  = autoSignedNearestLag(spk_j, spk_k);
-                    else
-                        % SNR tie -> higher ISI loses.
-                        if preprocessed.isiViolation(k) >= preprocessed.isiViolation(j)
-                            contIdx    = k;
-                            cleanIdx   = j;
-                            cont_rows  = spk_k_rows;
-                            cont_coinc = coincMask_k;
-                            signedLag  = autoSignedNearestLag(spk_k, spk_j);
-                        else
-                            contIdx    = j;
-                            cleanIdx   = k;
-                            cont_rows  = spk_j_rows;
-                            [d1_jk, d2_jk] = nearest_distances(spk_j, spk_k);
-                            cont_coinc     = min(d1_jk, d2_jk) <= coincSamples;
-                            signedLag  = autoSignedNearestLag(spk_j, spk_k);
-                        end
                     end
 
                     if ~any(cont_coinc), continue; end
@@ -3473,6 +3340,10 @@ refreshLabels();
                         continue;
                     end
                     medLag           = median(coincLags);
+                    % Median lag must also sit near zero; a non-zero
+                    % median is a synaptic delay (real coupling), not a
+                    % duplicate.
+                    if abs(medLag) > tightSamples, continue; end
                     withinTight      = abs(coincLags - medLag) <= tightSamples;
                     consistencyFrac  = sum(withinTight) / numel(coincLags);
                     if consistencyFrac < autoLagConsistencyFrac
@@ -3482,6 +3353,11 @@ refreshLabels();
                     keepCoinc(coincIdx)  = withinTight;
                     cont_coinc           = cont_coinc & keepCoinc;
                     if ~any(cont_coinc), continue; end
+
+                    % Strip-fraction cap: never gut the fragment.
+                    if sum(cont_coinc) / numel(cont_rows) > autoCCGMaxStripFrac
+                        continue;
+                    end
 
                     % Strip the contaminated unit's coincident rows
                     % from sortedRes.unifiedLabels (set to -1).
@@ -3525,12 +3401,26 @@ refreshLabels();
             if ~isempty(disimlarityScore)
                 simMat = full(disimlarityScore);
                 ampMat = full(ampSimilarity);
+                % Defensive: similarity matrices may be from a previous
+                % numGroups (e.g. before a Split). If their shapes don't
+                % match, snap both to a common dim and to current numGroups
+                % so the indexing into groupList stays valid.
+                if ~isequal(size(simMat), size(ampMat)) || ...
+                        size(simMat,1) ~= size(simMat,2) || ...
+                        size(simMat,1) ~= numGroups
+                    nMin = min([size(simMat,1), size(simMat,2), ...
+                                size(ampMat,1), size(ampMat,2), numGroups]);
+                    if nMin < 1, nMin = 1; end
+                    simMat = simMat(1:nMin, 1:nMin);
+                    ampMat = ampMat(1:nMin, 1:nMin);
+                end
                 if any(simMat(:) ~= 0)
                     [rIdx, cIdx] = find(simBetter(simMat) & ampMat <= thrAmp);
                     keep = rIdx > cIdx;
                     rIdx = rIdx(keep); cIdx = cIdx(keep);
                     for p = 1:numel(rIdx)
                         gA = cIdx(p); gB = rIdx(p);
+                        if gA > numel(groupList) || gB > numel(groupList), continue; end
                         if isnan(groupList(gA)) || isnan(groupList(gB)), continue; end
                         if groupList(gA) == groupList(gB), continue; end
                         if ~checkPCDistance(gA, gB, thrPC), continue; end
@@ -3929,6 +3819,10 @@ refreshLabels();
         if exist('lblGroupHandles','var') && numel(lblGroupHandles) >= idx
             if isvalid(lblGroupHandles(idx)), delete(lblGroupHandles(idx)); end
             lblGroupHandles(idx) = [];
+        end
+        if exist('lblIdHandles','var') && numel(lblIdHandles) >= idx
+            if isvalid(lblIdHandles(idx)), delete(lblIdHandles(idx)); end
+            lblIdHandles(idx) = [];
         end
         if exist('lblChannelHandles','var') && numel(lblChannelHandles) >= idx
             if isvalid(lblChannelHandles(idx)), delete(lblChannelHandles(idx)); end
@@ -4701,14 +4595,13 @@ disimlarityScore(15,14)
     end
 
     function updateIncExcCheck()
+        chanFilterActive = chkInclusion.Value || chkExclusion.Value;
         if chkInclusion.Value
             lastUnit = 0;
             incChan = isiInc & rateInc & snrInc & polarityInc;
             selectUnits = find(incChan);
 
-            startIdx = (currentPage-1) * PAGE_SIZE + 1;
-            endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-            visibleGroups = startIdx:endIdx;
+            visibleGroups = currentPageVisibleGroups();
             chkBoxSelect(:) = 0;
             chkBoxSelect(selectUnits) = 1;
             if chkTogVis.Value
@@ -4719,12 +4612,12 @@ disimlarityScore(15,14)
                 selected_order = [];
             end
             
-            for i = visibleGroups
-                if isvalid(groupSelectCheckboxes(i))
+            for i = visibleGroups(:)'
+                if isgraphics(groupSelectCheckboxes(i))
                     groupSelectCheckboxes(i).Value = incChan(i);
-                    if chkTogVis.Value
-                        groupVisCheckboxes(i).Value = incChan(i);
-                    end
+                end
+                if chkTogVis.Value && isgraphics(groupVisCheckboxes(i))
+                    groupVisCheckboxes(i).Value = incChan(i);
                 end
             end
             unitNum = sprintf('/%d',length(selectUnits));
@@ -4735,7 +4628,7 @@ disimlarityScore(15,14)
             selected_order = [];
             onAllSelectChecked(false);
             onAllVisChecked(false);
-            selectUnits = groupList;
+            selectUnits = displayedGroups;
             lastUnit = 0;
             unitNum = sprintf('/%d',length(selectUnits));
             changeuifUnitAll(unitNum);
@@ -4748,25 +4641,23 @@ disimlarityScore(15,14)
             exChan = ~isiInc | ~rateInc | ~snrInc & polarityInc;
             selectUnits = find(exChan);
 
-            startIdx = (currentPage-1) * PAGE_SIZE + 1;
-            endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-            visibleGroups = startIdx:endIdx;
+            visibleGroups = currentPageVisibleGroups();
             chkBoxSelect(:) = 0;
             chkBoxSelect(selectUnits) = 1;
             if chkTogVis.Value
                 chkBoxVis(:) = 0;
                 chkBoxVis(selectUnits) = 1;
             end
-            for i = visibleGroups
-                if isvalid(groupSelectCheckboxes(i))
+            for i = visibleGroups(:)'
+                if isgraphics(groupSelectCheckboxes(i))
                     groupSelectCheckboxes(i).Value = exChan(i);
-                    if chkTogVis.Value
-                        groupVisCheckboxes(i).Value = exChan(i);
-                        if groupVisCheckboxes(i).Value
-                            selected_order = [selected_order, i];
-                        else
-                            selected_order(selected_order==i) = [];
-                        end
+                end
+                if chkTogVis.Value && isgraphics(groupVisCheckboxes(i))
+                    groupVisCheckboxes(i).Value = exChan(i);
+                    if groupVisCheckboxes(i).Value
+                        selected_order = [selected_order, i];
+                    else
+                        selected_order(selected_order==i) = [];
                     end
                 end
             end
@@ -4777,7 +4668,7 @@ disimlarityScore(15,14)
             selected_order = [];
             onAllSelectChecked(false);
             onAllVisChecked(false);
-            selectUnits = groupList;
+            selectUnits = displayedGroups;
             lastUnit = 0;
             unitNum = sprintf('/%d',length(selectUnits));
             changeuifUnitAll(unitNum);
@@ -4828,31 +4719,64 @@ disimlarityScore(15,14)
         onAllSelectChecked(false);
         onAllVisChecked(false);
         thisUnit = lastUnit + val;
+
+        % Skip past hidden (zero-rate / dropped) units when navigating.
+        step = sign(val);
+        if step ~= 0
+            while thisUnit >= 1 && thisUnit <= length(selectUnits) ...
+                    && ~ismember(selectUnits(thisUnit), displayedGroups)
+                thisUnit = thisUnit + step;
+            end
+        end
+
         if thisUnit >= 1 && thisUnit <= length(selectUnits)
             thisCol = selectUnits(thisUnit);
 
-            % Calculate which page contains this unit
-            targetPage = ceil(thisCol / PAGE_SIZE);
-            if targetPage ~= currentPage
-                currentPage = targetPage;
-                onChangePage(0); % Refresh page without changing page number
+            % Only change page if the target unit isn't already on
+            % the current page. Page index uses position inside
+            % displayedGroups so it matches the filtered render.
+            visNow = currentPageVisibleGroups();
+            if ~ismember(thisCol, visNow)
+                posInDisplay = find(displayedGroups == thisCol, 1);
+                if isempty(posInDisplay)
+                    lastUnit = 0;
+                    if val ~= 0
+                        changeuifUnit(num2str(lastUnit), 1);
+                        changeuifUnitAll(sprintf('/%d', length(selectUnits)));
+                    end
+                    plotOption();
+                    return;
+                end
+                targetPage = ceil(posInDisplay / PAGE_SIZE);
+                if targetPage ~= currentPage
+                    currentPage = targetPage;
+                    onChangePage(0);
+                end
             end
 
             % Make sure the unit is now visible
-            if isvalid(groupVisCheckboxes(thisCol))
+            if isgraphics(groupVisCheckboxes(thisCol))
                 groupVisCheckboxes(thisCol).Value = true;
-                groupSelectCheckboxes(thisCol).Value = true;
+                if isgraphics(groupSelectCheckboxes(thisCol))
+                    groupSelectCheckboxes(thisCol).Value = true;
+                end
                 chkBoxSelect(thisCol) = 1;
                 chkBoxVis(thisCol) = 1;
                 selected_order = [thisCol];
-                groupRadioButtons(thisCol).Value = true;
+                if isgraphics(groupRadioButtons(thisCol))
+                    groupRadioButtons(thisCol).Value = true;
+                end
                 c = getGroupColor(groupList(thisCol));
                 groupVisCheckboxes(thisCol).FontColor = c;
                 groupVisCheckboxes(thisCol).FontWeight ='Bold';
-                groupSelectCheckboxes(thisCol).FontColor = c;
-                groupSelectCheckboxes(thisCol).FontWeight ='Bold';
-                lblChannelHandles(thisCol).BackgroundColor = c;
-                lblChannelHandles(thisCol).FontColor = bestTextColorFor(c);
+                if isgraphics(groupSelectCheckboxes(thisCol))
+                    groupSelectCheckboxes(thisCol).FontColor = c;
+                    groupSelectCheckboxes(thisCol).FontWeight ='Bold';
+                end
+                if isgraphics(lblChannelHandles(thisCol))
+                    lblChannelHandles(thisCol).BackgroundColor = c;
+                    lblChannelHandles(thisCol).FontColor = bestTextColorFor(c);
+                end
                 lastUnit = thisUnit;
             else
                 lastUnit = 0;
@@ -4877,22 +4801,28 @@ disimlarityScore(15,14)
             thisCol = colGroup(thisGroup);
             thisRow = rowGroup(thisGroup);
 
-            % Calculate which page contains each unit, then land on the
-            % page of the HIGHER-firing-rate member (the merge target),
-            % so its radio button is rendered and can be selected
-            % below. This guarantees the auto-selected target is always
-            % visible regardless of whether the pair sits on one or two
-            % pages.
-            targetPageCol = ceil(thisCol / PAGE_SIZE);
-            targetPageRow = ceil(thisRow / PAGE_SIZE);
+            % Land on the page of the HIGHER-firing-rate member, but
+            % fall back to whichever side is actually in displayedGroups
+            % (the other one may have been hidden by the zero-rate
+            % filter).
             if preprocessed.firingRate(thisCol) >= preprocessed.firingRate(thisRow)
-                targetPage = targetPageCol;
+                anchor = thisCol;  alt = thisRow;
             else
-                targetPage = targetPageRow;
+                anchor = thisRow;  alt = thisCol;
             end
-            if targetPage ~= currentPage
-                currentPage = targetPage;
-                onChangePage(0); % Refresh page without changing page number
+            if ~ismember(anchor, displayedGroups) && ismember(alt, displayedGroups)
+                anchor = alt;
+            end
+            visNow = currentPageVisibleGroups();
+            if ~ismember(anchor, visNow)
+                posAnchor = find(displayedGroups == anchor, 1);
+                if ~isempty(posAnchor)
+                    targetPage = ceil(posAnchor / PAGE_SIZE);
+                    if targetPage ~= currentPage
+                        currentPage = targetPage;
+                        onChangePage(0);
+                    end
+                end
             end
 
             chkBoxVis(thisCol) = 1;
@@ -4901,42 +4831,45 @@ disimlarityScore(15,14)
             chkBoxSelect(thisRow) = 1;
             selected_order = [thisCol,thisRow];
 
-            if isvalid(groupVisCheckboxes(thisCol)) && isprop(groupVisCheckboxes(thisCol),'Value')
-
-                groupVisCheckboxes(thisCol).Value    = true;
-                groupSelectCheckboxes(thisCol).Value = true;
-
-                c = getGroupColor(groupList(thisCol));
-                groupVisCheckboxes(thisCol).FontColor    = c;
-                groupVisCheckboxes(thisCol).FontWeight   = 'Bold';
-                groupSelectCheckboxes(thisCol).FontColor  = c;
+            cColRow = getGroupColor(groupList(thisCol));
+            if isgraphics(groupVisCheckboxes(thisCol))
+                groupVisCheckboxes(thisCol).Value     = true;
+                groupVisCheckboxes(thisCol).FontColor = cColRow;
+                groupVisCheckboxes(thisCol).FontWeight = 'Bold';
+            end
+            if isgraphics(groupSelectCheckboxes(thisCol))
+                groupSelectCheckboxes(thisCol).Value     = true;
+                groupSelectCheckboxes(thisCol).FontColor = cColRow;
                 groupSelectCheckboxes(thisCol).FontWeight = 'Bold';
-                lblChannelHandles(thisCol).BackgroundColor = c;
-                lblChannelHandles(thisCol).FontColor       = bestTextColorFor(c);
+            end
+            if isgraphics(lblChannelHandles(thisCol))
+                lblChannelHandles(thisCol).BackgroundColor = cColRow;
+                lblChannelHandles(thisCol).FontColor       = bestTextColorFor(cColRow);
             end
 
-            if isvalid(groupVisCheckboxes(thisRow)) && isprop(groupVisCheckboxes(thisRow),'Value')
-                % Make checkboxes checked                 
-                groupVisCheckboxes(thisRow).Value    = true;
-                groupSelectCheckboxes(thisRow).Value = true;
-
-                c = getGroupColor(groupList(thisRow));
-                groupVisCheckboxes(thisRow).FontColor    = c;
-                groupVisCheckboxes(thisRow).FontWeight   = 'Bold';
-                groupSelectCheckboxes(thisRow).FontColor  = c;
+            cRow = getGroupColor(groupList(thisRow));
+            if isgraphics(groupVisCheckboxes(thisRow))
+                groupVisCheckboxes(thisRow).Value     = true;
+                groupVisCheckboxes(thisRow).FontColor = cRow;
+                groupVisCheckboxes(thisRow).FontWeight = 'Bold';
+            end
+            if isgraphics(groupSelectCheckboxes(thisRow))
+                groupSelectCheckboxes(thisRow).Value     = true;
+                groupSelectCheckboxes(thisRow).FontColor = cRow;
                 groupSelectCheckboxes(thisRow).FontWeight = 'Bold';
-                lblChannelHandles(thisRow).BackgroundColor = c;
-                lblChannelHandles(thisRow).FontColor       = bestTextColorFor(c);
-                
+            end
+            if isgraphics(lblChannelHandles(thisRow))
+                lblChannelHandles(thisRow).BackgroundColor = cRow;
+                lblChannelHandles(thisRow).FontColor       = bestTextColorFor(cRow);
             end
 
             selected_order = [thisCol,thisRow];
             if preprocessed.firingRate(thisCol) > preprocessed.firingRate(thisRow)
-                if isvalid(groupRadioButtons(thisCol))  && isprop(groupRadioButtons(thisCol),'Value')
+                if isgraphics(groupRadioButtons(thisCol))
                     groupRadioButtons(thisCol).Value = true;
                 end
             else
-                if isvalid(groupRadioButtons(thisRow)) && isprop(groupRadioButtons(thisRow),'Value')
+                if isgraphics(groupRadioButtons(thisRow))
                     groupRadioButtons(thisRow).Value = true;
                 end
             end
@@ -5052,13 +4985,26 @@ disimlarityScore(15,14)
             absorbedIdx = bArr(thisIdx);
         end
 
-        % Land on the page that contains the primary so its row is
-        % rendered, then highlight one or two constituents depending
-        % on the walker mode.
-        targetPage = ceil(primaryIdx / PAGE_SIZE);
-        if targetPage ~= currentPage
-            currentPage = targetPage;
-            onChangePage(0);
+        % Anchor the page to whichever side of the pair is currently
+        % displayable. If primary is dropped (NaN groupList -> hidden by
+        % the zero-rate filter), use absorbed (the trigger neighbour);
+        % otherwise use primary.
+        anchorIdx = primaryIdx;
+        if ~ismember(primaryIdx, displayedGroups)
+            if ~unitMode && ismember(absorbedIdx, displayedGroups)
+                anchorIdx = absorbedIdx;
+            end
+        end
+        visNow = currentPageVisibleGroups();
+        if ~ismember(anchorIdx, visNow)
+            posAnchor = find(displayedGroups == anchorIdx, 1);
+            if ~isempty(posAnchor)
+                targetPage = ceil(posAnchor / PAGE_SIZE);
+                if targetPage ~= currentPage
+                    currentPage = targetPage;
+                    onChangePage(0);
+                end
+            end
         end
 
         selected_order        = [];
@@ -5075,31 +5021,40 @@ disimlarityScore(15,14)
             selected_order            = primaryIdx;
         end
 
-        if isvalid(groupVisCheckboxes(primaryIdx)) && isprop(groupVisCheckboxes(primaryIdx),'Value')
-            groupVisCheckboxes(primaryIdx).Value    = true;
-            groupSelectCheckboxes(primaryIdx).Value = true;
-            cP = getGroupColor(groupList(primaryIdx));
-            groupVisCheckboxes(primaryIdx).FontColor    = cP;
-            groupVisCheckboxes(primaryIdx).FontWeight   = 'Bold';
+        cP = getGroupColor(groupList(primaryIdx));
+        if isgraphics(groupVisCheckboxes(primaryIdx))
+            groupVisCheckboxes(primaryIdx).Value     = true;
+            groupVisCheckboxes(primaryIdx).FontColor = cP;
+            groupVisCheckboxes(primaryIdx).FontWeight = 'Bold';
+        end
+        if isgraphics(groupSelectCheckboxes(primaryIdx))
+            groupSelectCheckboxes(primaryIdx).Value     = true;
             groupSelectCheckboxes(primaryIdx).FontColor = cP;
             groupSelectCheckboxes(primaryIdx).FontWeight = 'Bold';
+        end
+        if isgraphics(lblChannelHandles(primaryIdx))
             lblChannelHandles(primaryIdx).BackgroundColor = cP;
             lblChannelHandles(primaryIdx).FontColor       = bestTextColorFor(cP);
         end
-        if ~unitMode && isvalid(groupVisCheckboxes(absorbedIdx)) && ...
-                isprop(groupVisCheckboxes(absorbedIdx),'Value')
-            groupVisCheckboxes(absorbedIdx).Value    = true;
-            groupSelectCheckboxes(absorbedIdx).Value = true;
+        if ~unitMode
             cA = getGroupColor(groupList(absorbedIdx));
-            groupVisCheckboxes(absorbedIdx).FontColor    = cA;
-            groupVisCheckboxes(absorbedIdx).FontWeight   = 'Bold';
-            groupSelectCheckboxes(absorbedIdx).FontColor = cA;
-            groupSelectCheckboxes(absorbedIdx).FontWeight = 'Bold';
-            lblChannelHandles(absorbedIdx).BackgroundColor = cA;
-            lblChannelHandles(absorbedIdx).FontColor       = bestTextColorFor(cA);
+            if isgraphics(groupVisCheckboxes(absorbedIdx))
+                groupVisCheckboxes(absorbedIdx).Value     = true;
+                groupVisCheckboxes(absorbedIdx).FontColor = cA;
+                groupVisCheckboxes(absorbedIdx).FontWeight = 'Bold';
+            end
+            if isgraphics(groupSelectCheckboxes(absorbedIdx))
+                groupSelectCheckboxes(absorbedIdx).Value     = true;
+                groupSelectCheckboxes(absorbedIdx).FontColor = cA;
+                groupSelectCheckboxes(absorbedIdx).FontWeight = 'Bold';
+            end
+            if isgraphics(lblChannelHandles(absorbedIdx))
+                lblChannelHandles(absorbedIdx).BackgroundColor = cA;
+                lblChannelHandles(absorbedIdx).FontColor       = bestTextColorFor(cA);
+            end
         end
 
-        if isvalid(groupRadioButtons(primaryIdx)) && isprop(groupRadioButtons(primaryIdx),'Value')
+        if isgraphics(groupRadioButtons(primaryIdx))
             groupRadioButtons(primaryIdx).Value = true;
         end
 
@@ -5178,11 +5133,13 @@ disimlarityScore(15,14)
 
 %% All supporting functions
     function refreshLabels()
-        startIdx = (currentPage-1) * PAGE_SIZE + 1;
-        endIdx = min(startIdx + PAGE_SIZE - 1, numGroups);
-
-        for k = startIdx:endIdx
-            if ~isvalid(lblGroupHandles(k))
+        visPageGrp = currentPageVisibleGroups();
+        for k = visPageGrp(:)'
+            % isgraphics catches both placeholders AND deleted handles
+            % (isvalid returns true for placeholders, so it's not enough
+            % here -- Phase 4 of Auto Curation can change displayedGroups
+            % without re-rendering the page).
+            if ~isgraphics(lblGroupHandles(k))
                 continue;
             end
 
@@ -5200,7 +5157,9 @@ disimlarityScore(15,14)
             else
                 txt = sprintf('Ch %g', lblChannelVal);
             end
-            lblChannelHandles(k).Text = txt;
+            if isgraphics(lblChannelHandles(k))
+                lblChannelHandles(k).Text = txt;
+            end
 
             if isprop(lblIsolation(k),'FontColor')
                 switch unitIsolation{k}
@@ -5219,7 +5178,9 @@ disimlarityScore(15,14)
             end
 
             txt = sprintf('%.1f%%', preprocessed.isiViolation(k));
-            lblISIViolation(k).Text = txt;
+            if isgraphics(lblISIViolation(k))
+                lblISIViolation(k).Text = txt;
+            end
 
             c = getGroupColor(lblVal);
             if isprop(lblGroupHandles(k), 'BackgroundColor')
@@ -5389,9 +5350,14 @@ disimlarityScore(15,14)
         % table. Restoring via Undo / Reset re-fills their cells
         % on the next refresh.
         snrAllT = 1 + detectblity;
-        liveIdx = (1:numGroups).';
         nLive   = numGroups;
         removedMask = isnan(groupList(:));
+        % Contiguous Group ID = rank among the shown (nonzero) groups,
+        % matching the Groups-panel ID column. NaN for hidden/removed.
+        gidAll = nan(numGroups, 1);
+        if ~isempty(displayedGroups)
+            gidAll(displayedGroups) = (1:numel(displayedGroups)).';
+        end
 
         labels   = double(groupList(:));
         channels = double(channelList(:));
@@ -5420,7 +5386,7 @@ disimlarityScore(15,14)
         % Target column is absent: clicking a row sets the merge
         % target radio in the main GUI; MATLAB's own focused-cell
         % highlight shows where the cursor is.
-        colNames = { 'G', 'ID', 'Ch', 'Rate (Hz)', 'ISI (%)', ...
+        colNames = { 'ID', 'G', 'Ch', 'Rate (Hz)', 'ISI (%)', ...
                      'SNR', 'ISO', 'Stable', 'Notes' };
 
         % Notes (col 9) is the only editable column.
@@ -5437,7 +5403,7 @@ disimlarityScore(15,14)
         % type -- the 'bank' format only changes display, not sort.
         rows = cell(nLive, nCols);
         for ii = 1:nLive
-            rows{ii, 1} = double(liveIdx(ii));
+            rows{ii, 1} = gidAll(ii);
             rows{ii, 2} = labels(ii);
             rows{ii, 3} = channels(ii);
             rows{ii, 4} = rates(ii);
@@ -5495,33 +5461,26 @@ disimlarityScore(15,14)
             % a freshly-created table -- ignore.
         end
 
-        % Build a map from unit index to row position (handles
-        % column-header sort, which reorders the displayed rows).
-        if isa(tbl.Data, 'table')
-            idxCol = double(tbl.Data{:, 1});
-        else
-            idxCol = nan(size(tbl.Data, 1), 1);
-            for r = 1:size(tbl.Data, 1)
-                v = tbl.Data{r, 1};
-                if isnumeric(v) && isscalar(v)
-                    idxCol(r) = double(v);
-                elseif ischar(v) || isstring(v)
-                    idxCol(r) = str2double(v);
-                end
-            end
+        % Map each displayed row back to its unit array index (col 1 is
+        % the contiguous Group ID, col 2 the label). Survives a column-
+        % header sort, which reorders the displayed rows.
+        nRowsT = size(tbl.Data, 1);
+        idxCol = nan(nRowsT, 1);
+        for r = 1:nRowsT
+            idxCol(r) = tableUnitIdx(tbl.Data{r, 1}, tbl.Data{r, 2});
         end
 
-        % Removed units (groupList(k) is NaN) stay in the table so
-        % users can still see them. Paint those rows italic-grey
-        % first; selection styling below can override that on any
+        % Removed units carry ISO == "REM" (col 7); paint those rows
+        % italic-grey. Selection styling below can override that on any
         % row that's both removed and still chkBoxSelect-ticked.
         try
             removedStyle = uistyle('FontAngle','italic', ...
                 'FontColor',[0.55 0.55 0.55]);
-            for k = find(isnan(groupList(:))).'
-                r = find(idxCol == k, 1);
-                if isempty(r), continue; end
-                addStyle(tbl, removedStyle, 'row', r);
+            for r = 1:nRowsT
+                isoV = tbl.Data{r, 7};
+                if (ischar(isoV) || isstring(isoV)) && strcmp(char(isoV),'REM')
+                    addStyle(tbl, removedStyle, 'row', r);
+                end
             end
         catch
             % uistyle/addStyle not available -> just skip the
@@ -5547,6 +5506,10 @@ disimlarityScore(15,14)
     end
 
     function openTableWindow()
+        % Refresh the main page first so the table opens on the latest
+        % curation state (Group IDs, metrics, removed units).
+        try, recomputeDisplayedGroups(); catch, end
+        try, onChangePage(0);            catch, end
         % Pop the curation table out into its own uifigure. Because
         % it lives in a separate window, the per-unit selection
         % handlers and the multi-plot redraw never touch it -- so
@@ -5827,6 +5790,24 @@ disimlarityScore(15,14)
         end
     end
 
+    function uidx = tableUnitIdx(gidVal, labVal)
+        % Map a curation-table row back to its unit array index. Column 1
+        % is the contiguous Group ID, column 2 the group label. The label
+        % is the stable per-unit identifier, so resolve by it first (this
+        % stays correct even if the page changed while the table was open);
+        % fall back to the Group ID. NaN when neither resolves (e.g. a
+        % removed unit, whose label is NaN).
+        uidx = NaN;
+        if isnumeric(labVal) && isscalar(labVal) && isfinite(labVal)
+            f = find(groupList(:) == labVal, 1);
+            if ~isempty(f), uidx = f; return; end
+        end
+        if isnumeric(gidVal) && isscalar(gidVal) && isfinite(gidVal) ...
+                && gidVal >= 1 && gidVal <= numel(displayedGroups)
+            uidx = displayedGroups(round(gidVal));
+        end
+    end
+
     function onTableCellSelect(src, evt)
         % Click handler for the curation table. The model:
         %   * Clicking ANY cell sets that row's unit as the merge
@@ -5846,16 +5827,10 @@ disimlarityScore(15,14)
             if row < 1, return; end
             if isa(src.Data, 'table')
                 if row > height(src.Data), return; end
-                unitIdx = double(src.Data{row, 1});
             else
                 if row > size(src.Data, 1), return; end
-                v = src.Data{row, 1};
-                if isnumeric(v)
-                    unitIdx = double(v);
-                else
-                    unitIdx = str2double(v);
-                end
             end
+            unitIdx = tableUnitIdx(src.Data{row, 1}, src.Data{row, 2});
             if isempty(unitIdx) || ~isfinite(unitIdx) || ...
                     unitIdx < 1 || unitIdx > numGroups
                 return;
@@ -5888,10 +5863,15 @@ disimlarityScore(15,14)
             if ~ismember(unitIdx, selected_order)
                 selected_order(end+1) = unitIdx;
             end
-            tgtPage = ceil(unitIdx / PAGE_SIZE);
-            if tgtPage ~= currentPage
-                currentPage = tgtPage;
-                onChangePage(0);
+            visNow = currentPageVisibleGroups();
+            if ~ismember(unitIdx, visNow)
+                posUnit = find(displayedGroups == unitIdx, 1);
+                if isempty(posUnit), posUnit = 1; end
+                tgtPage = ceil(posUnit / PAGE_SIZE);
+                if tgtPage ~= currentPage
+                    currentPage = tgtPage;
+                    onChangePage(0);
+                end
             end
             if unitIdx <= numel(groupSelectCheckboxes) && ...
                     isvalid(groupSelectCheckboxes(unitIdx)) && ...
@@ -5925,8 +5905,8 @@ disimlarityScore(15,14)
 
     function onTableCellEdit(src, evt)
         % Notes column is editable in-place; write through to
-        % unitNotes so the change persists into Save. Read the
-        % unit's index from the row's Idx cell (column 1) so a
+        % unitNotes so the change persists into Save. The unit is
+        % resolved from the row's Group ID / label (tableUnitIdx) so a
         % post-sort reorder routes the edit to the correct unit.
         try
             if isempty(evt.Indices), return; end
@@ -5935,11 +5915,10 @@ disimlarityScore(15,14)
             % Notes is always the last column (col 9 here).
             if isa(src.Data, 'table')
                 nCols   = width(src.Data);
-                unitIdx = double(src.Data{row, 1});
             else
                 nCols   = size(src.Data, 2);
-                unitIdx = double(src.Data{row, 1});
             end
+            unitIdx = tableUnitIdx(src.Data{row, 1}, src.Data{row, 2});
             if col ~= nCols, return; end
             if isempty(unitIdx) || ~isfinite(unitIdx) || ...
                     unitIdx < 1 || unitIdx > numGroups
@@ -7961,12 +7940,12 @@ tic
 
     function updatePlotType(newVal)
         plotType = newVal;
-        % Non-trace plots default to a 100 s time window; the trace
-        % plot keeps whatever step the user set.
-        if ~strcmpi(plotType, 'Trace')
-            xStepDropdown.Value = '100';
-            updateXWindow(xSlider.Value, xStepDropdown.Value);
+        if strcmpi(plotType, 'Trace')
+            xStepDropdown.Value = '0.1';
+        else
+            xStepDropdown.Value = 'full';
         end
+        updateXWindow(xSlider.Value, xStepDropdown.Value);
         disp(['Plot type set to ', plotType]);
         plotOption();
     end
@@ -8105,6 +8084,7 @@ tic
             end
         end
         preprocessed.logFiringRate = log(preprocessed.firingRate);
+        recomputeDisplayedGroups();
     end
 
 
@@ -8343,5 +8323,124 @@ try
     end
 catch
     d = fullfile(tempdir, 'kiaSort');
+end
+end
+
+
+function lbls = umapDbscanCluster(X, targetK)
+% Embed X with UMAP (Python package) when available, else PCA, then
+% DBSCAN forced to exactly targetK clusters (the most-similar clusters
+% are merged when DBSCAN finds more). Falls back to k-means only if
+% DBSCAN cannot reach targetK at all.
+nComp = min(2, size(X,2));
+Y = [];
+try
+    Y = pythonUMAP(X, nComp);
+catch
+    Y = [];
+end
+if isempty(Y) || size(Y,1) ~= size(X,1) || any(~isfinite(Y(:)))
+    try
+        [~, Y] = pca(X, 'NumComponents', nComp);
+    catch
+        Y = X;
+    end
+end
+lbls = dbscanToTargetK(Y, targetK);
+if numel(unique(lbls)) ~= targetK
+    try
+        lbls = kmeans(X, targetK, 'Start','plus', 'Replicates', 5, ...
+            'Options', statset('MaxIter', 300));
+    catch
+    end
+end
+end
+
+
+function lbls = dbscanToTargetK(Y, targetK)
+% DBSCAN epsilon sweep that aims for at least targetK clusters, then
+% merges the most-similar clusters down to exactly targetK. Noise (-1)
+% is folded into the nearest cluster centroid first. Returns labels
+% 1..targetK (or fewer when DBSCAN never reaches targetK).
+n = size(Y,1);
+minpts = max(5, 2*size(Y,2));
+minpts = min(minpts, max(2, n-1));
+try
+    eps0 = estimate_dbscan_par(Y, minpts);
+catch
+    eps0 = [];
+end
+if isempty(eps0) || ~isfinite(eps0) || eps0 <= 0
+    dd = pdist(Y(1:min(n,500), :));
+    eps0 = median(dd(dd > 0));
+    if isempty(eps0) || ~isfinite(eps0) || eps0 <= 0, eps0 = 1; end
+end
+% Prefer the fewest clusters that is still >= targetK (least merging);
+% otherwise the most clusters DBSCAN could produce.
+factors  = [1.6 1.3 1.1 1.0 0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.15];
+bestGE = []; bestGEn = inf;
+bestAny = []; bestAnyN = 0;
+for f = factors
+    lb = dbscan(Y, eps0*f, minpts);
+    nC = numel(unique(lb(lb > 0)));
+    if nC < 1, continue; end
+    if nC >= targetK && nC < bestGEn
+        bestGEn = nC; bestGE = lb;
+    end
+    if nC > bestAnyN
+        bestAnyN = nC; bestAny = lb;
+    end
+end
+if ~isempty(bestGE)
+    lbls = bestGE;
+elseif ~isempty(bestAny)
+    lbls = bestAny;
+else
+    lbls = ones(n,1);
+end
+lbls = foldNoiseToNearest(Y, lbls);
+lbls = mergeClustersToK(Y, lbls, targetK);
+uc = unique(lbls);
+remap = zeros(max(uc), 1);
+remap(uc) = 1:numel(uc);
+lbls = remap(lbls);
+end
+
+
+function lbls = foldNoiseToNearest(Y, lbls)
+% Assign DBSCAN noise points (label <= 0) to the nearest cluster centroid.
+noise = lbls <= 0;
+if all(noise)
+    lbls(:) = 1;
+    return;
+end
+if any(noise)
+    uc   = unique(lbls(~noise));
+    cent = zeros(numel(uc), size(Y,2));
+    for ii = 1:numel(uc)
+        cent(ii,:) = mean(Y(lbls == uc(ii), :), 1);
+    end
+    dn = pdist2(Y(noise,:), cent);
+    [~, nn] = min(dn, [], 2);
+    lbls(noise) = uc(nn);
+end
+end
+
+
+function lbls = mergeClustersToK(Y, lbls, K)
+% Merge the two nearest cluster centroids repeatedly until exactly K
+% clusters remain (no-op when the count is already <= K).
+uc = unique(lbls);
+while numel(uc) > K
+    cent = zeros(numel(uc), size(Y,2));
+    for ii = 1:numel(uc)
+        cent(ii,:) = mean(Y(lbls == uc(ii), :), 1);
+    end
+    DD = squareform(pdist(cent));
+    DD(1:size(DD,1)+1:end) = inf;
+    [~, idx] = min(DD(:));
+    [a, b]   = ind2sub(size(DD), idx);
+    lbls(lbls == uc(b)) = uc(a);
+    uc = unique(lbls);
 end
 end

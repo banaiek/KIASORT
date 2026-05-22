@@ -1,53 +1,44 @@
 function postSortReport = kiaSort_post_sort_curate(outputPath, varargin)
-%KIASORT_POST_SORT_CURATE  Lightweight CCG-cleaning + similarity-merge step.
+%KIASORT_POST_SORT_CURATE  Post-hoc overlap removal, CCG cleanup, merging.
 %
 %   postSortReport = kiaSort_post_sort_curate(outputPath, ...)
 %
-%   Runs after drift merging on the saved sort. Two phases, both gated
-%   by name/value flags so the caller can switch either off:
+%   Phases (each toggleable):
+%     0) Overlap removal (overlap_removal): tiered, applied to the
+%        lower-SNR side of each pair within coincYUm in y. A neighbour
+%        kj only counts as the 'dominant' side when its SNR is at
+%        least overlapSnrRatio (1.5) times the candidate's -- so two
+%        co-firing real units of similar quality are never paired up
+%        for a drop, no matter how high their overlap.
+%          Tier 1: overlap >= overlapHighFrac (0.50) AND snr <
+%                  overlapHighSnr (2.0)  -> drop unit
+%          Tier 2: overlap >= overlapMidFrac  (0.20) AND snr <
+%                  overlapMidSnr  (1.5)  -> drop unit
+%          Tier 3: overlapLowFrac (0.05) <= overlap < overlapMidFrac
+%                  (0.20) AND snr < overlapMidSnr (1.5) -> strip only
+%                  the coincident spikes from the lower-SNR side
+%     1) CCG cleaning (ccg_cleaning): per-pair peak-at-zero test, then a
+%        sequence of gates before any spike is stripped:
+%          - Similar-quality gate: |SNR_i - SNR_j| must be below
+%            cleanSnrDiff (0.3). Large SNR gaps are handled by overlap
+%            removal (Phase 0), not by spike stripping.
+%          - Median-lag-near-zero gate: median signed lag of coincident
+%            spikes must lie within cleanLagTightMs of 0 -- a non-zero
+%            median means real coupling (synaptic delay), not a duplicate.
+%          - Lag-consistency gate: at least cleanLagConsistencyFrac of
+%            the coincident lags must fall within cleanLagTightMs of the
+%            median.
+%          - Strip-fraction cap: skip if removal would zero out more
+%            than cleanMaxStripFrac of the stripped unit.
+%        Within a similar-quality pair, the lower firing-rate (fewer-
+%        spike) unit's surviving consistent-lag coincident rows are
+%        labelled -1.
+%     2) Merge (merging): XCorr similarity + amp-similarity + PC
+%        distance + multi-gate merged-ISI; shift absorbed spike times by
+%        best-lag before relabel.
 %
-%     1) CCG cleaning  (ccg_cleaning, default true)
-%        For each pair of units whose representative channels sit
-%        within coincYUm in y, build the cross-correlogram and test
-%        for a true peak at lag zero (peak in the lag-0 window is the
-%        global max of the CCG and exceeds ccgPeakRatio x median of
-%        off-zero bins). When a pair triggers, check that the
-%        coincident spikes on the contaminated side have signed lags
-%        (relative to the nearest clean-side spike) clustered tightly
-%        around their median: at least cleanLagConsistencyFrac of the
-%        coincidences must lie within +-cleanLagTightMs of the median
-%        lag. Random coincidences spread the lag distribution; a real
-%        duplicate produces a sharp sub-ms peak. Only the consistent-
-%        lag subset has its spikes rewritten to label -1 in
-%        unifiedLabels.h5. Identity is preserved -- only the
-%        duplicate spikes are stripped.
-%
-%     2) Merging       (merging, default true)
-%        Mirrors the full gate sequence from the GUI's Auto-curation
-%        merge phase. A pair is merged ONLY when ALL gates pass:
-%          a) Similarity (XCorr) >= xcorrThreshold (default 0.9):
-%             max_half_corr on the shared-channel mean waveforms.
-%          b) Amplitude similarity <= thrAmp (default 0.15):
-%             same metric the GUI's onSimilarityEstimation builds
-%             (mean of |peak diff|/maxAbs and |trough diff|/maxAbs).
-%          c) PC distance <= thrPC (default 0.30):
-%             projects the shared-channel mean waveforms onto the
-%             per-channel PCA stored in sortedSamples{ch}, compares
-%             PC1/PC2 distance normalised by score range. Skipped
-%             (treated as pass) when the cached basis is missing.
-%          d) Merged-ISI multi-gate (full GUI checkMergedISI):
-%             merged isiM <= thrIsiAbs; per-parent <= thrIsiAbs *
-%             thrIsiBudget; each parent within 0.5 %% of the size-
-%             weighted mean; merged <= effBudget * weighted mean.
-%        The smaller-spike-count side is absorbed into the larger.
-%
-%   This step does NOT remove any units. Removal is intentionally
-%   left to manual / Auto-curation in the GUI; here we only clean
-%   and merge.
-%
-%   The function tolerates missing inputs and per-pair errors: every
-%   block is wrapped in try/catch so a bad single pair never stops
-%   the whole pass. unifiedLabels.h5 is written back ONLY when
+%   Per-pair errors are caught (try/catch around each pair) and the run
+%   continues. unifiedLabels.h5 / spike_idx.h5 are rewritten only when
 %   something actually changed.
 %
 %   Name/Value:
@@ -79,49 +70,50 @@ function postSortReport = kiaSort_post_sort_curate(outputPath, varargin)
 %       If absent we assume identity remap.
 %
 %   OUTPUT
-%       postSortReport.nClean   number of CCG-cleanups (spike strips)
-%       postSortReport.nMerge   number of pair merges
-%       postSortReport.changed  true iff unifiedLabels.h5 was rewritten
-%       postSortReport.ok       true on a clean finish
+%       postSortReport.nClean        CCG strip count
+%       postSortReport.nMerge        pair-merge count
+%       postSortReport.nOverlapDrop  whole-unit overlap drops
+%       postSortReport.nOverlapStrip per-spike overlap strips (Tier 3)
+%       postSortReport.changed       true iff h5 files were rewritten
+%       postSortReport.ok            true on clean finish
 
-% ---- Parse arguments ----------------------------------------------------
-% Default merge thresholds match the GUI Auto-curation panel; only the
-% similarity threshold defaults to a tighter 0.9 here per the request
-% (the GUI's auto run uses 0.85). Each one can be overridden if you
-% want to mirror a specific GUI tuning.
 p = inputParser;
 p.addRequired('outputPath', @(x) ischar(x) || isstring(x));
 p.addParameter('ccg_cleaning', true,  @(x) islogical(x) || isnumeric(x));
 p.addParameter('merging',      true,  @(x) islogical(x) || isnumeric(x));
 p.addParameter('xcorrThreshold', 0.9, @(x) isscalar(x) && isnumeric(x));   % thrSim (XCorr metric)
-p.addParameter('thrAmp',         0.15, @(x) isscalar(x) && isnumeric(x));  % auto-curate default
+p.addParameter('thrAmp',         0.1, @(x) isscalar(x) && isnumeric(x));  % auto-curate default
 p.addParameter('thrPC',          0.30, @(x) isscalar(x) && isnumeric(x));  % auto-curate default
 p.addParameter('thrIsiAbs',      1.0,  @(x) isscalar(x) && isnumeric(x));  % max ISI %
 p.addParameter('thrIsiBudget',   1.5,  @(x) isscalar(x) && isnumeric(x));  % weighted-mean budget
 p.addParameter('thresholdISIms', 1,    @(x) isscalar(x) && isnumeric(x));  % refractory window (ms)
-p.addParameter('ccgPeakRatio',   2,   @(x) isscalar(x) && isnumeric(x));
+p.addParameter('ccgPeakRatio',   5,   @(x) isscalar(x) && isnumeric(x));
 p.addParameter('coincYUm',       100, @(x) isscalar(x) && isnumeric(x));
-% Timing-consistency gate for CCG cleaning. After a pair triggers the
-% peak-at-zero test, the coincident spikes on the contaminated side
-% must have signed lags (relative to the nearest clean-side spike) that
-% cluster tightly around their median: at least cleanLagConsistencyFrac
-% of them within +-cleanLagTightMs of the median. This blocks stripping
-% when the coincidences look random (uniform lag distribution inside
-% +-0.5 ms) and only strips spikes whose lag falls inside the tight
-% window -- exactly the duplicate-with-consistent-sub-ms-offset case.
 p.addParameter('cleanLagTightMs',          0.2, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('cleanLagConsistencyFrac',  0.75, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('cleanSnrDiff',             0.3, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('cleanMaxStripFrac',        0.5, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('overlap_removal', true, @(x) islogical(x) || isnumeric(x));
+p.addParameter('overlapHighFrac', 0.50, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('overlapHighSnr',  2.0,  @(x) isscalar(x) && isnumeric(x));
+p.addParameter('overlapMidFrac',  0.20, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('overlapMidSnr',   1.5,  @(x) isscalar(x) && isnumeric(x));
+p.addParameter('overlapLowFrac',  0.05, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('overlapSnrRatio', 1.5,  @(x) isscalar(x) && isnumeric(x));
 p.addParameter('verbose',        false, @(x) islogical(x) || isnumeric(x));
 p.parse(outputPath, varargin{:});
 opt = p.Results;
-opt.ccg_cleaning = logical(opt.ccg_cleaning);
-opt.merging      = logical(opt.merging);
-opt.verbose      = logical(opt.verbose);
+opt.ccg_cleaning    = logical(opt.ccg_cleaning);
+opt.merging         = logical(opt.merging);
+opt.overlap_removal = logical(opt.overlap_removal);
+opt.verbose         = logical(opt.verbose);
 
-postSortReport = struct('nClean', 0, 'nMerge', 0, 'changed', false, 'ok', false);
+postSortReport = struct('nClean', 0, 'nMerge', 0, ...
+                        'nOverlapDrop', 0, 'nOverlapStrip', 0, ...
+                        'changed', false, 'ok', false);
 
-% Bail early if neither phase is enabled.
-if ~opt.ccg_cleaning && ~opt.merging
+% Bail early if no phase is enabled.
+if ~opt.ccg_cleaning && ~opt.merging && ~opt.overlap_removal
     postSortReport.ok = true;
     return;
 end
@@ -211,7 +203,6 @@ if nU == 0
     return;
 end
 
-% Sampling frequency: pulled from the first non-empty sortedSamples cfg.
 fs = 30000;
 for i = 1:numel(sortedSamples)
     if ~isempty(sortedSamples{i}) && isfield(sortedSamples{i}, 'cfg') ...
@@ -221,12 +212,7 @@ for i = 1:numel(sortedSamples)
     end
 end
 
-% ---- Load drift label remap if present ---------------------------------
-% After drift merge, unifiedLabels.h5 carries POST-drift labels but the
-% unif struct (from sorted_samples.mat) was built from PRE-drift labels.
-% labelRemap maps pre-drift -> post-drift. If the report is absent we
-% fall back to identity, which is correct when drift merge was skipped
-% or made no changes.
+% Pre-drift -> post-drift label remap (identity if drift_merge_report missing).
 labelRemap = containers.Map('KeyType', 'double', 'ValueType', 'double');
 if exist(driftReportPath, 'file')
     try
@@ -236,15 +222,11 @@ if exist(driftReportPath, 'file')
             labelRemap = dr.driftReport.labelRemap;
         end
     catch
-        % silently fall back to identity
     end
 end
 
-% ---- Build per-unit info keyed by post-drift label ---------------------
-% For each unif entry compute its post-drift label, then collapse to one
-% representative per unique label (highest detectability wins). The
-% representative gives us a (channel, localLabel) pair we can feed into
-% sortedSamples to recover a mean waveform.
+% Per-unit info keyed by post-drift label (one representative per label,
+% highest detectability wins).
 postLabelPerUnif = zeros(nU, 1);
 for u = 1:nU
     preL = unif.label(u);
@@ -390,11 +372,73 @@ if isempty(pairList)
     return;
 end
 
+% ---- Phase 0: overlap removal (tiered) ---------------------------------
+nOverlapDrop  = 0;
+nOverlapStrip = 0;
+droppedLabels = [];
+if opt.overlap_removal
+    coincSamples = round(0.5e-3 * fs);
+    droppedMask  = false(nUnits, 1);
+    for ki = 1:nUnits
+        if isnan(unitInfo(ki).ny), continue; end
+        liveRows_i = unitInfo(ki).spkRows(lbl_all(unitInfo(ki).spkRows) == unitInfo(ki).label);
+        spk_i = spk_all(liveRows_i);
+        if numel(spk_i) < 10, continue; end
+        snr_i = 1 + unitInfo(ki).detectability;
+        if isnan(snr_i), snr_i = 0; end
+
+        maxFrac    = 0;
+        triggerRows = [];
+        for kj = 1:nUnits
+            if kj == ki || droppedMask(kj), continue; end
+            if isnan(unitInfo(kj).ny), continue; end
+            if abs(unitInfo(kj).ny - unitInfo(ki).ny) > opt.coincYUm, continue; end
+            snr_j = 1 + unitInfo(kj).detectability;
+            if isnan(snr_j), snr_j = 0; end
+            if snr_j < snr_i * opt.overlapSnrRatio, continue; end
+            liveRows_j = unitInfo(kj).spkRows(lbl_all(unitInfo(kj).spkRows) == unitInfo(kj).label);
+            spk_j = spk_all(liveRows_j);
+            if isempty(spk_j), continue; end
+            d_ij = local_nearest_distance(spk_i, spk_j);
+            coincMask = d_ij <= coincSamples;
+            frac = sum(coincMask) / numel(spk_i);
+            if frac > maxFrac
+                maxFrac     = frac;
+                triggerRows = liveRows_i(coincMask);
+            end
+        end
+
+        if maxFrac >= opt.overlapHighFrac && snr_i < opt.overlapHighSnr
+            droppedMask(ki) = true;
+            droppedLabels(end+1,1) = unitInfo(ki).label; %#ok<AGROW>
+            lbl_all(unitInfo(ki).spkRows) = -1;
+            nOverlapDrop = nOverlapDrop + 1;
+            if opt.verbose
+                fprintf('overlap-drop T1: lbl %d (frac %.2f, snr %.2f)\n', ...
+                    unitInfo(ki).label, maxFrac, snr_i);
+            end
+        elseif maxFrac >= opt.overlapMidFrac && snr_i < opt.overlapMidSnr
+            droppedMask(ki) = true;
+            droppedLabels(end+1,1) = unitInfo(ki).label; %#ok<AGROW>
+            lbl_all(unitInfo(ki).spkRows) = -1;
+            nOverlapDrop = nOverlapDrop + 1;
+            if opt.verbose
+                fprintf('overlap-drop T2: lbl %d (frac %.2f, snr %.2f)\n', ...
+                    unitInfo(ki).label, maxFrac, snr_i);
+            end
+        elseif maxFrac >= opt.overlapLowFrac && maxFrac < opt.overlapMidFrac ...
+                && snr_i < opt.overlapMidSnr && ~isempty(triggerRows)
+            lbl_all(triggerRows) = -1;
+            nOverlapStrip = nOverlapStrip + numel(triggerRows);
+            if opt.verbose
+                fprintf('overlap-strip T3: lbl %d (frac %.2f, %d spikes)\n', ...
+                    unitInfo(ki).label, maxFrac, numel(triggerRows));
+            end
+        end
+    end
+end
+
 % ---- Phase 1: CCG cleaning ---------------------------------------------
-% Per-pair CCG peak-at-zero test. When triggered, strip the contaminated
-% (higher-ISI) side's coincident rows by setting their lbl_all entries
-% to -1. lbl_all is mutated in place; subsequent pairs see the cleaned
-% counts.
 nClean = 0;
 if opt.ccg_cleaning
     coincSamples = round(0.5e-3 * fs);
@@ -419,27 +463,31 @@ if opt.ccg_cleaning
                 continue;
             end
 
-            % Coincidence mask in i's frame.
-            d_ij = local_nearest_distance(spk_i, spk_j);
-            coinc_i = d_ij <= coincSamples;
-
-            % Decide contaminated side: higher ISI is contaminated;
-            % ties broken by smaller spike count.
-            isi_i = unitInfo(ki).isiViol; if isnan(isi_i), isi_i = 0; end
-            isi_j = unitInfo(kj).isiViol; if isnan(isi_j), isi_j = 0; end
-            if isi_i > isi_j || (isi_i == isi_j && numel(spk_i) <= numel(spk_j))
-                kCont   = ki;
-                contRows = kiLive;
-                contMask = coinc_i;
+            % Only clean pairs of similar quality: |SNR_i - SNR_j| must
+            % be below cleanSnrDiff. A large SNR gap is the domain of
+            % overlap removal (Phase 0), not spike stripping. Within a
+            % similar-quality pair the lower firing-rate (fewer-spike)
+            % unit is the likely fragment, so its coincident spikes are
+            % the ones removed.
+            snr_i = 1 + unitInfo(ki).detectability;
+            snr_j = 1 + unitInfo(kj).detectability;
+            if isnan(snr_i), snr_i = 0; end
+            if isnan(snr_j), snr_j = 0; end
+            if abs(snr_i - snr_j) >= opt.cleanSnrDiff
+                continue;
+            end
+            if numel(spk_i) <= numel(spk_j)
+                kCont     = ki;
+                contRows  = kiLive;
+                d_cont    = local_nearest_distance(spk_i, spk_j);
                 signedLag = local_signed_nearest_lag(spk_i, spk_j);
             else
-                kCont   = kj;
-                contRows = kjLive;
-                d_ji    = local_nearest_distance(spk_j, spk_i);
-                contMask = d_ji <= coincSamples;
+                kCont     = kj;
+                contRows  = kjLive;
+                d_cont    = local_nearest_distance(spk_j, spk_i);
                 signedLag = local_signed_nearest_lag(spk_j, spk_i);
             end
-
+            contMask = d_cont <= coincSamples;
             if ~any(contMask), continue; end
 
             % --- Timing-consistency gate -----------------------------
@@ -457,6 +505,18 @@ if opt.ccg_cleaning
                 continue;
             end
             medLag         = median(coincLags);
+            % Median must also sit near zero. A non-zero median lag with
+            % consistent spread indicates a synaptic delay (real coupling),
+            % not a duplicate -- stripping it would discard real spikes.
+            if abs(medLag) > tightSamples
+                if opt.verbose
+                    fprintf(['Post-sort CCG-clean: pair (%d,%d) skipped, ' ...
+                        'median lag %.2f ms not near zero.\n'], ...
+                        unitInfo(ki).label, unitInfo(kj).label, ...
+                        1000 * medLag / fs);
+                end
+                continue;
+            end
             withinTight    = abs(coincLags - medLag) <= tightSamples;
             consistencyFrac = sum(withinTight) / numel(coincLags);
             if consistencyFrac < opt.cleanLagConsistencyFrac
@@ -473,6 +533,18 @@ if opt.ccg_cleaning
             keepCoinc(coincIdx)  = withinTight;
             contMask             = contMask & keepCoinc;
             if ~any(contMask), continue; end
+
+            % Strip-fraction cap: refuse to gut the contaminated unit.
+            stripFrac = sum(contMask) / numel(contMask);
+            if stripFrac > opt.cleanMaxStripFrac
+                if opt.verbose
+                    fprintf(['Post-sort CCG-clean: pair (%d,%d) skipped, ' ...
+                        'would strip %.0f%% (cap %.0f%%).\n'], ...
+                        unitInfo(ki).label, unitInfo(kj).label, ...
+                        100*stripFrac, 100*opt.cleanMaxStripFrac);
+                end
+                continue;
+            end
 
             lbl_all(contRows(contMask)) = -1;
             nClean = nClean + 1;
@@ -498,37 +570,12 @@ if opt.ccg_cleaning
 end
 
 % ---- Phase 2: Merging --------------------------------------------------
-% Mirrors the GUI Auto-curation merge stage: a candidate pair must clear
-% ALL of these gates before it is merged.
-%
-%   1) Similarity (XCorr).
-%      max_half_corr on the shared-channel mean waveforms (channel of
-%      unit i). Must reach >= opt.xcorrThreshold (default 0.9).
-%
-%   2) Amplitude similarity.
-%      Same metric the GUI's onSimilarityEstimation builds: average of
-%      |peak-to-peak diffs| normalised by the larger of the two
-%      maxAbs values. Must be <= opt.thrAmp.
-%
-%   3) PC distance.
-%      Project both mean waveforms onto the per-channel PCA stored in
-%      sortedSamples{ch}.clusteringInfo.PCA, then compare PC1/PC2.
-%      Must be <= opt.thrPC. When the cached PCA is missing or invalid
-%      this gate is skipped (treated as pass) -- same conservative
-%      fallback the GUI uses when the basis is unavailable.
-%
-%   4) Merged ISI gates (full local_checkMergedISI logic).
-%      Runs against the CURRENT spike trains for each label so that
-%      Phase 1 strips and any earlier Phase 2 merges feed forward.
-%
-% Spike-time alignment: when the similarity metric finds a non-zero
-% best-lag, the absorbed unit's spike times are shifted by -bestLag so
-% the merged ACG's lag-0 bin really sits at lag zero (matches GUI).
+% Gates per pair: XCorr similarity, amp similarity, PC distance, merged-
+% ISI multi-gate. On pass, the absorbed side's spike times are shifted
+% by max_half_corr's bestLag before relabel.
 nMerge     = 0;
 spkChanged = false;
-% Working remap from "label as it was" -> "label as it is now after
-% any merges already applied this run". Allows transitive collapse.
-mergedTo = containers.Map('KeyType', 'double', 'ValueType', 'double');
+mergedTo   = containers.Map('KeyType', 'double', 'ValueType', 'double');
 
 if opt.merging
     chanPCA = containers.Map('KeyType','double','ValueType','any');
@@ -608,7 +655,8 @@ if opt.merging
 end
 
 % ---- Write back if anything changed ------------------------------------
-changed = (nClean > 0) || (nMerge > 0) || spkChanged;
+changed = (nClean > 0) || (nMerge > 0) || spkChanged || ...
+          (nOverlapDrop > 0) || (nOverlapStrip > 0);
 if changed
     try
         if exist(unifiedLabelsH5, 'file')
@@ -628,22 +676,27 @@ if changed
         if opt.verbose
             fprintf('Post-sort curate: H5 write failed (%s).\n', ME.message);
         end
-        postSortReport.nClean  = nClean;
-        postSortReport.nMerge  = nMerge;
-        postSortReport.changed = false;
-        postSortReport.ok      = false;
+        postSortReport.nClean        = nClean;
+        postSortReport.nMerge        = nMerge;
+        postSortReport.nOverlapDrop  = nOverlapDrop;
+        postSortReport.nOverlapStrip = nOverlapStrip;
+        postSortReport.changed       = false;
+        postSortReport.ok            = false;
         return;
     end
 end
 
-postSortReport.nClean  = nClean;
-postSortReport.nMerge  = nMerge;
-postSortReport.changed = changed;
-postSortReport.ok      = true;
+postSortReport.nClean        = nClean;
+postSortReport.nMerge        = nMerge;
+postSortReport.nOverlapDrop  = nOverlapDrop;
+postSortReport.nOverlapStrip = nOverlapStrip;
+postSortReport.droppedLabels = droppedLabels;
+postSortReport.changed       = changed;
+postSortReport.ok            = true;
 
 if opt.verbose
-    fprintf('Post-sort curate: %d CCG strips, %d merges (changed=%d).\n', ...
-        nClean, nMerge, changed);
+    fprintf('Post-sort curate: %d overlap drops, %d overlap strips, %d CCG strips, %d merges (changed=%d).\n', ...
+        nOverlapDrop, nOverlapStrip, nClean, nMerge, changed);
 end
 
 end
@@ -654,9 +707,7 @@ end
 % =========================================================================
 
 function [ccg, zeroBinIdx] = local_pairCCG(spkA, spkB, maxLagSamples, binSamples)
-% Two-pointer pairwise-difference histogram for the CCG of (spkB - spkA)
-% inside +-maxLagSamples, binned at binSamples. Same logic as the curate
-% GUI's pairCCG -- inlined here so this file has no GUI dependency.
+% CCG of (spkB - spkA) inside +-maxLagSamples, binSamples bin width.
 spkA = sort(spkA(:));
 spkB = sort(spkB(:));
 nA   = numel(spkA);
@@ -693,17 +744,9 @@ end
 
 
 function tf = local_ccgPeakAtZero(ccg, zeroBinIdx, zeroTolBins, ratio)
-% Lag-0 peak test, stricter than the curate GUI's median-based version.
-% A pair triggers ONLY when both:
-%   * The lag-0 window holds the global max of the CCG (so the
-%     biggest bin really sits at zero, not somewhere else).
-%   * That peak is > ratio x the 90th-percentile of the off-zero
-%     bins. The 90th percentile means the peak has to clear what
-%     90 % of the rest of the CCG looks like, so a single tall
-%     non-zero bin can't push the baseline up the way it can with
-%     a mean, and structural temporal coupling (real biology with
-%     wide lag bands) gets a much fairer comparison than against a
-%     median that's usually 0 or 1 in sparse CCGs.
+% True iff the lag-0 window holds the global max and that peak exceeds
+% ratio * 90th-percentile of the off-zero bins (falls back to mean of
+% non-zero off-bins when the percentile is 0).
 tf = false;
 if isempty(ccg) || all(ccg == 0), return; end
 nB = numel(ccg);
@@ -713,17 +756,10 @@ peakValue = max(ccg(peakRange));
 offRange  = ccg;
 offRange(peakRange) = [];
 if isempty(offRange), return; end
-% Off-window must NOT contain a strictly larger bin -- if it does,
-% the actual global max sits away from zero and this isn't a "true
-% peak at zero" pair.
 if any(offRange > peakValue), return; end
 if ~any(offRange > 0), return; end
 baseline = prctile(offRange, 90);
 if ~isfinite(baseline) || baseline <= 0
-    % Sparse CCG: 90 % of bins are zero -> percentile is 0. Fall back
-    % to the mean of the non-zero off-window bins so the peak still
-    % has something meaningful to clear (and we don't trivially pass
-    % every non-zero peak).
     nz = offRange(offRange > 0);
     if isempty(nz), return; end
     baseline = mean(nz);
@@ -734,10 +770,7 @@ end
 
 
 function d = local_nearest_distance(A, B)
-% For each element of A, distance (samples) to its nearest neighbour in
-% B. Two-pointer sweep on sorted inputs -- O(nA + nB). Returns +inf for
-% A entries with no neighbour in B (so the caller's "<= tol" check is
-% safe).
+% For each A(i), distance to nearest B (samples). +Inf if B is empty.
 A = A(:); B = B(:);
 nA = numel(A); nB = numel(B);
 d  = inf(nA, 1);
@@ -762,12 +795,7 @@ end
 
 
 function lag = local_signed_nearest_lag(A, B)
-% For each element of A, SIGNED lag (samples) to its nearest neighbour
-% in B: lag(i) = B_nearest - A(i). Positive = B comes after A,
-% negative = B comes before A. NaN when B is empty or no neighbour
-% within finite range. Used by the cleaning timing-consistency gate
-% so we can tell whether the coincident spikes cluster around a
-% specific sub-ms offset (real duplicate) or are scattered (random).
+% lag(i) = B_nearest - A(i). Positive = B after A. NaN when B is empty.
 A = A(:); B = B(:);
 nA = numel(A); nB = numel(B);
 lag = nan(nA, 1);
@@ -799,10 +827,7 @@ end
 
 
 function lab = local_resolveLabel(lab0, mergedTo)
-% Walk the merged-to chain to find the current top-level label for lab0.
-% Used so transitive merges (A->B, B->C ⇒ A->C) collapse cleanly within
-% a single Phase 2 pass without rewriting the whole label vector each
-% step.
+% Follow the merged-to chain so transitive merges collapse correctly.
 lab = lab0;
 while isKey(mergedTo, lab)
     next = mergedTo(lab);
@@ -813,15 +838,12 @@ end
 
 
 function row = local_rowOnChannel(wf, homeCh, targetCh)
-% Pull the local row of a (nLocalChannels x T) mean-waveform tensor
-% that corresponds to GLOBAL channel targetCh, given the waveform is
-% centered on homeCh. Returns [] when the target falls outside the
-% unit's local footprint.
+% Row of (nLoc x T) mean waveform corresponding to global targetCh,
+% given the footprint is centred on homeCh. [] if targetCh out of range.
 row = [];
 if isempty(wf) || ~ismatrix(wf), return; end
 nLoc  = size(wf, 1);
 half  = floor((nLoc - 1) / 2);
-% Local row index 1 corresponds to global channel (homeCh - half).
 localIdx = targetCh - (homeCh - half);
 if localIdx < 1 || localIdx > nLoc, return; end
 row = wf(localIdx, :);
@@ -829,10 +851,7 @@ end
 
 
 function ampDiff = local_ampSimilarity(mw1, mw2)
-% Mirrors the amplitude-similarity metric used in the GUI's
-% onSimilarityEstimation: average of |peak diff|/maxAbs and
-% |trough diff|/maxAbs across the pair. Smaller is more similar.
-% Returns NaN when either trace is flat.
+% Average of |peak diff|/maxAbs and |trough diff|/maxAbs. NaN if flat.
 mw1 = mw1(:)'; mw2 = mw2(:)';
 both = [mw1; mw2];
 maxAbs = max(abs(both), [], 2);
@@ -851,22 +870,15 @@ end
 
 
 function ok = local_checkPCDistance(wfI, wfJ, chI, chJ, sortedSamples, chanPCA, thr)
-% Shared-channel PC1/PC2 distance between mean waveforms, normalised
-% by the basis's score range. Mirrors the GUI's checkPCDistance, with
-% the difference that we use the per-channel PCA cached in
-% sortedSamples{chI}.clusteringInfo.PCA instead of recomputing it
-% from raw spikes (the post-sort step deliberately does not re-read
-% the input data file). When the cached basis is missing or
-% malformed we conservatively pass.
+% PC distance between mwA and mwB on chI, normalised by the basis's
+% score range. Returns true (pass) when the cached PCA is missing.
 ok = true;
 if isnan(chI), return; end
-% Pull rows on chI for both units.
 mwA = local_rowOnChannel(wfI, chI, chI);
 mwB = local_rowOnChannel(wfJ, chJ, chI);
 if isempty(mwA) || isempty(mwB), return; end
 if numel(mwA) ~= numel(mwB), return; end
 
-% Cached PCA: load on first hit, reuse thereafter.
 if isKey(chanPCA, chI)
     PC = chanPCA(chI);
 else
@@ -890,7 +902,6 @@ else
             end
         end
     catch
-        % leave PC empty; gate will pass
     end
     chanPCA(chI) = PC;
 end
@@ -909,16 +920,8 @@ end
 
 
 function ok = local_checkMergedISI(spkA, spkB, fs, threshMs, isiAbs, isiBudget)
-% Same multi-condition merged-ISI gate the GUI's checkMergedISI uses:
-%   1) Hard cap on the merged train: isiM <= isiAbs.
-%   2) Per-parent cap: isiA, isiB <= isiAbs * max(isiBudget, 1).
-%   3) Each parent's ISI within 0.5 % of the size-weighted mean.
-%   4) Merged ISI <= effBudget * weighted mean, where effBudget
-%      shrinks toward 1.0 as size disparity grows.
-%
-% spkA, spkB are sample-frame spike-time vectors. fs is the sampling
-% rate in Hz, threshMs is the refractory threshold in ms passed
-% straight to getISIViolations.
+% Multi-gate merged-ISI test: hard cap, per-parent cap, parent deviation
+% from size-weighted mean, and size-shrunk merged budget.
 ok = true;
 NA = numel(spkA); NB = numel(spkB);
 if NA < 1 || NB < 1, return; end

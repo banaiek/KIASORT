@@ -406,7 +406,6 @@ try
 
             valid_idx  = (left_diff > sample_spike_distance) & (right_diff > sample_spike_distance) & valid_idx;
 
-
             out.spk_Val_full            = tmp_val(valid_idx);
             out.spk_ID_full             = tmp_id(valid_idx);
             out.spk_idx_full            = tmp_idx(valid_idx);
