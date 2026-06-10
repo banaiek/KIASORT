@@ -594,7 +594,7 @@ autoIsiVal      = 1.0;     % max ISI violation %
 autoOverlapFrac = 0.10;    % coincidence overlap fraction (Phase: removal)
 autoIsiBudget   = 1.5;     % merged-ISI budget (Phase: merge)
 autoPCVal       = 0.30;    % PC-distance gate (Phase: merge)
-autoCCGRatio    = 5;       % CCG peak / baseline-median ratio (Phase: cleaning)
+autoCCGRatio    = 2;       % CCG peak / baseline-median ratio (Phase: cleaning)
 % Timing-consistency gate (Phase: cleaning). After CCG peak-at-zero
 % triggers, the contaminated side's coincident-spike lags (relative to
 % the nearest clean-side spike) must cluster tightly around their
@@ -602,13 +602,16 @@ autoCCGRatio    = 5;       % CCG peak / baseline-median ratio (Phase: cleaning)
 % spread the lags evenly inside the +-0.5 ms window; a real sorter-
 % introduced duplicate produces a sharp sub-ms peak. Only the
 % consistent-lag subset is stripped.
-autoLagTightMs         = 0.2;
+autoLagTightSamples    = 2;
 autoLagConsistencyFrac = 0.75;
-% Cleaning acts only on similar-quality pairs (|SNR_k - SNR_j| <
-% autoCCGSnrDiff); larger gaps belong to overlap removal. The lower
-% firing-rate side is the one stripped, capped at autoCCGMaxStripFrac
-% of its spikes per pair.
-autoCCGSnrDiff         = 0.3;
+% Cleaning de-duplicates a pair that double-detects the same physical
+% spike. The lower-SNR side's coincident copies are stripped; the
+% higher-SNR side (owner) keeps them, so recall is preserved -- only
+% double-counted spikes are removed, never a unit's independent activity.
+% A shared-channel waveform-similarity confirm (autoCCGWaveSim) guards
+% against stripping genuinely co-active different neurons; the strip is
+% capped at autoCCGMaxStripFrac of the contaminated unit per pair.
+autoCCGWaveSim         = 0.8;
 autoCCGMaxStripFrac    = 0.5;
 
 % Pull saved Auto-panel values from the prefs file so the user gets
@@ -648,9 +651,9 @@ if isfield(loadedPrefs,'autoCCGRatio') && isfinite(loadedPrefs.autoCCGRatio) && 
         loadedPrefs.autoCCGRatio >= 0.5 && loadedPrefs.autoCCGRatio <= 10
     autoCCGRatio = loadedPrefs.autoCCGRatio;
 end
-if isfield(loadedPrefs,'autoLagTightMs') && isfinite(loadedPrefs.autoLagTightMs) && ...
-        loadedPrefs.autoLagTightMs > 0 && loadedPrefs.autoLagTightMs <= 2
-    autoLagTightMs = loadedPrefs.autoLagTightMs;
+if isfield(loadedPrefs,'autoLagTightSamples') && isfinite(loadedPrefs.autoLagTightSamples) && ...
+        loadedPrefs.autoLagTightSamples > 0 && loadedPrefs.autoLagTightSamples <= 10
+    autoLagTightSamples = loadedPrefs.autoLagTightSamples;
 end
 if isfield(loadedPrefs,'autoLagConsistencyFrac') && isfinite(loadedPrefs.autoLagConsistencyFrac) && ...
         loadedPrefs.autoLagConsistencyFrac >= 0 && loadedPrefs.autoLagConsistencyFrac <= 1
@@ -761,7 +764,7 @@ applyColorScheme(lblAutoCCG, figColor);
 
 uiAutoCCG = uieditfield(autoLayout,'numeric','Value',autoCCGRatio, ...
     'Limits',[0.5 10], ...
-    'Tooltip','CCG lag-0 peak / baseline-median ratio. Higher = stricter. Default 5.',...
+    'Tooltip','CCG lag-0 peak / baseline-median ratio. Higher = stricter. Default 2.',...
     'LowerLimitInclusive','on','UpperLimitInclusive','on', ...
     'ValueChangedFcn',@(ui,ev)setAutoCCGRatio(ui.Value));
 uiAutoCCG.Layout.Row = 4;
@@ -2382,9 +2385,45 @@ refreshLabels();
             return;
         end
 
-        % Perform the merge => all selected become the same label
+        % Perform the merge => all selected become the same label. For
+        % each non-primary side, if the templates are peak/trough offset
+        % (|bestLag| > 1) and the absorbed unit has spikes whose nearest-
+        % primary lag clusters tightly, strip those spikes first -- they
+        % are the same physical event picked up at two different
+        % features. Primary keeps its detections; absorbed loses only the
+        % duplicates.
         selectedIdx = find(chkBoxSelect);
+        refrSamples = max(1, round(thresholdISI * 1e-3 * cfg.samplingFrequency));
         for k = selectedIdx'
+            if k == selIdx, continue; end
+            if isnan(groupList(k)) || groupList(k) == mergeLabel, continue; end
+
+            bestLag = 0;
+            if ~isnan(mergeChannel)
+                mwP = localMeanWaveform(selIdx, mergeChannel);
+                mwA = localMeanWaveform(k,      mergeChannel);
+                if ~isempty(mwP) && ~isempty(mwA) && ...
+                   numel(mwP) == numel(mwA) && numel(mwP) > 4
+                    M2 = numel(mwP);
+                    lagCap = max(1, round(M2/4));
+                    [~, bestLag] = max_half_corr(mwP(:)', mwA(:)', 1, M2, lagCap, 0);
+                end
+            end
+            if abs(bestLag) > 1
+                labA  = groupList(k);
+                rowsA = find(sortedRes.unifiedLabels == labA);
+                rowsP = find(sortedRes.unifiedLabels == mergeLabel);
+                if ~isempty(rowsA) && ~isempty(rowsP)
+                    spkA  = sortedRes.spike_idx(rowsA);
+                    spkP  = sortedRes.spike_idx(rowsP);
+                    keepA = dedupAbsorbedToPrimary(spkP, spkA, bestLag, ...
+                        refrSamples, 2, 0.75);
+                    if ~all(keepA)
+                        sortedRes.unifiedLabels(rowsA(~keepA)) = -1;
+                    end
+                end
+            end
+
             mergedFlag(k) = true;
             sortedRes.unifiedLabels(sortedRes.unifiedLabels==groupList(k)) = mergeLabel;
             sortedRes.channelNum(sortedRes.unifiedLabels==groupList(k))    = mergeChannel;
@@ -2392,6 +2431,15 @@ refreshLabels();
             channelList(k) = mergeChannel;
             stable_length(k,:) = stable_length(selIdx,:);
         end
+        % Primary's spike train just grew (with any non-deduped absorbed
+        % spikes) and possibly shrank (with the duplicates that were
+        % relabelled -1). Flag it so the cached pair-wise ISI / CCG
+        % entries involving primary are rebuilt on the next plot, and
+        % refresh the per-unit ISI / firing-rate metrics on the merged
+        % train so the Groups panel and curation table show the survived
+        % spikes immediately.
+        mergedFlag(selIdx) = true;
+        try, preprocessSortedData(); catch, end
         updateChannelPlot();
         refreshLabels();
         plotOption();
@@ -3295,15 +3343,14 @@ refreshLabels();
                     [d1_kj, d2_kj] = nearest_distances(spk_k, spk_j);
                     coincMask_k    = min(d1_kj, d2_kj) <= coincSamples;
 
-                    % CCG peak triggered. Only clean similar-quality
-                    % pairs: a large SNR gap belongs to overlap removal,
-                    % not spike stripping. Within the pair, strip the
-                    % lower firing-rate (fewer-spike) side -- the likely
-                    % fragment. NaN SNR is treated as 0.
+                    % CCG peak triggered. Owner = higher-SNR side; the
+                    % lower-SNR side is contaminated and its coincident
+                    % copies get stripped. Equal SNR -> no clear owner,
+                    % skip. NaN SNR is treated as 0.
                     sk = snrAll(k); if isnan(sk), sk = 0; end
                     sj = snrAll(j); if isnan(sj), sj = 0; end
-                    if abs(sk - sj) >= autoCCGSnrDiff, continue; end
-                    if numel(spk_k) <= numel(spk_j)
+                    if sk == sj, continue; end
+                    if sk < sj
                         contIdx    = k;
                         cleanIdx   = j;
                         cont_rows  = spk_k_rows;
@@ -3320,6 +3367,32 @@ refreshLabels();
 
                     if ~any(cont_coinc), continue; end
 
+                    % Shared-channel waveform confirm + expected offset. A
+                    % true duplicate is the same waveform on the contaminated
+                    % unit's channel; co-active different neurons are not.
+                    % max_half_corr also returns the best-lag offset where
+                    % the coincident lags should sit -- this is what lets the
+                    % same spike picked up at different peak/trough features
+                    % (a non-zero but fixed offset) still register.
+                    chCont  = channelList(contIdx);
+                    simWF   = NaN;
+                    waveLag = 0;
+                    if ~isnan(chCont)
+                        mwC = localMeanWaveform(contIdx,  chCont);
+                        mwO = localMeanWaveform(cleanIdx, chCont);
+                        if ~isempty(mwC) && ~isempty(mwO) && ...
+                           numel(mwC) == numel(mwO) && numel(mwC) > 4
+                            M2w = numel(mwC);
+                            [simWF, waveLag] = max_half_corr(mwC(:)', mwO(:)', ...
+                                1, M2w, max(1, round(M2w/4)), 0);
+                        end
+                    end
+                    if autoCCGWaveSim > 0 && (~isfinite(simWF) || simWF < autoCCGWaveSim)
+                        continue;
+                    end
+                    expectedLag = 0;
+                    if isfinite(waveLag), expectedLag = waveLag; end
+
                     % --- Timing-consistency gate -----------------
                     % The coincident spikes' signed lags to the
                     % nearest clean spike must cluster tightly around
@@ -3330,9 +3403,9 @@ refreshLabels();
                     % uniformly inside the +-0.5 ms window. The strip
                     % is applied only to the consistent-lag subset;
                     % if fewer than autoLagConsistencyFrac of the
-                    % coincident lags fall inside +-autoLagTightMs of
-                    % the median, skip the pair entirely.
-                    tightSamples = max(1, round(autoLagTightMs * 1e-3 * cfg.samplingFrequency));
+                    % coincident lags fall inside +-autoLagTightSamples
+                    % of the median, skip the pair entirely.
+                    tightSamples = max(1, round(autoLagTightSamples));
                     coincIdx     = find(cont_coinc);
                     coincLags    = signedLag(coincIdx);
                     coincLags    = coincLags(~isnan(coincLags));
@@ -3340,10 +3413,12 @@ refreshLabels();
                         continue;
                     end
                     medLag           = median(coincLags);
-                    % Median lag must also sit near zero; a non-zero
-                    % median is a synaptic delay (real coupling), not a
-                    % duplicate.
-                    if abs(medLag) > tightSamples, continue; end
+                    % Median must match the waveform offset (expectedLag):
+                    % 0 for a same-feature duplicate, the peak/trough offset
+                    % when the two units detect the same spike at different
+                    % features. A median away from that offset is a random
+                    % or synaptic coincidence, not a duplicate.
+                    if abs(medLag - expectedLag) > tightSamples, continue; end
                     withinTight      = abs(coincLags - medLag) <= tightSamples;
                     consistencyFrac  = sum(withinTight) / numel(coincLags);
                     if consistencyFrac < autoLagConsistencyFrac
@@ -3424,7 +3499,6 @@ refreshLabels();
                         if isnan(groupList(gA)) || isnan(groupList(gB)), continue; end
                         if groupList(gA) == groupList(gB), continue; end
                         if ~checkPCDistance(gA, gB, thrPC), continue; end
-                        if ~checkMergedISI(gA, gB, thrIsiAbs, thrIsiBudget), continue; end
 
                         if preprocessed.firingRate(gA) >= preprocessed.firingRate(gB)
                             primary = gA; absorbed = gB;
@@ -3435,11 +3509,10 @@ refreshLabels();
                         mergeChannel = channelList(primary);
                         absLab       = groupList(absorbed);
 
-                        % Align absorbed spike times to primary frame
-                        % using shared-channel XCorr lag. Done for every
-                        % merge regardless of the similarity metric the
-                        % user selected. originalSpikeIdx is untouched
-                        % so Reset / Undo restore the original timing.
+                        % bestLag is needed both to align absorbed spikes
+                        % to primary's frame AND to gate the double-count
+                        % rescue below. Compute it once up front.
+                        bestLag = 0;
                         if ~isnan(mergeChannel)
                             mwA = localMeanWaveform(primary, mergeChannel);
                             mwB = localMeanWaveform(absorbed, mergeChannel);
@@ -3448,13 +3521,39 @@ refreshLabels();
                                 M2 = numel(mwA);
                                 lagCap = max(1, round(M2/4));
                                 [~, bestLag] = max_half_corr(mwA(:)', mwB(:)', 1, M2, lagCap, 0);
-                                if isfinite(bestLag) && bestLag ~= 0
-                                    shiftRows = find(sortedRes.unifiedLabels == absLab);
-                                    shifted   = sortedRes.spike_idx(shiftRows) - bestLag;
-                                    shifted(shifted < 1)            = 1;
-                                    shifted(shifted > num_Samples)  = num_Samples;
-                                    sortedRes.spike_idx(shiftRows)  = shifted;
-                                end
+                            end
+                        end
+
+                        % ISI gate. When it fails AND the templates are
+                        % meaningfully peak/trough offset (|bestLag| > 1),
+                        % give the merge one rescue: strip systematic
+                        % double-counted absorbed spikes (their nearest-
+                        % primary lag clusters tightly around the median)
+                        % and re-test the gates. Primary keeps its spikes;
+                        % absorbed loses only the duplicates.
+                        isiOK    = checkMergedISI(gA, gB, thrIsiAbs, thrIsiBudget);
+                        dropRows = [];
+                        if ~isiOK && abs(bestLag) > 1
+                            [isiOK, dropRows] = attemptMergeDedupGate(primary, ...
+                                absorbed, bestLag, thrIsiAbs, thrIsiBudget);
+                        end
+                        if ~isiOK, continue; end
+
+                        if ~isempty(dropRows)
+                            sortedRes.unifiedLabels(dropRows) = -1;
+                        end
+
+                        % Align surviving absorbed spike times to primary
+                        % frame using the bestLag computed above.
+                        % originalSpikeIdx is untouched so Reset / Undo
+                        % restore the original timing.
+                        if isfinite(bestLag) && bestLag ~= 0
+                            shiftRows = find(sortedRes.unifiedLabels == absLab);
+                            if ~isempty(shiftRows)
+                                shifted = sortedRes.spike_idx(shiftRows) - bestLag;
+                                shifted(shifted < 1)           = 1;
+                                shifted(shifted > num_Samples) = num_Samples;
+                                sortedRes.spike_idx(shiftRows) = shifted;
                             end
                         end
 
@@ -3473,6 +3572,11 @@ refreshLabels();
                         groupList(absMembers)   = mergeLabel;
                         channelList(absMembers) = mergeChannel;
                         mergedFlag(absMembers)  = true;
+                        % Primary's spike train changed too (gained the
+                        % absorbed survivors, lost the deduped duplicates),
+                        % so flag it so the cached ISI / CCG entries
+                        % involving primary are rebuilt on the next plot.
+                        mergedFlag(primary)     = true;
                         nMerged = nMerged + 1;
 
                         % Record this merge for the Auto-panel pair
@@ -4181,6 +4285,107 @@ refreshLabels();
              (devA   <= weightedDevCap)  && ...
              (devB   <= weightedDevCap)  && ...
              (isiM   <= budgetCap);
+    end
+
+    function keepIdx = dedupAbsorbedToPrimary(spkP, spkA, bestLag, ...
+            refrSamples, tightSamples, consistencyFrac)
+        % Identify absorbed-side spikes that are systematic double-counts
+        % of primary spikes (the same physical event detected by both
+        % templates at their respective peak/trough). Only fires when the
+        % template lag |bestLag| > 1 sample, and only flags spikes whose
+        % nearest-primary lag clusters tightly around the median (>=
+        % consistencyFrac of within-refractory absorbed spikes fall within
+        % +/- tightSamples of the median lag). Returns a logical over spkA:
+        % true = keep, false = drop as a duplicate of the primary.
+        keepIdx = true(numel(spkA), 1);
+        if abs(bestLag) <= 1, return; end
+        if isempty(spkP) || isempty(spkA), return; end
+        spkA = spkA(:); spkP = spkP(:);
+        [spkPs, ~]            = sort(spkP);
+        [spkAs, sortOrderA]   = sort(spkA);
+        nLags  = nan(numel(spkAs), 1);
+        nDists = inf(numel(spkAs), 1);
+        nP = numel(spkPs);
+        j = 1;
+        for i = 1:numel(spkAs)
+            while j < nP && spkPs(j+1) <= spkAs(i)
+                j = j + 1;
+            end
+            candDiffs = spkAs(i) - spkPs(j);
+            if j-1 >= 1
+                candDiffs(end+1) = spkAs(i) - spkPs(j-1); %#ok<AGROW>
+            end
+            if j+1 <= nP
+                candDiffs(end+1) = spkAs(i) - spkPs(j+1); %#ok<AGROW>
+            end
+            [bestAbs, mi] = min(abs(candDiffs));
+            nLags(i)      = candDiffs(mi);
+            nDists(i)     = bestAbs;
+        end
+        within = nDists <= refrSamples;
+        if sum(within) < 3, return; end
+        lags    = nLags(within);
+        medLag  = median(lags);
+        nearMed = abs(lags - medLag) <= tightSamples;
+        if sum(nearMed) / numel(lags) < consistencyFrac, return; end
+        withinIdx       = find(within);
+        dropSortedIdx   = withinIdx(nearMed);
+        dropOriginalIdx = sortOrderA(dropSortedIdx);
+        keepIdx(dropOriginalIdx) = false;
+    end
+
+    function [ok, dropRows] = attemptMergeDedupGate(primary, absorbed, ...
+            bestLag, isiAbs, isiBudget)
+        % Re-test the merged-ISI gates after stripping systematic double-
+        % counted absorbed spikes. Returns ok=true with dropRows = the
+        % indices into sortedRes.unifiedLabels that should be relabeled -1
+        % before the merge proceeds. Only attempts the rescue when the
+        % template lag |bestLag| > 1.
+        ok       = false;
+        dropRows = [];
+        if abs(bestLag) <= 1, return; end
+        labP = groupList(primary); labA = groupList(absorbed);
+        if isnan(labP) || isnan(labA), return; end
+        rowsP = find(sortedRes.unifiedLabels == labP);
+        rowsA = find(sortedRes.unifiedLabels == labA);
+        if isempty(rowsP) || isempty(rowsA), return; end
+        spkP = sortedRes.spike_idx(rowsP);
+        spkA = sortedRes.spike_idx(rowsA);
+        refrSamples = max(1, round(thresholdISI * 1e-3 * cfg.samplingFrequency));
+        keepA = dedupAbsorbedToPrimary(spkP, spkA, bestLag, refrSamples, 2, 0.75);
+        if all(keepA), return; end
+        spkA_trim = spkA(keepA);
+        NA = numel(spkP); NB = numel(spkA_trim);
+        if NA + NB < 2
+            ok = true; dropRows = rowsA(~keepA); return;
+        end
+        spkM = sort([spkP(:); spkA_trim(:)]);
+        [~,~,isiM] = getISIViolations(spkM, cfg.samplingFrequency, thresholdISI);
+        if NB >= 2
+            try
+                [~,~,isiB_new] = getISIViolations(spkA_trim, cfg.samplingFrequency, thresholdISI);
+            catch
+                isiB_new = 0;
+            end
+        else
+            isiB_new = 0;
+        end
+        isiP_cur       = preprocessed.isiViolation(primary);
+        parentCap      = isiAbs * max(isiBudget, 1);
+        denom          = max(NA + NB, 1);
+        weightedIsi    = (NA*isiP_cur + NB*isiB_new) / denom;
+        weightedDevCap = 0.5;
+        devA           = abs(isiP_cur - weightedIsi);
+        devB           = abs(isiB_new - weightedIsi);
+        sizeFactor     = 2 * min(NA, NB) / denom;
+        effBudget      = 1 + (isiBudget - 1) * sizeFactor;
+        budgetCap      = max(effBudget * weightedIsi, 1e-6);
+        pass = (isiM <= isiAbs) && (isiP_cur <= parentCap) && (isiB_new <= parentCap) && ...
+               (devA <= weightedDevCap) && (devB <= weightedDevCap) && (isiM <= budgetCap);
+        if pass
+            ok       = true;
+            dropRows = rowsA(~keepA);
+        end
     end
 
     function onSave()
@@ -8239,7 +8444,7 @@ tic
             prefs.autoIsiBudget   = autoIsiBudget;
             prefs.autoPCVal       = autoPCVal;
             prefs.autoCCGRatio    = autoCCGRatio;
-            prefs.autoLagTightMs           = autoLagTightMs;
+            prefs.autoLagTightSamples      = autoLagTightSamples;
             prefs.autoLagConsistencyFrac   = autoLagConsistencyFrac;
             prefs.autoPairType    = autoPairType;
 

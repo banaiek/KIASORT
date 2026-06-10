@@ -17,22 +17,23 @@ function postSortReport = kiaSort_post_sort_curate(outputPath, varargin)
 %          Tier 3: overlapLowFrac (0.05) <= overlap < overlapMidFrac
 %                  (0.20) AND snr < overlapMidSnr (1.5) -> strip only
 %                  the coincident spikes from the lower-SNR side
-%     1) CCG cleaning (ccg_cleaning): per-pair peak-at-zero test, then a
-%        sequence of gates before any spike is stripped:
-%          - Similar-quality gate: |SNR_i - SNR_j| must be below
-%            cleanSnrDiff (0.3). Large SNR gaps are handled by overlap
-%            removal (Phase 0), not by spike stripping.
-%          - Median-lag-near-zero gate: median signed lag of coincident
-%            spikes must lie within cleanLagTightMs of 0 -- a non-zero
-%            median means real coupling (synaptic delay), not a duplicate.
-%          - Lag-consistency gate: at least cleanLagConsistencyFrac of
-%            the coincident lags must fall within cleanLagTightMs of the
-%            median.
-%          - Strip-fraction cap: skip if removal would zero out more
-%            than cleanMaxStripFrac of the stripped unit.
-%        Within a similar-quality pair, the lower firing-rate (fewer-
-%        spike) unit's surviving consistent-lag coincident rows are
-%        labelled -1.
+%     1) Cross-unit de-duplication (ccg_cleaning): a pair that double-
+%        detects the same physical spike shows a sharp zero-lag CCG peak
+%        while both ACGs stay clean. The lower-SNR unit (contaminated)
+%        loses its coincident copies; the higher-SNR unit (owner) keeps
+%        them, so recall is preserved. Gates before any strip:
+%          - Ownership: owner = higher SNR. Equal SNR -> skip.
+%          - CCG peak-at-zero above baseline (ccgPeakRatio).
+%          - Waveform-similarity confirm: shared-channel similarity must
+%            be >= dupWaveSim (0.8) -- same waveform = same source. The
+%            same max_half_corr also gives the best-lag offset between
+%            the two units' detections (the peak-vs-trough offset).
+%          - Tight lag at the waveform offset: median signed lag within
+%            dupLagTightSamples (2) of that best-lag offset, and at least
+%            cleanLagConsistencyFrac of the coincident lags within
+%            dupLagTightSamples of the median.
+%          - Backstop: skip if removal would zero out more than
+%            cleanMaxStripFrac of the contaminated unit.
 %     2) Merge (merging): XCorr similarity + amp-similarity + PC
 %        distance + multi-gate merged-ISI; shift absorbed spike times by
 %        best-lag before relabel.
@@ -87,12 +88,14 @@ p.addParameter('thrPC',          0.30, @(x) isscalar(x) && isnumeric(x));  % aut
 p.addParameter('thrIsiAbs',      1.0,  @(x) isscalar(x) && isnumeric(x));  % max ISI %
 p.addParameter('thrIsiBudget',   1.5,  @(x) isscalar(x) && isnumeric(x));  % weighted-mean budget
 p.addParameter('thresholdISIms', 1,    @(x) isscalar(x) && isnumeric(x));  % refractory window (ms)
-p.addParameter('ccgPeakRatio',   5,   @(x) isscalar(x) && isnumeric(x));
+p.addParameter('ccgPeakRatio',   2,   @(x) isscalar(x) && isnumeric(x));
 p.addParameter('coincYUm',       100, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('cleanLagTightMs',          0.2, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('cleanLagConsistencyFrac',  0.75, @(x) isscalar(x) && isnumeric(x));
-p.addParameter('cleanSnrDiff',             0.3, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('cleanSnrDiff',             0.3, @(x) isscalar(x) && isnumeric(x));   % legacy, unused
 p.addParameter('cleanMaxStripFrac',        0.5, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('dupLagTightSamples',       2,   @(x) isscalar(x) && isnumeric(x));   % +-N sample consistency window
+p.addParameter('dupWaveSim',               0.8, @(x) isscalar(x) && isnumeric(x));   % shared-channel waveform sim (0 disables)
 p.addParameter('overlap_removal', true, @(x) islogical(x) || isnumeric(x));
 p.addParameter('overlapHighFrac', 0.50, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('overlapHighSnr',  2.0,  @(x) isscalar(x) && isnumeric(x));
@@ -438,10 +441,18 @@ if opt.overlap_removal
     end
 end
 
-% ---- Phase 1: CCG cleaning ---------------------------------------------
+% ---- Phase 1: cross-unit de-duplication --------------------------------
+% A pair that double-detects the same physical spike shows a sharp zero-
+% lag CCG peak while both ACGs stay clean. Strip the lower-SNR unit's
+% coincident copies; the higher-SNR unit (owner) keeps them, so recall is
+% preserved -- only double-counted spikes are removed, never a unit's
+% independent activity. Guards: CCG peak above baseline, high shared-
+% channel waveform similarity (same waveform = same source), and tight &
+% near-zero lag (systematic re-detection, not biology).
 nClean = 0;
 if opt.ccg_cleaning
     coincSamples = round(0.5e-3 * fs);
+    tightSamples = max(1, round(opt.dupLagTightSamples));
     ccgBin       = round(1e-3 * fs);   % 1 ms
     ccgMaxLag    = 100 * ccgBin;       % +-100 ms
     ccgZeroTol   = 1;                  % +-1 ms peak window
@@ -458,91 +469,66 @@ if opt.ccg_cleaning
             spk_j = spk_all(kjLive);
             if numel(spk_i) < 10 || numel(spk_j) < 10, continue; end
 
+            % Owner = higher SNR; contaminated = lower SNR. Equal SNR ->
+            % no clear owner, skip.
+            snr_i = 1 + unitInfo(ki).detectability; if isnan(snr_i), snr_i = 0; end
+            snr_j = 1 + unitInfo(kj).detectability; if isnan(snr_j), snr_j = 0; end
+            if snr_i == snr_j, continue; end
+            if snr_i < snr_j
+                kCont = ki; kOwn = kj; contRows = kiLive;
+                spkCont = spk_i; spkOwn = spk_j;
+            else
+                kCont = kj; kOwn = ki; contRows = kjLive;
+                spkCont = spk_j; spkOwn = spk_i;
+            end
+
+            % Coincidence above chance: sharp zero-lag CCG peak.
             [ccg, zb] = local_pairCCG(spk_i, spk_j, ccgMaxLag, ccgBin);
             if ~local_ccgPeakAtZero(ccg, zb, ccgZeroTol, opt.ccgPeakRatio)
                 continue;
             end
 
-            % Only clean pairs of similar quality: |SNR_i - SNR_j| must
-            % be below cleanSnrDiff. A large SNR gap is the domain of
-            % overlap removal (Phase 0), not spike stripping. Within a
-            % similar-quality pair the lower firing-rate (fewer-spike)
-            % unit is the likely fragment, so its coincident spikes are
-            % the ones removed.
-            snr_i = 1 + unitInfo(ki).detectability;
-            snr_j = 1 + unitInfo(kj).detectability;
-            if isnan(snr_i), snr_i = 0; end
-            if isnan(snr_j), snr_j = 0; end
-            if abs(snr_i - snr_j) >= opt.cleanSnrDiff
+            % Shared-channel waveform confirm + expected offset. A true
+            % duplicate is the same waveform on the contaminated unit's
+            % channel; co-active different neurons are not. max_half_corr
+            % also returns the best-lag offset where the coincident lags
+            % should sit -- this is what lets the same spike picked up at
+            % different peak/trough features (a non-zero but fixed offset)
+            % still register, rather than only same-feature (lag 0) doubles.
+            [simWF, waveLag] = local_pairWaveSim(unitInfo(kCont), unitInfo(kOwn));
+            if opt.dupWaveSim > 0 && (~isfinite(simWF) || simWF < opt.dupWaveSim)
                 continue;
             end
-            if numel(spk_i) <= numel(spk_j)
-                kCont     = ki;
-                contRows  = kiLive;
-                d_cont    = local_nearest_distance(spk_i, spk_j);
-                signedLag = local_signed_nearest_lag(spk_i, spk_j);
-            else
-                kCont     = kj;
-                contRows  = kjLive;
-                d_cont    = local_nearest_distance(spk_j, spk_i);
-                signedLag = local_signed_nearest_lag(spk_j, spk_i);
-            end
-            contMask = d_cont <= coincSamples;
+            expectedLag = 0;
+            if isfinite(waveLag), expectedLag = waveLag; end
+
+            % Coincident contaminated spikes within +-0.5 ms of an owner spike.
+            d_cont    = local_nearest_distance(spkCont, spkOwn);
+            signedLag = local_signed_nearest_lag(spkCont, spkOwn);
+            contMask  = d_cont <= coincSamples;
             if ~any(contMask), continue; end
 
-            % --- Timing-consistency gate -----------------------------
-            % The coincident spikes' signed lags to the nearest clean
-            % spike must cluster tightly around their median. A real
-            % duplicate (same physical spike picked up twice with a
-            % small sorter-induced offset) gives a sharp peak; random
-            % coincidence gives a broad / uniform distribution.
-            tightSamples = max(1, round(opt.cleanLagTightMs * 1e-3 * fs));
-            coincIdx     = find(contMask);
-            coincLags    = signedLag(coincIdx);
-            coincLags    = coincLags(~isnan(coincLags));
-            if numel(coincLags) < 5
-                % Too few to assess consistency reliably; skip strip.
+            % Systematic re-detection: the coincident spikes' signed lags
+            % must cluster within +-tightSamples of their median, and that
+            % median must match the waveform offset (expectedLag) -- not a
+            % random or synaptic coincidence.
+            coincIdx  = find(contMask);
+            coincLags = signedLag(coincIdx);
+            coincLags = coincLags(~isnan(coincLags));
+            if numel(coincLags) < 5, continue; end
+            medLag = median(coincLags);
+            if abs(medLag - expectedLag) > tightSamples, continue; end
+            withinTight = abs(coincLags - medLag) <= tightSamples;
+            if sum(withinTight) / numel(coincLags) < opt.cleanLagConsistencyFrac
                 continue;
             end
-            medLag         = median(coincLags);
-            % Median must also sit near zero. A non-zero median lag with
-            % consistent spread indicates a synaptic delay (real coupling),
-            % not a duplicate -- stripping it would discard real spikes.
-            if abs(medLag) > tightSamples
-                if opt.verbose
-                    fprintf(['Post-sort CCG-clean: pair (%d,%d) skipped, ' ...
-                        'median lag %.2f ms not near zero.\n'], ...
-                        unitInfo(ki).label, unitInfo(kj).label, ...
-                        1000 * medLag / fs);
-                end
-                continue;
-            end
-            withinTight    = abs(coincLags - medLag) <= tightSamples;
-            consistencyFrac = sum(withinTight) / numel(coincLags);
-            if consistencyFrac < opt.cleanLagConsistencyFrac
-                if opt.verbose
-                    fprintf(['Post-sort CCG-clean: pair (%d,%d) skipped, ' ...
-                        'lag consistency %.2f < %.2f.\n'], ...
-                        unitInfo(ki).label, unitInfo(kj).label, ...
-                        consistencyFrac, opt.cleanLagConsistencyFrac);
-                end
-                continue;
-            end
-            % Restrict the strip mask to the consistent-lag subset.
-            keepCoinc            = false(numel(signedLag), 1);
-            keepCoinc(coincIdx)  = withinTight;
-            contMask             = contMask & keepCoinc;
+            keepCoinc           = false(numel(signedLag), 1);
+            keepCoinc(coincIdx) = withinTight;
+            contMask            = contMask & keepCoinc;
             if ~any(contMask), continue; end
 
-            % Strip-fraction cap: refuse to gut the contaminated unit.
-            stripFrac = sum(contMask) / numel(contMask);
-            if stripFrac > opt.cleanMaxStripFrac
-                if opt.verbose
-                    fprintf(['Post-sort CCG-clean: pair (%d,%d) skipped, ' ...
-                        'would strip %.0f%% (cap %.0f%%).\n'], ...
-                        unitInfo(ki).label, unitInfo(kj).label, ...
-                        100*stripFrac, 100*opt.cleanMaxStripFrac);
-                end
+            % Backstop: refuse to gut the unit on a detection misfire.
+            if sum(contMask) / numel(contMask) > opt.cleanMaxStripFrac
                 continue;
             end
 
@@ -562,7 +548,7 @@ if opt.ccg_cleaning
             end
         catch ME
             if opt.verbose
-                fprintf('Post-sort CCG-clean: pair (%d,%d) failed: %s\n', ...
+                fprintf('Post-sort de-dup: pair (%d,%d) failed: %s\n', ...
                     unitInfo(ki).label, unitInfo(kj).label, ME.message);
             end
         end
@@ -847,6 +833,26 @@ half  = floor((nLoc - 1) / 2);
 localIdx = targetCh - (homeCh - half);
 if localIdx < 1 || localIdx > nLoc, return; end
 row = wf(localIdx, :);
+end
+
+
+function [s, bestLag] = local_pairWaveSim(uCont, uOwn)
+% Shared-channel waveform similarity and best-lag offset (max_half_corr)
+% between two units, measured on the contaminated unit's main channel.
+% bestLag is the expected cont->owner detection offset, so a duplicate
+% picked up at different peak/trough features still registers. [NaN, 0]
+% if either footprint can't supply a row on that channel.
+s = NaN; bestLag = 0;
+if isempty(uCont.meanWF) || isempty(uOwn.meanWF), return; end
+chC = uCont.channel; chO = uOwn.channel;
+if isnan(chC) || isnan(chO), return; end
+rC = local_rowOnChannel(uCont.meanWF, chC, chC);
+rO = local_rowOnChannel(uOwn.meanWF,  chO, chC);
+if isempty(rC) || isempty(rO) || numel(rC) ~= numel(rO) || numel(rC) < 5
+    return;
+end
+M2 = numel(rC);
+[s, bestLag] = max_half_corr(rC(:)', rO(:)', 1, M2, max(1, round(M2/4)), 0);
 end
 
 
