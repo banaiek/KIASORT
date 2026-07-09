@@ -96,6 +96,7 @@ p.addParameter('cleanSnrDiff',             0.3, @(x) isscalar(x) && isnumeric(x)
 p.addParameter('cleanMaxStripFrac',        0.5, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('dupLagTightSamples',       2,   @(x) isscalar(x) && isnumeric(x));   % +-N sample consistency window
 p.addParameter('dupWaveSim',               0.8, @(x) isscalar(x) && isnumeric(x));   % shared-channel waveform sim (0 disables)
+p.addParameter('overlapMergeSim',          0.9, @(x) isscalar(x) && isnumeric(x));   % footprint-wide sim gate for merge escalation
 p.addParameter('overlap_removal', true, @(x) islogical(x) || isnumeric(x));
 p.addParameter('overlapHighFrac', 0.50, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('overlapHighSnr',  2.0,  @(x) isscalar(x) && isnumeric(x));
@@ -443,19 +444,67 @@ end
 
 % ---- Phase 1: cross-unit de-duplication --------------------------------
 % A pair that double-detects the same physical spike shows a sharp zero-
-% lag CCG peak while both ACGs stay clean. Strip the lower-SNR unit's
-% coincident copies; the higher-SNR unit (owner) keeps them, so recall is
-% preserved -- only double-counted spikes are removed, never a unit's
-% independent activity. Guards: CCG peak above baseline, high shared-
-% channel waveform similarity (same waveform = same source), and tight &
-% near-zero lag (systematic re-detection, not biology).
+% lag CCG peak while both ACGs stay clean. Owner = higher SNR (ties broken
+% by spike count then label so equal-SNR fragments still get an owner).
+% Strip the contaminated unit's coincident copies; the owner keeps them,
+% so recall is preserved. Guards before any strip: CCG peak above
+% baseline, high shared-channel waveform similarity, and tight lag at the
+% waveform offset (systematic re-detection, not biology).
+%   Below cleanMaxStripFrac: strip the confirmed duplicate copies.
+%   Above it (mostly a duplicate): escalate to a recall-neutral MERGE --
+%   strip the coincident copies and relabel + lag-shift the survivors into
+%   the owner -- but only when a footprint-wide similarity (overlapMergeSim)
+%   AND a merged-train refractory veto both pass; otherwise leave it be.
 nClean = 0;
+% spike times can change here (Phase 1 merge escalation shifts relabelled
+% survivors) as well as in Phase 2; declare the flag + clamp bound once.
+spkChanged = false;
+maxSampAll = max(spk_all);
 if opt.ccg_cleaning
     coincSamples = round(0.5e-3 * fs);
     tightSamples = max(1, round(opt.dupLagTightSamples));
     ccgBin       = round(1e-3 * fs);   % 1 ms
     ccgMaxLag    = 100 * ccgBin;       % +-100 ms
     ccgZeroTol   = 1;                  % +-1 ms peak window
+
+    % Map the raw file (path from the saved cfg) to build genuine 2ms
+    % templates for the waveform xcorr; fall back to padding the stored
+    % 1ms template if the raw file isn't reachable.
+    rawMap = []; chanMap = []; nSampRaw = 0; rawOK = false;
+    dupHalf2 = round(1e-3 * fs);   % +-1ms -> 2ms window
+    dupCapN  = 300;                % spikes averaged per template
+    tplCache = containers.Map('KeyType', 'char', 'ValueType', 'any');
+    cfgRaw = [];
+    for i = 1:numel(sortedSamples)
+        if ~isempty(sortedSamples{i}) && isfield(sortedSamples{i}, 'cfg')
+            cfgRaw = sortedSamples{i}.cfg; break;
+        end
+    end
+    if ~isempty(cfgRaw) && isfield(cfgRaw, 'fullFilePath') ...
+            && (ischar(cfgRaw.fullFilePath) || isstring(cfgRaw.fullFilePath)) ...
+            && exist(char(cfgRaw.fullFilePath), 'file') ...
+            && isfield(cfgRaw, 'numChannels') && isfield(cfgRaw, 'dataType')
+        try
+            cfgRaw.outputFolder = outputPath;   % keep the memmap log local
+            rawMap = map_input_file(char(cfgRaw.fullFilePath), cfgRaw);
+            if isfield(chInfo, 'channel_mapping') && ~isempty(chInfo.channel_mapping)
+                chanMap = double(chInfo.channel_mapping(:));
+            else
+                chanMap = (1:cfgRaw.numChannels)';
+            end
+            if isfield(chInfo, 'num_samples') && ~isempty(chInfo.num_samples)
+                nSampRaw = double(chInfo.num_samples);
+            else
+                nSampRaw = size(rawMap.Data.data, 2);
+            end
+            rawOK = ~isempty(rawMap) && nSampRaw > 0 && ~isempty(chanMap);
+        catch ME
+            if opt.verbose
+                fprintf('Post-sort de-dup: raw map failed (%s), padding instead.\n', ME.message);
+            end
+            rawMap = []; rawOK = false;
+        end
+    end
 
     for p = 1:size(pairList, 1)
         ki = pairList(p, 1); kj = pairList(p, 2);
@@ -469,17 +518,23 @@ if opt.ccg_cleaning
             spk_j = spk_all(kjLive);
             if numel(spk_i) < 10 || numel(spk_j) < 10, continue; end
 
-            % Owner = higher SNR; contaminated = lower SNR. Equal SNR ->
-            % no clear owner, skip.
+            % Owner = higher SNR; the other side is contaminated. Ties are
+            % broken by spike count (more spikes = better-sampled owner),
+            % then by label for determinism -- so two split fragments of
+            % identical SNR still get an owner instead of being skipped.
+            % The contaminated side loses spikes only if the pair then
+            % clears every duplicate-signature gate below.
             snr_i = 1 + unitInfo(ki).detectability; if isnan(snr_i), snr_i = 0; end
             snr_j = 1 + unitInfo(kj).detectability; if isnan(snr_j), snr_j = 0; end
-            if snr_i == snr_j, continue; end
-            if snr_i < snr_j
-                kCont = ki; kOwn = kj; contRows = kiLive;
-                spkCont = spk_i; spkOwn = spk_j;
-            else
+            ownerIsI = snr_i > snr_j || (snr_i == snr_j && ...
+                (numel(spk_i) > numel(spk_j) || ...
+                 (numel(spk_i) == numel(spk_j) && unitInfo(ki).label > unitInfo(kj).label)));
+            if ownerIsI
                 kCont = kj; kOwn = ki; contRows = kjLive;
                 spkCont = spk_j; spkOwn = spk_i;
+            else
+                kCont = ki; kOwn = kj; contRows = kiLive;
+                spkCont = spk_i; spkOwn = spk_j;
             end
 
             % Coincidence above chance: sharp zero-lag CCG peak.
@@ -495,7 +550,24 @@ if opt.ccg_cleaning
             % should sit -- this is what lets the same spike picked up at
             % different peak/trough features (a non-zero but fixed offset)
             % still register, rather than only same-feature (lag 0) doubles.
-            [simWF, waveLag] = local_pairWaveSim(unitInfo(kCont), unitInfo(kOwn));
+            simWF = NaN; waveLag = 0;
+            chC = unitInfo(kCont).channel;
+            if rawOK && ~isnan(chC)
+                tC = local_getTpl2ms(tplCache, kCont, chC, spkCont, ...
+                    rawMap, chanMap, dupHalf2, nSampRaw, dupCapN);
+                tO = local_getTpl2ms(tplCache, kOwn, chC, spkOwn, ...
+                    rawMap, chanMap, dupHalf2, nSampRaw, dupCapN);
+                if ~isempty(tC) && ~isempty(tO) && numel(tC) == numel(tO) && numel(tC) > 4
+                    M2t = numel(tC);
+                    [simWF, waveLag] = max_half_corr(tC(:)', tO(:)', 1, M2t, ...
+                        max(1, round(M2t/4)), 0);
+                end
+            end
+            if ~isfinite(simWF)
+                % Raw unavailable (or too few clean snippets): pad the
+                % stored 1ms template to 2ms instead.
+                [simWF, waveLag] = local_pairWaveSim(unitInfo(kCont), unitInfo(kOwn), coincSamples);
+            end
             if opt.dupWaveSim > 0 && (~isfinite(simWF) || simWF < opt.dupWaveSim)
                 continue;
             end
@@ -527,8 +599,52 @@ if opt.ccg_cleaning
             contMask            = contMask & keepCoinc;
             if ~any(contMask), continue; end
 
-            % Backstop: refuse to gut the unit on a detection misfire.
+            % Backstop. Below the strip cap: strip the confirmed duplicate
+            % copies (recall-neutral -- owner keeps its copy). Above the
+            % cap the unit is mostly a duplicate; rather than walk away
+            % (which is what left overlapping groups behind), escalate to a
+            % recall-neutral MERGE: strip the coincident copies AND relabel
+            % the unit's remaining spikes into the owner. Two guards make
+            % the merge safe: footprint-wide waveform similarity (so two
+            % look-alike co-active cells on one channel aren't merged) and
+            % a merged-train refractory veto (a genuine two-neuron pair
+            % shows an ISI violation when combined -> merge refused).
             if sum(contMask) / numel(contMask) > opt.cleanMaxStripFrac
+                keepRows = contRows(~contMask);
+                % Post-shift survivor times (their actual timing once merged)
+                % drive the refractory veto.
+                spkKeep = spk_all(keepRows);
+                if isfinite(expectedLag) && expectedLag ~= 0 && ~isempty(spkKeep)
+                    spkKeep = min(max(spkKeep + round(expectedLag), 1), maxSampAll);
+                end
+                % Merged-train refractory veto: owner + survivors must not
+                % exceed the ISI cap (a genuine two-neuron pair would).
+                combinedM  = sort([spkOwn(:); spkKeep(:)]);
+                mergedISIok = true;
+                if numel(combinedM) >= 2
+                    try
+                        [~, ~, isiM] = getISIViolations(combinedM, fs, opt.thresholdISIms);
+                        mergedISIok = isiM <= opt.thrIsiAbs;
+                    catch
+                        mergedISIok = false;
+                    end
+                end
+                fpSim = local_footprintSim(unitInfo(kCont), unitInfo(kOwn), 2, coincSamples);
+                mergeSafe = isfinite(fpSim) && fpSim >= opt.overlapMergeSim && mergedISIok;
+                if ~mergeSafe
+                    continue;   % guards fail -> leave untouched (conservative)
+                end
+                lbl_all(contRows(contMask)) = -1;         % strip duplicate copies
+                if ~isempty(keepRows)
+                    spk_all(keepRows) = spkKeep;                 % commit lag-shift
+                    if isfinite(expectedLag) && expectedLag ~= 0
+                        spkChanged = true;
+                    end
+                    lbl_all(keepRows) = unitInfo(kOwn).label;   % relabel survivors
+                    unitInfo(kOwn).spkRows = [unitInfo(kOwn).spkRows(:); keepRows(:)];
+                end
+                unitInfo(kCont).spkRows = [];   % contaminated unit merged away
+                nClean = nClean + 1;
                 continue;
             end
 
@@ -560,7 +676,6 @@ end
 % ISI multi-gate. On pass, the absorbed side's spike times are shifted
 % by max_half_corr's bestLag before relabel.
 nMerge     = 0;
-spkChanged = false;
 mergedTo   = containers.Map('KeyType', 'double', 'ValueType', 'double');
 
 if opt.merging
@@ -836,12 +951,54 @@ row = wf(localIdx, :);
 end
 
 
-function [s, bestLag] = local_pairWaveSim(uCont, uOwn)
+function tpl = local_getTpl2ms(cache, g, ch, spk, rawMap, chanMap, half2, nSamp, capN)
+% Cached 2ms mean template (1 x 2*half2+1) for unit g on global channel
+% ch, built by averaging up to capN of the unit's spike snippets read
+% from the raw memmap. [] when ch is out of range or too few clean
+% snippets land fully inside the recording. Keyed by (g, ch) so the same
+% unit-on-channel is read once per run.
+tpl = [];
+key = sprintf('%d_%d', g, ch);
+if isKey(cache, key)
+    tpl = cache(key);
+    return;
+end
+if ch >= 1 && ch <= numel(chanMap)
+    rawRow = chanMap(ch);
+    if ~isnan(rawRow) && rawRow >= 1
+        s = round(spk(:));
+        s = s(s > half2 & s <= nSamp - half2);
+        if numel(s) >= 5
+            if numel(s) > capN
+                s = s(round(linspace(1, numel(s), capN)));
+            end
+            W   = 2*half2 + 1;
+            acc = zeros(1, W);
+            cnt = 0;
+            for ii = 1:numel(s)
+                a = s(ii) - half2;
+                acc = acc + double(rawMap.Data.data(rawRow, a:a+W-1));
+                cnt = cnt + 1;
+            end
+            if cnt >= 5, tpl = acc / cnt; end
+        end
+    end
+end
+cache(key) = tpl;
+end
+
+
+function [s, bestLag] = local_pairWaveSim(uCont, uOwn, padN)
 % Shared-channel waveform similarity and best-lag offset (max_half_corr)
 % between two units, measured on the contaminated unit's main channel.
 % bestLag is the expected cont->owner detection offset, so a duplicate
 % picked up at different peak/trough features still registers. [NaN, 0]
 % if either footprint can't supply a row on that channel.
+%
+% padN zero-pads each side of the ~1ms template (typically 0.5ms worth)
+% -> 2ms. max_half_corr's validMask ignores the zero pad, so it still
+% correlates the real core but can search +-padN of lag -- enough to
+% lock onto a peak/trough offset that the un-padded 1ms template clips.
 s = NaN; bestLag = 0;
 if isempty(uCont.meanWF) || isempty(uOwn.meanWF), return; end
 chC = uCont.channel; chO = uOwn.channel;
@@ -851,8 +1008,45 @@ rO = local_rowOnChannel(uOwn.meanWF,  chO, chC);
 if isempty(rC) || isempty(rO) || numel(rC) ~= numel(rO) || numel(rC) < 5
     return;
 end
+if nargin >= 3 && padN > 0
+    z  = zeros(padN, 1);
+    rC = [z; rC(:); z];
+    rO = [z; rO(:); z];
+end
 M2 = numel(rC);
 [s, bestLag] = max_half_corr(rC(:)', rO(:)', 1, M2, max(1, round(M2/4)), 0);
+end
+
+
+function s = local_footprintSim(uCont, uOwn, nSide, padN)
+% Mean waveform similarity across the contaminated unit's main channel
+% and +-nSide neighbours (footprint-wide), so two co-active cells that
+% merely look alike on a single shared channel do NOT clear the gate.
+% Only channels where BOTH units carry real signal are counted. NaN if
+% fewer than 2 usable channels.
+s = NaN;
+if isempty(uCont.meanWF) || isempty(uOwn.meanWF), return; end
+chC = uCont.channel; chO = uOwn.channel;
+if isnan(chC) || isnan(chO), return; end
+sims = [];
+for dc = -nSide:nSide
+    ch = chC + dc;
+    rC = local_rowOnChannel(uCont.meanWF, chC, ch);
+    rO = local_rowOnChannel(uOwn.meanWF,  chO, ch);
+    if isempty(rC) || isempty(rO) || numel(rC) ~= numel(rO) || numel(rC) < 5
+        continue;
+    end
+    if max(abs(rC)) <= eps || max(abs(rO)) <= eps, continue; end
+    if nargin >= 4 && padN > 0
+        z  = zeros(padN, 1);
+        rC = [z; rC(:); z];
+        rO = [z; rO(:); z];
+    end
+    M2 = numel(rC);
+    c  = max_half_corr(rC(:)', rO(:)', 1, M2, max(1, round(M2/4)), 0);
+    if isfinite(c), sims(end+1) = c; end %#ok<AGROW>
+end
+if numel(sims) >= 2, s = mean(sims); end
 end
 
 
