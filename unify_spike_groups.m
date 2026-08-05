@@ -65,13 +65,29 @@ for i = 1:N
     end
 end
 
+% unified.meanWaveforms grows row by row, so the full-length waveform can
+% only be used when every channel has one; otherwise lengths would clash.
+useFullWF = true;
+for i = 1:N
+    if isempty(sortedSamples{i}), continue; end
+    rel_i = sortedSamples{i}.clusteringInfo.clusterRelabeling;
+    if ~isfield(rel_i, 'newMeanWaveformsFull') || isempty(rel_i.newMeanWaveformsFull)
+        useFullWF = false;
+        break;
+    end
+end
+
 idCount = 0;
 for i = 1:N
     if isempty(sortedSamples{i}), continue; end
-    
+
     uLabs_i       = sortedSamples{i}.clusteringInfo.clusterRelabeling.newUniqueLabels;
     clusterStatus_i       = sortedSamples{i}.clusteringInfo.clusterSelection.clusterStatus;
-    waveform_i    = sortedSamples{i}.clusteringInfo.clusterRelabeling.newMeanWaveforms;
+    if useFullWF
+        waveform_i = sortedSamples{i}.clusteringInfo.clusterRelabeling.newMeanWaveformsFull;
+    else
+        waveform_i = sortedSamples{i}.clusteringInfo.clusterRelabeling.newMeanWaveforms;
+    end
     keepVec_i     = sortedSamples{i}.clusteringInfo.clusterSelection.keep;
     detectblity_i = sortedSamples{i}.clusteringInfo.clusterSelection.detectblity_val;
     mainNegativePolarity_i = sortedSamples{i}.clusteringInfo.clusterSelection.mainNegativePolarity;

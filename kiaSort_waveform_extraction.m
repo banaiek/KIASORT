@@ -45,6 +45,9 @@ end
 fs                  = cfg.samplingFrequency;
 num_channel_extract = cfg.num_channel_extract;
 spikeDuration       = round(cfg.spikeDuration * fs / 1000) + 1;
+% Overlap is judged on the clustering window so that widening
+% spikeDuration only widens what is saved, never which spikes get masked.
+clusteringDuration  = round(cfg.clusteringSpikeDuration * fs / 1000) + 1;
 jitter_gap          = round(1 * round(cfg.spikeDistance * fs / 1000));
 midPoint            = floor(spikeDuration / 2) + 1;
 middle_channel      = num_channel_extract + 1;
@@ -121,7 +124,7 @@ if num_spikes > 0
 if cancel_overlap 
     % sigmoid window to the main channel
     spike_distance = diff(main_spk_inds);
-    overlap_id = find(spike_distance < 0.75 * spikeDuration & spike_distance > jitter_gap);
+    overlap_id = find(spike_distance < 0.75 * clusteringDuration & spike_distance > jitter_gap);
     overlap_length = round(spike_distance(overlap_id)/2);
     right_spike_overlap = overlap_id;
     left_spike_overlap  = overlap_id + 1;
@@ -145,8 +148,8 @@ if cancel_overlap
             else
                 [d1, d2] = nearest_distances_nz(main_spk_inds, spk_inds_channel, jitter_gap);
             end
-            right_overlap_idx = find(d1 < 0.75 * spikeDuration );
-            left_overlap_idx  = find(d2 < 0.75 * spikeDuration );
+            right_overlap_idx = find(d1 < 0.75 * clusteringDuration );
+            left_overlap_idx  = find(d2 < 0.75 * clusteringDuration );
             right_overlap_length = round(d1(right_overlap_idx)/2);
             left_overlap_length = round(d2(left_overlap_idx)/2);
             right_mask = reshape(right_mask_lib(right_overlap_length, :), [length(right_overlap_idx), 1, spikeDuration]);

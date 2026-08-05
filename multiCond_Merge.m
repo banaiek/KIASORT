@@ -62,7 +62,7 @@ function merge_matrix = multiCond_Merge(A, options)
         normed = (A(i,:,:) - mu) / sigma;
         A_norm2D(i,:,:) = normed;
         for ch = 1:Nch
-            A_fft(i, ch, :) = fft(squeeze(normed(1, ch, :)));
+            A_fft(i, ch, :) = fft(reshape(normed(1, ch, :), T, 1));
         end
     end
 
@@ -74,9 +74,9 @@ function merge_matrix = multiCond_Merge(A, options)
 
     max_corr_sim = zeros(N, N);
     for i = 1:N
-        fi = squeeze(A_fft(i,:,:));          % Nch × T  (complex)
+        fi = reshape(A_fft(i,:,:), Nch, T);  % Nch × T  (complex)
         for j = i:N
-            fj = squeeze(A_fft(j,:,:));      % Nch × T  (complex)
+            fj = reshape(A_fft(j,:,:), Nch, T);
 
             % Cross-correlation summed over channels
             xc = sum(real(ifft(fi .* conj(fj), [], 2)), 1);   % 1 × T

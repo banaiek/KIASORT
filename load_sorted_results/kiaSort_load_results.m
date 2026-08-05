@@ -72,7 +72,7 @@ if strcmp(suffix, '_curated') && exist(curatedMat, 'file')
                 units(k).channel = c.channelNum(k);
             end
             if isfield(c, 'waveform') && size(c.waveform, 1) >= k
-                units(k).meanWaveform = squeeze(c.waveform(k, :, :));
+                units(k).meanWaveform = reshape(c.waveform(k, :, :), size(c.waveform,2), []);
             end
             if isfield(c, 'unitIsolation') && numel(c.unitIsolation) >= k
                 units(k).isolation = c.unitIsolation{k};
@@ -93,7 +93,7 @@ if exist(sortedSamp, 'file')
                 units(k).channel = u.channelID(k);
             end
             if isfield(u, 'meanWaveforms') && size(u.meanWaveforms, 1) >= k
-                units(k).meanWaveform = squeeze(u.meanWaveforms(k, :, :));
+                units(k).meanWaveform = reshape(u.meanWaveforms(k, :, :), size(u.meanWaveforms,2), []);
             end
         end
     end

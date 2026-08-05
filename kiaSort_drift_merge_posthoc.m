@@ -252,7 +252,12 @@ for u = 1:nUnits
     keptIdx = find(rel.newUniqueLabels == lbl, 1);
     if isempty(keptIdx), continue; end
 
-    unitInfo(u).meanWF = squeeze(rel.newMeanWaveforms(keptIdx, :, :));
+    if isfield(rel, 'newMeanWaveformsFull') && ~isempty(rel.newMeanWaveformsFull)
+        srcWF = rel.newMeanWaveformsFull;
+    else
+        srcWF = rel.newMeanWaveforms;
+    end
+    unitInfo(u).meanWF = reshape(srcWF(keptIdx, :, :), size(srcWF,2), []);
     if isfield(rel, 'newSampleCounts') && numel(rel.newSampleCounts) >= keptIdx
         unitInfo(u).sampleCount = rel.newSampleCounts(keptIdx);
     else
@@ -271,7 +276,16 @@ for u = 1:nUnits
         t = cat(1, t, tj);
     end
     if isempty(t) || all(t(:) == 0)
+        % tSet must stay clustering-length: every other unit's comes from
+        % templateWaveforms, and maxTemplateCorr compares them directly.
         mw = unitInfo(u).meanWF;
+        if isfield(cfg, 'clusteringSpikeDuration')
+            hw = floor(cfg.clusteringSpikeDuration * fs / (2*1000));
+            mid = floor(size(mw,2)/2) + 1;
+            if mid-hw >= 1 && mid+hw <= size(mw,2)
+                mw = mw(:, mid-hw:mid+hw);
+            end
+        end
         t = reshape(mw, 1, size(mw,1), size(mw,2));
     end
     unitInfo(u).tSet = t;

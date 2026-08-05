@@ -12,6 +12,10 @@ end
 if nargin < 3, channelMapFile = []; end
 if nargin < 4 || isempty(cfg_overrides), cfg_overrides = struct(); end
 
+% Run the headless auto-curation after sorting and write the curated
+% outputs (RES_Sorted/*_curated.h5, curated_sample.mat, curated_metrics.csv).
+run_auto_curation = false;
+
 if ~exist(dataFilePath, 'file')
     error('Input data file not found: %s', dataFilePath);
 end
@@ -62,6 +66,10 @@ if ~cfg.sort_only
 end
 
 kiaSort_main_sortData(cfg.fullFilePath, cfg.outputFolder, cfg);
+
+if run_auto_curation
+    kiaSort_auto_curate_nogui(cfg.outputFolder, cfg);
+end
 
 fprintf('Done. Results in %s\n', outputFolder);
 

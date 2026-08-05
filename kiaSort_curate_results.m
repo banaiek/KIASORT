@@ -3244,28 +3244,44 @@ refreshLabels();
                 if isnan(channelList(k)), continue; end
                 yk = ylocs(channelList(k));
 
-                % Per-neighbour test: drop k as soon as ONE single
-                % neighbour j alone accounts for > coincFrac of k's
-                % spikes (within 0.5 ms) AND k itself is genuinely
-                % low quality (SNR < 1.5). Without the SNR gate we
-                % would NaN any unit that happens to share spikes
-                % with a noisier neighbour -- including high-SNR
-                % units the user explicitly wants to keep.
-                shouldDrop = false;
-                triggerJ   = NaN;
-                threshold  = coincFrac * numel(spk_k);
+                % Contamination is measured as the UNION of k's spikes
+                % coincident with any neighbour, not the largest single
+                % neighbour: a unit whose duplicate load is spread over
+                % several neighbours is just as contaminated but trips no
+                % individual pair. The union is then corrected for the
+                % coincidence two independent trains produce by chance,
+                % which for a high-rate unit in a dense neighbourhood is
+                % substantial and would otherwise read as contamination.
+                coincAny  = false(numel(spk_k), 1);
+                pIndep    = 1;
+                bestCount = 0;
+                triggerJ  = NaN;
                 for j = 1:numGroups
                     if j == k || isnan(groupList(j)) || isnan(channelList(j)), continue; end
                     if abs(ylocs(channelList(j)) - yk) > coincYUm, continue; end
                     spk_j = sortedRes.spike_idx(sortedRes.unifiedLabels == groupList(j));
                     if isempty(spk_j), continue; end
-                    [d_kj, ~] = nearest_distances(spk_k, spk_j);
-                    if sum(d_kj <= coincSamples) > threshold
-                        shouldDrop = true;
-                        triggerJ   = j;
-                        break;
+                    [d1_kj, d2_kj] = nearest_distances(spk_k, spk_j);
+                    hit_j = min(d1_kj, d2_kj) <= coincSamples;
+                    if ~any(hit_j), continue; end
+                    coincAny = coincAny | hit_j;
+                    if sum(hit_j) > bestCount
+                        bestCount = sum(hit_j);
+                        triggerJ  = j;
                     end
+                    pj = min(1, numel(spk_j) * (2*coincSamples + 1) / max(num_Samples,1));
+                    pIndep = pIndep * (1 - pj);
                 end
+
+                aggFrac   = sum(coincAny) / numel(spk_k);
+                aggChance = 1 - pIndep;
+                excess    = (aggFrac - aggChance) / max(1 - aggChance, eps);
+                % Margin over the binomial spread of the chance model, so
+                % a unit is not dropped on a fluctuation.
+                nChance   = aggChance * numel(spk_k);
+                margin    = 4 * sqrt(max(nChance, 1));
+                shouldDrop = excess > coincFrac && ...
+                    (sum(coincAny) - nChance) > margin;
 
                 snr_k = snrAll4(k);
                 if isnan(snr_k), snr_k = 0; end

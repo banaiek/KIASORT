@@ -102,7 +102,9 @@ try
 
     window_size = cfg.num_channel_extract * 2 + 1;
     half_window = floor(window_size / 2);
-    search_window = min(round(1.5 * half_window), round(num_channels/2)-3);
+    % Floor at 1 so main-channel-only mode (half_window 0) still releases
+    % and transfers across channels; identical to 1.5*half_window for >=1.
+    search_window = min(round(1.5 * max(1, half_window)), round(num_channels/2)-3);
     release_window = 2 * search_window;
 
     chunk_duration      = cfg.sortingChunkDuration;

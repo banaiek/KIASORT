@@ -10,9 +10,11 @@ high_thr     = data.classifierInfo.highAmpThr;
 ampVal       = data.amplitude;
 
 if cfg.usePCA
-    nComp = cfg.nPCAcomp;
     centered_new_data = data.waveformNorm - data.PCA.mu;
     lowDComponents    = centered_new_data * data.PCA.coeff;
+    % The basis can hold fewer components than requested when the
+    % clustering window is narrow.
+    nComp = min(cfg.nPCAcomp, size(lowDComponents,2));
     Xinput = lowDComponents(:,1:nComp);
 else
     centered_new_data = data.waveformNorm - data.PCA.mu;

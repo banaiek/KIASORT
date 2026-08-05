@@ -290,8 +290,17 @@ for u = 1:nU
             rel = sortedSamples{ch}.clusteringInfo.clusterRelabeling;
             keptIdx = find(rel.newUniqueLabels == lL, 1);
             if ~isempty(keptIdx)
-                mw = squeeze(rel.newMeanWaveforms(keptIdx, :, :));
-                if ~isempty(mw) && ismatrix(mw)
+                % The full-length mean gives max_half_corr a wider lag
+                % search than the clustering-length one.
+                if isfield(rel, 'newMeanWaveformsFull') && ~isempty(rel.newMeanWaveformsFull)
+                    src = rel.newMeanWaveformsFull;
+                else
+                    src = rel.newMeanWaveforms;
+                end
+                % reshape, not squeeze: a single-channel footprint would
+                % otherwise come back transposed.
+                mw = reshape(src(keptIdx, :, :), size(src,2), []);
+                if ~isempty(mw)
                     unitInfo(k).meanWF = mw;
                 end
             end

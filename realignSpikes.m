@@ -1,8 +1,5 @@
 function [updatedLabels, realigned_spk_idx, realigned_waveform, changeType] = realignSpikes(labels, waveform, spk_idx, clusterRelabeling, cfg)
 
-fs = cfg.samplingFrequency;
-midPoint = floor(cfg.spikeDuration * fs/(2*1000))+1;
-spike_length = floor(cfg.clusteringSpikeDuration * fs/(2*1000));
 realigned_waveform = waveform;
 
 uniqueLabels = clusterRelabeling.originalLabels(:);
@@ -34,7 +31,5 @@ for i = 1:numLabels
         realigned_waveform(idx, :, :) = circshift(waveform(idx, :, :), lag, 3);
     end
 end
-
-realigned_waveform = realigned_waveform(:,:,midPoint-spike_length:midPoint+spike_length);
 
 end

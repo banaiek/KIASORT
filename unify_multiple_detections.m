@@ -1,6 +1,12 @@
 function [sampleFeatures, sortedSamples] = unify_multiple_detections(cfg, sampleFeatures, sortedSamples)
 middleChannelIdx = cfg.num_channel_extract + 1;
-searchChannel = round(cfg.num_channel_extract);
+if cfg.num_channel_extract == 0
+    % A 1-channel window leaves no cross-channel radius of its own, so the
+    % duplicate search needs its own reach or nothing is ever collapsed.
+    searchChannel = round(cfg.duplicateSearchChannels);
+else
+    searchChannel = round(cfg.num_channel_extract);
+end
 spikeDistance = 1.5 * cfg.spikeDistance * cfg.samplingFrequency/1000;
 overlap_thr = cfg.overlap_thr;
 numChannels = length(sortedSamples);

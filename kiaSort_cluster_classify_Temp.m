@@ -2,7 +2,6 @@ function [out, out_sampleFeatures] = kiaSort_cluster_classify_Temp(data, cfg, hp
 
 modelType               = cfg.modelType;
 method                  = cfg.method;
-sampleSpikeDuration     = cfg.spikeDuration;
 fs                      = cfg.samplingFrequency;
 clusteringSpikeDuration = cfg.clusteringSpikeDuration;
 nComp                   = cfg.umapNComp;
@@ -28,7 +27,6 @@ else
     numTemplatesPerCluster = 15;
 end
 
-midPoint = floor(sampleSpikeDuration * fs/(2*1000))+1;
 spike_length = floor(clusteringSpikeDuration * fs/(2*1000));
 spk_idx_full    = data.spk_idx_full;
 spk_ID_full     = data.spk_ID_full;
@@ -43,6 +41,9 @@ end
 
 waveform_bp_full = data.waveform_bp_full;
 waveform_bp_full(isnan(waveform_bp_full)) = 0;
+% Centre from the array itself so the crop tracks the extraction window
+% regardless of how the two durations round.
+midPoint = floor(size(waveform_bp_full,3) / 2) + 1;
 waveform = waveform_bp_full(:,:,midPoint-spike_length:midPoint+spike_length);
 [N, C, T] = size(waveform);
 midChannel = ceil(C/2);
@@ -60,8 +61,6 @@ flat_umapWaveforms = reshape(umapWaveforms, N2, C2*T2);
 
 
 
-[~, C_full, T_full] = size(waveform_bp_full);
-flattend_waveform_full = reshape(waveform_bp_full, N, C_full*T_full);
 flattend_waveform = reshape(waveform, N, C*T);
 hamWin = hamming(size(flattend_waveform,2)).^2;
 hamWin = reshape(hamWin,C,T);
@@ -94,13 +93,16 @@ else
     mean_side_waveforms = [];
 end
 
-PCA_waveform = flattend_waveform_full(:,sum(flattend_waveform_full,1)~=0);
+% Clustering features come from the clustering crop only, so widening
+% spikeDuration changes what is saved without moving any cluster.
+PCA_waveform = flattend_waveform(:,sum(flattend_waveform,1)~=0);
+nPCAcompEff  = max(1, min(nPCAcomp, size(PCA_waveform,2)));
 
 warning('off', 'stats:pca:ColRankDefX');
 warning('off', 'MATLAB:class:DynPropDuplicatesMethod');
 
 umap_out = pythonUMAP(flat_umapWaveforms,nComp);
-[PCA.coeff,PCA.score,PCA.latent,PCA.tsquared,PCA.explained,PCA.mu] = pca(PCA_waveform,'Algorithm','svd','NumComponents',nPCAcomp);
+[PCA.coeff,PCA.score,PCA.latent,PCA.tsquared,PCA.explained,PCA.mu] = pca(PCA_waveform,'Algorithm','svd','NumComponents',nPCAcompEff);
 warning(warning);
 
 PCA_score = PCA.score;
@@ -157,7 +159,7 @@ for i = 1:numUniqueClusters
     trainingLbl(clusterIdx(misMatched_ID)) = -1;
 
     if size(PCA_score, 2) >= 3
-        noise_idx = identifyOutliers(PCA_score(clusterIdx, 1:nPCAcomp));
+        noise_idx = identifyOutliers(PCA_score(clusterIdx, 1:min(nPCAcompEff, size(PCA_score,2))));
         trainingLbl(clusterIdx(noise_idx)) = -1;
     end
 end
@@ -165,11 +167,15 @@ end
 clusterSampleCounts = zeros(numUniqueClusters,1);
 
 meanClusterWaveform = zeros([numUniqueClusters, size(waveform,[2,3])]);
+% Full-length twin of meanClusterWaveform. Sorting decisions use the
+% clustering-length one; only what gets saved uses this.
+meanClusterWaveformFull = zeros([numUniqueClusters, size(waveform_bp_full,[2,3])]);
 
 for i=1:numUniqueClusters
     idx = labels==uniqueLabels(i);
     clusterSampleCounts(i) = sum(idx);
     meanClusterWaveform(i,:,:)  = mean(waveform(idx,:,:), 1, 'omitmissing');
+    meanClusterWaveformFull(i,:,:) = mean(waveform_bp_full(idx,:,:), 1, 'omitmissing');
 end
 
 % Drop small clusters whose per-spike maxima are concentrated on one
@@ -189,7 +195,9 @@ if ~isempty(sizes_valid)
         [maxPerCh, maxTimePerCh] = max(abs(waveform(idx, :, :)), [], 3);
         [~, mainCh] = max(maxPerCh, [], 2);
         modeCh = mode(mainCh);
-        if mean(mainCh == modeCh) < chanFracThr, continue; end
+        % With one channel the concentration test is vacuously true, which
+        % would reduce this rule to a bare time-jitter test.
+        if C < 2 || mean(mainCh == modeCh) < chanFracThr, continue; end
         times_on_dom = double(maxTimePerCh(mainCh == modeCh, modeCh));
         if numel(times_on_dom) < 5, continue; end
         if std(times_on_dom) <= timeJitterThr, continue; end
@@ -213,10 +221,12 @@ if ~isempty(sizes_valid)
         class_polarity      = zeros(numUniqueClusters, 1);
         clusterSampleCounts = zeros(numUniqueClusters, 1);
         meanClusterWaveform = zeros([numUniqueClusters, size(waveform, [2, 3])]);
+        meanClusterWaveformFull = zeros([numUniqueClusters, size(waveform_bp_full, [2, 3])]);
         for ii = 1:numUniqueClusters
             cMask = labels == uniqueLabels(ii);
             clusterSampleCounts(ii)     = sum(cMask);
             meanClusterWaveform(ii,:,:) = mean(waveform(cMask, :, :), 1, 'omitmissing');
+            meanClusterWaveformFull(ii,:,:) = mean(waveform_bp_full(cMask, :, :), 1, 'omitmissing');
             if uniqueLabels(ii) >= 0
                 class_polarity(ii, 1) = mode(spk_ID_full(cMask));
             end
@@ -258,7 +268,7 @@ end
 
 clusterRelabeling.originalLabels = uniqueLabels;
 clusterRelabeling.mean_side_waveforms = mean_side_waveforms;
-[clusterRelabeling] = realign_merge_Waveforms(meanClusterWaveform, clusterSampleCounts, clusterRelabeling);
+[clusterRelabeling] = realign_merge_Waveforms(meanClusterWaveform, meanClusterWaveformFull, clusterSampleCounts, clusterRelabeling);
 updatedLabels = updateLabels(labels, uniqueLabels, clusterRelabeling.newLabels);
 
 
@@ -539,13 +549,26 @@ end
 end
 
 function noise_idx = identifyOutliers(data)
+% Restored on exit so the suppression does not leak into the session.
+wsNear = warning('off', 'MATLAB:nearlySingularMatrix');
+wsSing = warning('off', 'MATLAB:singularMatrix');
+restoreWarn = onCleanup(@() warning([wsNear, wsSing])); %#ok<NASGU>
 try
     mu = mean(data, 1);
     sigma = cov(data);
-    if rcond(sigma) < 1e-10
-        sigma = sigma + eye(size(sigma)) * 1e-6;
+    % Ridge scaled to the data, then used directly: mahal() recomputes the
+    % covariance itself, so calling it here would discard the regularised
+    % sigma and invert the singular one. A cluster with fewer spikes than
+    % components is rank-deficient by construction.
+    ridge = 1e-6 * mean(diag(sigma));
+    if ~isfinite(ridge) || ridge <= 0
+        ridge = 1e-6;
     end
-    mahalDist = mahal(data, data);
+    if rcond(sigma) < 1e-10
+        sigma = sigma + eye(size(sigma)) * ridge;
+    end
+    d = data - mu;
+    mahalDist = sum((d / sigma) .* d, 2);
     threshold = chi2inv(0.975, size(data, 2));
     noise_idx = mahalDist > threshold;
 catch

@@ -99,8 +99,14 @@ out.keep = keep;
 out.max_val = maxK_val(:,1);
 out.max_channel = maxK_idx(:,1);
 out.max_channelIdx = channelIdx(maxK_idx(:,1));
-out.max_altChannel = channelIdx(maxK_idx(:,2));
-out.max_altChannel((maxK_val(:,2)-threshold_pos(maxK_idx(:,2)))<0) = 0;
+if size(maxK_idx, 2) >= 2
+    out.max_altChannel = channelIdx(maxK_idx(:,2));
+    out.max_altChannel((maxK_val(:,2)-threshold_pos(maxK_idx(:,2)))<0) = 0;
+else
+    % maxk clamps k to the dimension length, so a single-channel window
+    % yields no second-best channel. 0 is the existing "none" sentinel.
+    out.max_altChannel = zeros(size(out.max_channelIdx));
+end
 end
 
 function mask = gaussianMask(n, m, jitterGap, sigma)

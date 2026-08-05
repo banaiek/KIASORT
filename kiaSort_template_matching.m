@@ -26,11 +26,11 @@ if nValidClasses == 0
 end
 
 fs           = cfg.samplingFrequency;
-midPoint     = floor(cfg.spikeDuration * fs/(2*1000)) + 1;
 spike_length = floor(cfg.clusteringSpikeDuration * fs/(2*1000));
 
 waveform_full = data.waveform;
 waveform_full(isnan(waveform_full)) = 0;
+midPoint = floor(size(waveform_full,3) / 2) + 1;
 spikes = waveform_full(:, :, midPoint-spike_length:midPoint+spike_length);
 
 [Nspikes, ~, T_spk] = size(spikes);
