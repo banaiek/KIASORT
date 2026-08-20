@@ -121,6 +121,15 @@ if num_spikes > 0
     end
 
 
+% Overlap cancellation is wanted for sorting but not for what gets saved.
+% The copy doubles peak memory, so only take it when the waveforms are
+% actually kept -- the same flag that decides whether they reach disk.
+if isfield(cfg,'extractWaveform') && cfg.extractWaveform
+    waveform_bp_raw = waveform_bp;
+else
+    waveform_bp_raw = [];
+end
+
 if cancel_overlap 
     % sigmoid window to the main channel
     spike_distance = diff(main_spk_inds);
@@ -176,6 +185,7 @@ end
 
 
 out.waveform      = waveform_bp;
+out.waveform_raw  = waveform_bp_raw;
 out.wavformChanelIdx = wavformChanelIdx;
 out.channel_thresholds_neg = channel_thresholds_neg;
 out.channel_thresholds_pos = channel_thresholds_pos;

@@ -165,7 +165,7 @@ try
             if ch_idx == 1
                 batch_idx = 1;
                 start_ch = channel_idx(batch_idx);
-                end_ch = batch_idx * batch_ch_size;
+                end_ch = min(batch_idx * batch_ch_size, num_channels);
 
                 try
                     selected_data = batch_extract(m, chunk_limits, start_ch, end_ch, channel_mapping, channel_inclusion, cfg);
@@ -193,7 +193,7 @@ try
             elseif any(channel_idx == last_batch_channel) && last_batch_channel~=num_channels
                 batch_idx = find(channel_idx == last_batch_channel);
                 start_ch = channel_idx(batch_idx);
-                end_ch = batch_idx * batch_ch_size;
+                end_ch = min(batch_idx * batch_ch_size, num_channels);
 
                 try
                     selected_data = batch_extract(m, chunk_limits, start_ch, end_ch, channel_mapping, channel_inclusion, cfg);
@@ -291,6 +291,9 @@ try
                 waveform_channels(ch_idx) = waveOut;
                 [out_bestChannel]     = kiaSort_best_channel_detection(waveOut, 100, cfg);
                 waveOut.waveform      = waveOut.waveform(out_bestChannel.keep, :, :);
+                if isfield(waveOut,'waveform_raw') && ~isempty(waveOut.waveform_raw)
+                    waveOut.waveform_raw = waveOut.waveform_raw(out_bestChannel.keep, :, :);
+                end
                 waveOut.waveformInfo  = sortedSamples{ch_idx,1}.waveformInfo;
                 tmp_idx               = spk_idx_channels(ch_idx);
                 sorting_spk_idx       = tmp_idx(out_bestChannel.keep);
@@ -329,7 +332,7 @@ try
                     clusterSelection = sortedSamples{ch_idx, 1}.clusteringInfo.clusterSelection;
                     clusterRelabeling = sortedSamples{ch_idx, 1}.clusteringInfo.clusterRelabeling;
                     [updatedLabels, realigned_spk_idx, realigned_waveform, ~] = ...
-                        realignSpikes(predLabels, waveOut.waveform, sorting_spk_idx, clusterRelabeling, cfg);
+                        realignSpikes(predLabels, saveWF(waveOut), sorting_spk_idx, clusterRelabeling, cfg);
 
                     relabling_out = kiaSort_evaluate_labels(updatedLabels, clusterSelection, altChannels, validKeep);
                     relabling_channels(ch_idx) = relabling_out;
@@ -722,18 +725,44 @@ end
 if isfield(cfg,'postHocProcessing')
     if cfg.postHocProcessing
         if ~cfg.sort_only
-            kiaSort_drift_merge_posthoc_iterative(outputPath, ...
-                'overwrite', true, ...
-                'verbose',   false, ...
-                'mainArgs',  {'debugFigs', false});
-            try
-                kiaSort_post_sort_curate(outputPath, ...
-                    'ccg_cleaning',   true, ...
-                    'merging',        true, ...
-                    'xcorrThreshold', 0.9, ...
-                    'verbose',        false);
-            catch
+            doDrift  = ~isfield(cfg,'postHocDriftMerge') || cfg.postHocDriftMerge;
+            doMerge  = ~isfield(cfg,'postHocMerging')    || cfg.postHocMerging;
+            doRemove = ~isfield(cfg,'postHocRemoval')    || cfg.postHocRemoval;
 
+            if doDrift
+                kiaSort_drift_merge_posthoc_iterative(outputPath, ...
+                    'overwrite', true, ...
+                    'verbose',   false, ...
+                    'mainArgs',  {'debugFigs', false});
+            end
+            % Split before merging, so the merge pass gets the final set of
+            % units and can rejoin anything the split separated too eagerly.
+            if isfield(cfg,'posthocSplit') && cfg.posthocSplit
+                try
+                    kiaSort_posthoc_split(outputPath, 'verbose', false);
+                catch
+
+                end
+            end
+            if doMerge || doRemove
+                try
+                    kiaSort_post_sort_curate(outputPath, ...
+                        'ccg_cleaning',    doRemove, ...
+                        'overlap_removal', doRemove, ...
+                        'merging',         doMerge, ...
+                        'xcorrThreshold',  0.9, ...
+                        'verbose',         false);
+                catch
+
+                end
+            end
+            % Last, so SNR reflects the units that actually survived. The
+            % sample-stage detectblity is keyed by labelInChannel and is
+            % wrong for any unit that shares a sample entry with another.
+            try
+                kiaSort_recompute_snr(outputPath, 'verbose', false);
+            catch ME
+                warning('kiaSort:snrRecompute', 'SNR recompute skipped: %s', ME.message);
             end
         end
     end
@@ -924,6 +953,12 @@ end
 
 templateInfo.classLabels = sortedSample.clusteringInfo.classLabels(:);
 templateInfo.clusterStatus = sortedSample.clusteringInfo.clusterRelabeling.changeType(:);
+templateInfo.isNoiseSink = false(size(templateInfo.classLabels));
+if isfield(sortedSample.clusteringInfo, 'noiseSinkLabels') && ...
+        ~isempty(sortedSample.clusteringInfo.noiseSinkLabels)
+    templateInfo.isNoiseSink = ismember(templateInfo.classLabels, ...
+        sortedSample.clusteringInfo.noiseSinkLabels(:));
+end
 
 if isfield(sortedSample, 'classifierInfo')
     templateInfo.polarity   = sortedSample.classifierInfo.class_polarity(:);
@@ -1064,7 +1099,7 @@ if iscategorical(predLabels_fe)
 end
 
 [updatedLabels_fe, realigned_spk_idx_fe, realigned_waveform_fe, ~] = ...
-    realignSpikes(predLabels_fe, waveOut_fe.waveform, matched_idx(:), clusterRelabeling, cfg);
+    realignSpikes(predLabels_fe, saveWF(waveOut_fe), matched_idx(:), clusterRelabeling, cfg);
 
 relabling_out_fe = evaluate_labels(updatedLabels_fe, clusterSelection, validKeep_fe);
 
@@ -1631,7 +1666,7 @@ vK = vK & corrValid;
 clusterSelection  = sortedSamples{iCh, 1}.clusteringInfo.clusterSelection;
 clusterRelabeling = sortedSamples{iCh, 1}.clusteringInfo.clusterRelabeling;
 
-[uL, rIdx, rWf, ~] = realignSpikes(pL, waveOut_r.waveform, ...
+[uL, rIdx, rWf, ~] = realignSpikes(pL, saveWF(waveOut_r), ...
                       sorting_spk_idx_r, clusterRelabeling, cfg);
 
 rOut = kiaSort_evaluate_labels(uL, clusterSelection, altChannels_r, vK);
@@ -1703,4 +1738,16 @@ output_waveform(iCh)      = cat(1, output_waveform(iCh), rWf(k, :, :));
 output_amplitude(iCh)     = [output_amplitude(iCh);      amplitude_r(k)];
 output_bestVariant(iCh)   = [output_bestVariant(iCh);    recovered_varIdx(k)];
 
+end
+
+
+function wf = saveWF(waveOut)
+% Saved waveforms keep the pre-overlap-cancellation samples; matching still
+% uses the masked ones.
+if isfield(waveOut,'waveform_raw') && ~isempty(waveOut.waveform_raw) && ...
+        isequal(size(waveOut.waveform_raw), size(waveOut.waveform))
+    wf = waveOut.waveform_raw;
+else
+    wf = waveOut.waveform;
+end
 end

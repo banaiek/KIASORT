@@ -1151,6 +1151,18 @@ nodeField.UserData = 'Maximum allowed amplitude variance for merging groups.';
 nodeField = uitreenode(nodeExtConfig, 'Text', 'Amp. Var. Thr Xcorr'); % was 'ampVarThreshold'
 nodeField.UserData = 'Maximum allowed amplitude variance for merging misaligned groups.';
 
+nodeField = uitreenode(nodeExtConfig, 'Text', 'Noise Sink On'); % was 'enableNoiseSink'
+nodeField.UserData = 'Keep low-amplitude clusters that fail the ISI check, so noise lands on them instead of on real units during sorting. They are excluded from the final units.';
+
+nodeField = uitreenode(nodeExtConfig, 'Text', 'Merge Scale Strength'); % was 'mergeScaleStrength'
+nodeField.UserData = 'Tightens the merge gates when the waveform spans few channels, where two different neurons look alike. 0 disables. No effect at or above the reference width.';
+
+nodeField = uitreenode(nodeExtConfig, 'Text', 'Posthoc: Merging'); % was 'postHocMerging'
+nodeField.UserData = 'After sorting, merge units that the sorter left separate: high waveform correlation, similar amplitude, close in PC space, and a merged ISI that stays within budget.';
+
+nodeField = uitreenode(nodeExtConfig, 'Text', 'Posthoc: Bimodal Split'); % was 'posthocSplit'
+nodeField.UserData = 'After sorting, split a unit whose spike amplitudes form two separated modes. The two modes must overlap in time, and the waveforms must agree with the amplitude cut, so a drifting unit is left alone.';
+
 %% Hyperparameters
 nodeHyper = uitreenode(nodeMain, 'Text', 'Hyperparameters');
 applyColorScheme(nodeHyper, figColor);

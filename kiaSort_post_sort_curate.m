@@ -47,7 +47,7 @@ function postSortReport = kiaSort_post_sort_curate(outputPath, varargin)
 %       'merging'         (logical, true)   run Phase 2
 %       'xcorrThreshold'  (scalar, 0.9)     similarity (XCorr) cutoff
 %       'thrAmp'          (scalar, 0.15)    amplitude-similarity gate
-%       'thrPC'           (scalar, 0.30)    PC1/PC2 distance gate
+%       'thrPC'           (scalar, 0.45)    PC distance gate
 %       'thrIsiAbs'       (scalar, 1.0)     hard cap on merged ISI %%
 %       'thrIsiBudget'    (scalar, 1.5)     weighted-mean ISI budget
 %       'thresholdISIms'  (scalar, 1)       refractory window (ms) for ISI
@@ -84,7 +84,7 @@ p.addParameter('ccg_cleaning', true,  @(x) islogical(x) || isnumeric(x));
 p.addParameter('merging',      true,  @(x) islogical(x) || isnumeric(x));
 p.addParameter('xcorrThreshold', 0.9, @(x) isscalar(x) && isnumeric(x));   % thrSim (XCorr metric)
 p.addParameter('thrAmp',         0.1, @(x) isscalar(x) && isnumeric(x));  % auto-curate default
-p.addParameter('thrPC',          0.30, @(x) isscalar(x) && isnumeric(x));  % auto-curate default
+p.addParameter('thrPC',          0.45, @(x) isscalar(x) && isnumeric(x));  % calibrated once the gate actually fires
 p.addParameter('thrIsiAbs',      1.0,  @(x) isscalar(x) && isnumeric(x));  % max ISI %
 p.addParameter('thrIsiBudget',   1.5,  @(x) isscalar(x) && isnumeric(x));  % weighted-mean budget
 p.addParameter('thresholdISIms', 1,    @(x) isscalar(x) && isnumeric(x));  % refractory window (ms)
@@ -97,6 +97,12 @@ p.addParameter('cleanMaxStripFrac',        0.5, @(x) isscalar(x) && isnumeric(x)
 p.addParameter('dupLagTightSamples',       2,   @(x) isscalar(x) && isnumeric(x));   % +-N sample consistency window
 p.addParameter('dupWaveSim',               0.8, @(x) isscalar(x) && isnumeric(x));   % shared-channel waveform sim (0 disables)
 p.addParameter('overlapMergeSim',          0.9, @(x) isscalar(x) && isnumeric(x));   % footprint-wide sim gate for merge escalation
+p.addParameter('looseCorr',                0.8, @(x) isscalar(x) && isnumeric(x));   % pass-1 prefilter on the clustering means
+p.addParameter('spikeCapN',               5000, @(x) isscalar(x) && isnumeric(x));   % spikes drawn per unit for pass 2
+p.addParameter('minSpikesForMerge',         50, @(x) isscalar(x) && isnumeric(x));   % below this, fall back to the means
+p.addParameter('mergeMaxSeparability',    0.85, @(x) isscalar(x) && isnumeric(x));   % cloud-overlap gate (0.5 = chance)
+p.addParameter('mergedIsiMax',            0.20, @(x) isscalar(x) && isnumeric(x));   % refractory cap on the MERGED train
+p.addParameter('wfCacheMB',                512, @(x) isscalar(x) && isnumeric(x));   % cap on the per-unit waveform cache
 p.addParameter('overlap_removal', true, @(x) islogical(x) || isnumeric(x));
 p.addParameter('overlapHighFrac', 0.50, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('overlapHighSnr',  2.0,  @(x) isscalar(x) && isnumeric(x));
@@ -195,6 +201,14 @@ if ~isfield(ssData, 'sortedSamples') || ~isfield(ssData, 'crossChannelStats')
     return;
 end
 sortedSamples     = ssData.sortedSamples;
+% Recovered here, not inside Phase 1: the merge pass needs it too, and Phase 1
+% is skipped when ccg_cleaning is off.
+cfgRaw = [];
+for iCfg = 1:numel(sortedSamples)
+    if ~isempty(sortedSamples{iCfg}) && isfield(sortedSamples{iCfg}, 'cfg')
+        cfgRaw = sortedSamples{iCfg}.cfg; break;
+    end
+end
 crossChannelStats = ssData.crossChannelStats;
 if ~isfield(crossChannelStats, 'unified_labels')
     if opt.verbose, fprintf('Post-sort curate: unified_labels missing.\n'); end
@@ -286,10 +300,14 @@ for u = 1:nU
         lL  = unif.labelInChannel(u);
         unitInfo(k).channel = ch;
         % Pull mean waveform from sortedSamples (best-effort).
+        % Prefer the PER-UNIT template: labelInChannel is a per-channel class
+        % id, and a post-hoc split child copies its parent's, so both would
+        % resolve to the same stored waveform.
+        unitInfo(k).meanWF = local_unitTemplate(unif, u);
         try
             rel = sortedSamples{ch}.clusteringInfo.clusterRelabeling;
             keptIdx = find(rel.newUniqueLabels == lL, 1);
-            if ~isempty(keptIdx)
+            if ~isempty(keptIdx) && isempty(unitInfo(k).meanWF)
                 % The full-length mean gives max_half_corr a wider lag
                 % search than the clustering-length one.
                 if isfield(rel, 'newMeanWaveformsFull') && ~isempty(rel.newMeanWaveformsFull)
@@ -483,12 +501,6 @@ if opt.ccg_cleaning
     dupHalf2 = round(1e-3 * fs);   % +-1ms -> 2ms window
     dupCapN  = 300;                % spikes averaged per template
     tplCache = containers.Map('KeyType', 'char', 'ValueType', 'any');
-    cfgRaw = [];
-    for i = 1:numel(sortedSamples)
-        if ~isempty(sortedSamples{i}) && isfield(sortedSamples{i}, 'cfg')
-            cfgRaw = sortedSamples{i}.cfg; break;
-        end
-    end
     if ~isempty(cfgRaw) && isfield(cfgRaw, 'fullFilePath') ...
             && (ischar(cfgRaw.fullFilePath) || isstring(cfgRaw.fullFilePath)) ...
             && exist(char(cfgRaw.fullFilePath), 'file') ...
@@ -690,6 +702,27 @@ mergedTo   = containers.Map('KeyType', 'double', 'ValueType', 'double');
 if opt.merging
     chanPCA = containers.Map('KeyType','double','ValueType','any');
 
+    % One draw per unit, reused across every pair it appears in. Without it a
+    % unit is re-read once per pair (measured ~12x redundancy on a 122-unit
+    % Utah array, and far worse on a dense probe).
+    wfCache  = containers.Map('KeyType', 'double', 'ValueType', 'any');
+    wfCacheB = 0;
+    wfSrc = struct('ok', false);
+    if ~isempty(cfgRaw)
+        try
+            wfSrc = kiaSort_waveform_source(outputPath, cfgRaw, opt.verbose);
+        catch
+            wfSrc = struct('ok', false);
+        end
+    end
+    if opt.verbose
+        if wfSrc.ok
+            fprintf('Post-sort merge: judging pairs on individual spikes (%s).\n', wfSrc.mode);
+        else
+            fprintf('Post-sort merge: no waveform source, falling back to clustering means.\n');
+        end
+    end
+
     for p = 1:size(pairList, 1)
         ki = pairList(p, 1); kj = pairList(p, 2);
         try
@@ -705,28 +738,96 @@ if opt.merging
             chJ = unitInfo(kj).channel;
             if isnan(chI) || isnan(chJ), continue; end
 
+            % ---- pass 1: cheap prefilter on the clustering means -------
+            % Polarity, merged-train refractoriness and a LOOSE correlation.
+            % Nothing here reads spike waveforms, so a pair that is obviously
+            % unrelated costs nothing.
             mw1 = local_rowOnChannel(wfI, chI, chI);
             mw2 = local_rowOnChannel(wfJ, chJ, chI);
             if isempty(mw1) || isempty(mw2), continue; end
             M2 = numel(mw1);
             if M2 < 5 || numel(mw2) ~= M2, continue; end
-            maxLag = max(1, round(M2/4));
-            [simScore, bestLag] = max_half_corr(mw1(:)', mw2(:)', 1, M2, maxLag, 0);
-            if ~isfinite(simScore) || simScore < opt.xcorrThreshold, continue; end
-
-            ampDiff = local_ampSimilarity(mw1(:)', mw2(:)');
-            if ~isfinite(ampDiff) || ampDiff > opt.thrAmp, continue; end
-
-            ok = local_checkPCDistance(wfI, wfJ, chI, chJ, sortedSamples, ...
-                chanPCA, opt.thrPC);
-            if ~ok, continue; end
+            if local_peakPolarity(mw1) ~= local_peakPolarity(mw2), continue; end
 
             spkI_now = spk_all(lbl_all == labI);
             spkJ_now = spk_all(lbl_all == labJ);
             if numel(spkI_now) < 1 || numel(spkJ_now) < 1, continue; end
             ok = local_checkMergedISI(spkI_now, spkJ_now, ...
-                fs, opt.thresholdISIms, opt.thrIsiAbs, opt.thrIsiBudget);
+                fs, opt.thresholdISIms, opt.thrIsiAbs, opt.thrIsiBudget, opt.mergedIsiMax);
             if ~ok, continue; end
+
+            % Refractory cap on the merged train. Two cells cannot share a
+            % refractory period, so this separates a genuine over-split from
+            % a look-alike pair far more sharply than waveform shape does --
+            % measured on this data the two groups sit at <=0.19 and >=0.25.
+            % Kept separate from thrIsiAbs, which also caps each PARENT and
+            % would otherwise block merging a slightly contaminated unit.
+            if isfinite(opt.mergedIsiMax)
+                try
+                    [~, ~, isiMerged] = getISIViolations(sort([spkI_now(:); spkJ_now(:)]), ...
+                        fs, opt.thresholdISIms);
+                catch
+                    isiMerged = Inf;
+                end
+                if ~isfinite(isiMerged) || isiMerged > opt.mergedIsiMax, continue; end
+            end
+
+            maxLag = max(1, round(M2/4));
+            [simLoose, bestLag] = max_half_corr(mw1(:)', mw2(:)', 1, M2, maxLag, 0);
+            if ~isfinite(simLoose) || simLoose < opt.looseCorr, continue; end
+
+            % ---- pass 2: decide on the unit's OWN spikes ----------------
+            % The clustering mean is a sample-stage artefact keyed by
+            % labelInChannel, so two units can share it (a post-hoc split
+            % child inherits its parent's). Templates rebuilt from the
+            % matched spikes are per-unit by construction.
+            simScore = simLoose;
+            sepWI = []; sepWJ = []; sepLag = 0;
+            if wfSrc.ok
+                rowsI = unitInfo(ki).spkRows(lbl_all(unitInfo(ki).spkRows) == labI);
+                rowsJ = unitInfo(kj).spkRows(lbl_all(unitInfo(kj).spkRows) == labJ);
+                [WI, wfCacheB] = local_cachedWaveforms(wfCache, wfCacheB, labI, ...
+                    rowsI, wfSrc, spk_all, chn_all, opt.spikeCapN, opt.wfCacheMB);
+                [WJ, wfCacheB] = local_cachedWaveforms(wfCache, wfCacheB, labJ, ...
+                    rowsJ, wfSrc, spk_all, chn_all, opt.spikeCapN, opt.wfCacheMB);
+                if size(WI,1) >= opt.minSpikesForMerge && size(WJ,1) >= opt.minSpikesForMerge ...
+                        && size(WI,2) == size(WJ,2)
+                    eI = double(mean(WI, 1)); eJ = double(mean(WJ, 1));
+                    Me = numel(eI);
+                    [simScore, bestLag] = max_half_corr(eI, eJ, 1, Me, max(1,round(Me/4)), 0);
+                    if ~isfinite(simScore) || simScore < opt.xcorrThreshold, continue; end
+                    ampDiff = local_ampSimilarity(eI, eJ);
+                    if ~isfinite(ampDiff) || ampDiff > opt.thrAmp, continue; end
+                    % Two clouds that a clusterer cannot tell apart are one
+                    % neuron. Recovery near chance -> merge; well separated
+                    % -> two neurons, refuse.
+                    sepWI = WI; sepWJ = WJ; sepLag = bestLag;
+                else
+                    % not enough spikes to judge on waveforms -- fall back to
+                    % the mean-waveform gates rather than merging blind
+                    if simScore < opt.xcorrThreshold, continue; end
+                    ampDiff = local_ampSimilarity(mw1(:)', mw2(:)');
+                    if ~isfinite(ampDiff) || ampDiff > opt.thrAmp, continue; end
+                end
+            else
+                if simScore < opt.xcorrThreshold, continue; end
+                ampDiff = local_ampSimilarity(mw1(:)', mw2(:)');
+                if ~isfinite(ampDiff) || ampDiff > opt.thrAmp, continue; end
+            end
+
+            ok = local_checkPCDistance(wfI, wfJ, chI, chJ, sortedSamples, ...
+                chanPCA, opt.thrPC);
+            if ~ok, continue; end
+
+            % Last, and only for pairs that already agree on everything else.
+            % The clouds are aligned on bestLag first: comparing them unshifted
+            % separates them on alignment alone, which is not evidence of two
+            % neurons (a 1-sample offset scores identical populations at 1.00,
+            % and 39% of correlation-passing pairs here carry a lag).
+            if ~isempty(sepWI)
+                sepAcc = local_cloudSeparability(sepWI, sepWJ, sepLag);
+                if isfinite(sepAcc) && sepAcc > opt.mergeMaxSeparability, continue; end
+            end
 
             nI = numel(spkI_now);
             nJ = numel(spkJ_now);
@@ -754,6 +855,13 @@ if opt.merging
 
             lbl_all(lbl_all == absorbedLab) = primaryLab;
             mergedTo(absorbedLab) = primaryLab;
+            % The primary's spike set just changed (and absorbed times may
+            % have been shifted), so its cached draw is stale.
+            if primaryLab == labI, kPri = ki; kAbs = kj; else, kPri = kj; kAbs = ki; end
+            unitInfo(kPri).spkRows = [unitInfo(kPri).spkRows(:); unitInfo(kAbs).spkRows(:)];
+            unitInfo(kAbs).spkRows = [];
+            if isKey(wfCache, primaryLab),  remove(wfCache, primaryLab);  end
+            if isKey(wfCache, absorbedLab), remove(wfCache, absorbedLab); end
             nMerge = nMerge + 1;
         catch ME
             if opt.verbose
@@ -954,7 +1062,9 @@ row = [];
 if isempty(wf) || ~ismatrix(wf), return; end
 nLoc  = size(wf, 1);
 half  = floor((nLoc - 1) / 2);
-localIdx = targetCh - (homeCh - half);
+% Home channel is the CENTRE row, so it is +half+1, not +half. Without the
+% +1 a single-channel footprint resolves to row 0 and every merge gate bails.
+localIdx = targetCh - homeCh + half + 1;
 if localIdx < 1 || localIdx > nLoc, return; end
 row = wf(localIdx, :);
 end
@@ -1059,6 +1169,76 @@ if numel(sims) >= 2, s = mean(sims); end
 end
 
 
+function [W, bytesOut] = local_cachedWaveforms(cache, bytesIn, lab, rows, src, spk, chn, capN, capMB)
+% containers.Map is a handle, so the store persists in the caller. Cleared
+% wholesale once it passes the byte cap -- simpler than an eviction policy
+% and the pairs for one channel are processed together, so locality is good.
+bytesOut = bytesIn;
+if isKey(cache, lab)
+    W = cache(lab);
+    return;
+end
+W = kiaSort_read_waveforms(src, rows, spk, chn, capN);
+W = single(W);
+if bytesOut > capMB * 1e6
+    remove(cache, keys(cache));
+    bytesOut = 0;
+end
+cache(lab) = W;
+bytesOut = bytesOut + numel(W) * 4;
+end
+
+
+function pol = local_peakPolarity(w)
+% Sign of the dominant excursion. Two units with opposite polarity are not
+% the same neuron, and this costs nothing to check.
+w = w(:)';
+if isempty(w) || all(~isfinite(w)), pol = 0; return; end
+if max(w) >= abs(min(w)), pol = 1; else, pol = -1; end
+end
+
+
+function acc = local_cloudSeparability(WA, WB, lag)
+% How well a blind 2-means on the pooled spikes recovers which unit each
+% spike came from. ~0.5 means the two clouds are one population; high means
+% they are genuinely distinct. Deterministic: seeded from the group means,
+% so no RNG and no dependence on spike order.
+acc = NaN;
+nA = size(WA,1); nB = size(WB,1);
+if nA < 5 || nB < 5 || size(WA,2) ~= size(WB,2), return; end
+if nargin >= 3 && isfinite(lag) && lag ~= 0
+    T = size(WA,2); L = round(lag);
+    if abs(L) < T - 4
+        if L > 0
+            WA = WA(:, 1+L:T);  WB = WB(:, 1:T-L);
+        else
+            WA = WA(:, 1:T+L);  WB = WB(:, 1-L:T);
+        end
+    end
+end
+X = double([WA; WB]);
+X = X - mean(X, 1);
+nComp = min(5, min(size(X)) - 1);
+if nComp < 1, return; end
+try
+    [~, F] = pca(X, 'Algorithm', 'svd', 'NumComponents', nComp);
+catch
+    return;
+end
+if isempty(F) || size(F,1) < 10, return; end
+truth = [true(nA,1); false(nB,1)];
+C = [mean(F(truth,:), 1); mean(F(~truth,:), 1)];
+if any(~isfinite(C(:))), return; end
+try
+    k = kmeans(F, 2, 'Start', C, 'MaxIter', 300);
+catch
+    return;
+end
+a = mean((k == 1) == truth);
+acc = max(a, 1 - a);
+end
+
+
 function ampDiff = local_ampSimilarity(mw1, mw2)
 % Average of |peak diff|/maxAbs and |trough diff|/maxAbs. NaN if flat.
 mw1 = mw1(:)'; mw2 = mw2(:)';
@@ -1116,10 +1296,16 @@ else
 end
 
 if isempty(PC.coeff) || isempty(PC.mu), return; end
-mwA = mwA(:)'; mwB = mwB(:)';
-if numel(mwA) ~= size(PC.coeff, 1) || numel(mwB) ~= size(PC.coeff, 1)
-    return;
-end
+% The basis is fit on the CLUSTERING crop and, for a wide footprint, on the
+% flattened footprint -- while meanWF spans spikeDuration. Bailing on the
+% length mismatch left this gate permanently inert. Rebuild the vector the
+% basis expects instead. Cross-channel pairs are skipped: the two footprints
+% are centred on different channels, so flattening them is not comparable.
+Lb = size(PC.coeff, 1);
+if chI ~= chJ, return; end
+mwA = local_pcVector(wfI, Lb);
+mwB = local_pcVector(wfJ, Lb);
+if isempty(mwA) || isempty(mwB), return; end
 pcA = (mwA - PC.mu) * PC.coeff;
 pcB = (mwB - PC.mu) * PC.coeff;
 scale = max(PC.max(:));
@@ -1128,7 +1314,22 @@ ok = norm(pcA - pcB) / scale <= thr;
 end
 
 
-function ok = local_checkMergedISI(spkA, spkB, fs, threshMs, isiAbs, isiBudget)
+function v = local_pcVector(wf, Lb)
+% Vector matching the stored PCA basis: footprint centre-cropped in time to
+% Lb/nChannels samples, then flattened channel-fastest -- the order
+% reshape(waveform, N, C*T) produced when the basis was fit.
+v = [];
+if isempty(wf) || ~ismatrix(wf), return; end
+C = size(wf, 1); T = size(wf, 2);
+if C < 1 || T < 1 || mod(Lb, C) ~= 0, return; end
+Tc = Lb / C;
+if Tc > T, return; end
+o = floor((T - Tc) / 2);
+v = reshape(wf(:, o+1:o+Tc), 1, []);
+end
+
+
+function ok = local_checkMergedISI(spkA, spkB, fs, threshMs, isiAbs, isiBudget, isiFloor)
 % Multi-gate merged-ISI test: hard cap, per-parent cap, parent deviation
 % from size-weighted mean, and size-shrunk merged budget.
 ok = true;
@@ -1149,6 +1350,7 @@ if NB >= 2
     try, [~, ~, isiB] = getISIViolations(spkB, fs, threshMs); catch, isiB = 0; end
 end
 
+if nargin < 7 || isempty(isiFloor), isiFloor = 0; end
 parentCap   = isiAbs * max(isiBudget, 1);
 denom       = max(NA + NB, 1);
 weightedIsi = (NA * isiA + NB * isiB) / denom;
@@ -1159,7 +1361,11 @@ devB = abs(isiB - weightedIsi);
 
 sizeFactor = 2 * min(NA, NB) / denom;
 effBudget  = 1 + (isiBudget - 1) * sizeFactor;
-budgetCap  = max(effBudget * weightedIsi, 1e-6);
+% Absolute floor. budgetCap alone is purely relative, so two immaculate
+% parents (ISI ~0.01%) give a cap near zero and a merged unit at 0.06% --
+% clean by any standard -- is refused for exceeding 1.5x of almost nothing.
+% The floor makes it "clean in absolute terms OR no worse than the parents".
+budgetCap  = max([effBudget * weightedIsi, isiFloor, 1e-6]);
 
 ok = (isiM <= isiAbs) && ...
      (isiA <= parentCap) && ...
@@ -1168,3 +1374,19 @@ ok = (isiM <= isiAbs) && ...
      (devB <= weightedDevCap) && ...
      (isiM <= budgetCap);
 end
+
+
+function mw = local_unitTemplate(unif, u)
+% Per-unit mean waveform as (nChannels x nSamples), [] when unavailable.
+mw = [];
+if ~isfield(unif, 'meanWaveforms') || isempty(unif.meanWaveforms), return; end
+MW = unif.meanWaveforms;
+if size(MW,1) < u, return; end
+if ndims(MW) == 3
+    mw = reshape(MW(u,:,:), size(MW,2), []);
+else
+    mw = reshape(MW(u,:), 1, []);
+end
+if all(~isfinite(mw(:))) || all(mw(:) == 0), mw = []; end
+end
+

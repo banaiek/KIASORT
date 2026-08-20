@@ -65,10 +65,17 @@ if sample
     keep = midChanDev >= p_keep;
 
     % check if main channel amplitude is low and other channels are even lower
+    if isfield(cfg, 'keepAmpSnr') && ~isempty(cfg.keepAmpSnr)
+        keepAmpSnr = cfg.keepAmpSnr;
+    else
+        keepAmpSnr = 1.25;
+    end
     main_threshold = max(threshold_pos(middle_channel), threshold_neg(middle_channel));
-    main_amp_low = midChanDev < 1.25 * main_threshold;
+    main_amp_low = midChanDev < keepAmpSnr * main_threshold;
 
-    % Check if other channels are less than 80% of main channel
+    % Check if other channels are less than 80% of main channel.
+    % With a single-channel footprint there are no others, and all([]) is
+    % true, so the gate reduces to the amplitude cut alone.
     other_channels = setdiff(1:n_channels, middle_channel);
     other_amps_low = all(max_detected(:, other_channels) < 1 * midChanDev, 2);
 

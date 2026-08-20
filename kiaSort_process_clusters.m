@@ -1,8 +1,12 @@
 function [out] = kiaSort_process_clusters(meanWaveform, spikeDensity, ...
-    initLabels, labels, pca, spike_idx, mean_side_waveforms, cfg)
+    initLabels, labels, pca, spike_idx, mean_side_waveforms, cfg, sinkMask)
 
 sample_points = cfg.numSampleChunks * cfg.sampleChunkDuration * cfg.samplingFrequency;
 S = size(meanWaveform, 1);
+if nargin < 9 || isempty(sinkMask)
+    sinkMask = false(S,1);
+end
+sinkMask = logical(sinkMask(:));
 N = size(meanWaveform, 2);
 M = size(meanWaveform, 3);
 midChannel = round(N/2);
@@ -21,7 +25,8 @@ end
 % ---- Overlapping waveform detection ----
 merge_overlap = zeros(S,S);
 if ~isempty(mean_side_waveforms)
-    merge_overlap = overlapping_waveform(meanWaveform, .2, counts, .05, 1, spike_distance+1, 4, mean_side_waveforms);
+    [~, ovTol] = kiaSort_channel_scaled_thresholds(size(meanWaveform,2), [], .2, cfg);
+    merge_overlap = overlapping_waveform(meanWaveform, ovTol, counts, .05, 1, spike_distance+1, 4, mean_side_waveforms);
 end
 
 counts_merge = counts < 0.05*counts' | counts' < 0.05*counts;
@@ -43,6 +48,12 @@ adj_corrThresholdMisAlign = adjust_correlation_threshold(fullLength, validLength
 
 ampVarThreshold         = cfg.ampVarThreshold;
 ampXcorrVarThreshold    = cfg.ampXcorrVarThreshold;
+
+% N is the footprint width; a narrow one separates units poorly, so the
+% correlation and amplitude gates are tightened toward it.
+[mergeCorrThr, ampVarThreshold]      = kiaSort_channel_scaled_thresholds(N, 0.9, ampVarThreshold, cfg);
+[adj_corrThresholdMisAlign, ampXcorrVarThreshold] = ...
+    kiaSort_channel_scaled_thresholds(N, adj_corrThresholdMisAlign, ampXcorrVarThreshold, cfg);
 corrThresholdSpkDensity = cfg.corrThresholdSpkDensity;
 
 % ---- Peak-based amplitude features (vectorized setup) ----
@@ -64,7 +75,13 @@ maxAmpN2 = squeeze(mean(abs(mink(maxWave,2,3)), 3, 'omitmissing'));
 
 midV  = maxAmp(:, round(N/2));
 ranks = sum(maxAmp <= midV, 2);
-rank_merge = ~(ranks < N-3 & ranks' < N-3);
+rankThr = N - 3;
+if N < 5
+    % N-3 is below the minimum possible rank here, so the gate would be
+    % vacuously satisfied and drop out of merge2 entirely.
+    rankThr = ceil(N/2);
+end
+rank_merge = ~(ranks < rankThr & ranks' < rankThr);
 
 [~, maxMidPoint] = max(squeeze(abs(meanWaveform(:,:,round(M/2)))), [], 2);
 similarKept = (maxMidPoint == round(M/2)) == (maxMidPoint == round(M/2))';
@@ -157,6 +174,11 @@ for i = 1:S
     si = spike_idx(idx_i);
 
     for j = i:S
+        % A sink must never merge into a real class: it would inherit
+        % keep=1 and come back as a final unit.
+        if i ~= j && (sinkMask(i) || sinkMask(j))
+            continue;
+        end
         idx_j = (labels == initLabels(j)) ...
               & (spike_idx <= endIdx(j)/density_length * sample_points) ...
               & (spike_idx >= startIdx(j)/density_length * sample_points);
@@ -213,9 +235,15 @@ ameMergeDrift    = ampVar < ampXcorrVarThreshold & ampVar2 < ampXcorrVarThreshol
 
 d = diag(isi_violation);
 isi_merge = (isi_violation - max(d, d') < refrac_threshold);
-isRefr    = refractoryMatrix(spike_idx, labels, cfg.samplingFrequency, initLabels);
+labels_refr = labels;
+if any(sinkMask)
+    labels_refr(ismember(labels, initLabels(sinkMask))) = -1;
+end
+isRefr    = refractoryMatrix(spike_idx, labels_refr, cfg.samplingFrequency, initLabels);
 
-merge_matrix = multiCond_Merge(meanWaveform);
+mergeOpts = struct('corr_weight', 0.5, 'shape_weight', 0.5, ...
+                   'threshold', mergeCorrThr, 'max_shift', 15);
+merge_matrix = multiCond_Merge(meanWaveform, mergeOpts);
 
 merge1 = isi_pass & (~isRefr | isi_merge) & (merge_matrix | (XcorrMerge & ampMergeXcorr));
 merge2 = isi_pass & rank_merge & (~isRefr | isi_merge) ...
@@ -223,6 +251,10 @@ merge2 = isi_pass & rank_merge & (~isRefr | isi_merge) ...
         | (merge_feat & ampMergeFeat & counts_merge & similarKept & full_classes & midChannelVar) ...
         | (drift_based_Xcorr & ameMergeDrift));
 
+if any(sinkMask)
+    merge1(sinkMask,:) = false;  merge1(:,sinkMask) = false;
+    merge2(sinkMask,:) = false;  merge2(:,sinkMask) = false;
+end
 [newLabels, changeType, timeLagChanged] = kiaSort_merge_cluster(merge1, merge2, maxXcorrLag, initLabels, counts, 1-maxXcorrVal);
 
 for i = 1:S

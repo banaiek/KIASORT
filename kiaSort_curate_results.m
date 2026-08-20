@@ -42,6 +42,11 @@ groupList   = sampleRes.crossChannelStats.unified_labels.label;
 channelList = sampleRes.crossChannelStats.unified_labels.channelID;
 sampleWaveform = sampleRes.crossChannelStats.unified_labels.meanWaveforms;
 detectblity = sampleRes.crossChannelStats.unified_labels.detectblity;
+if isfield(sampleRes.channel_info, 'mad_Thresh')
+    chanThresh = double(sampleRes.channel_info.mad_Thresh(:));
+else
+    chanThresh = [];
+end
 mainPolarity = sampleRes.crossChannelStats.unified_labels.mainNegativePolarity;
 sidePolarity = sampleRes.crossChannelStats.unified_labels.sideNegativePolarity;
 numChannelPlot = cfg.num_channel_extract;
@@ -49,6 +54,10 @@ channelPlot = channelList + [-numChannelPlot : numChannelPlot];
 channel_mapping = sampleRes.channel_info.channel_mapping;
 chan_wave_inclusion = sampleRes.channel_info.chan_wave_inclusion;
 numGroups   = length(groupList);
+% The numbering this session is being opened against. A saved session is only
+% applicable to the same one: a post-hoc split or a label repair renumbers the
+% units without changing the spike count, so counts alone cannot tell them apart.
+baseLabels  = double(groupList(:));
 halfSpikeWaveDur = cfg.spikeDuration/2;
 numSpikeSamples = round(halfSpikeWaveDur * cfg.samplingFrequency /1000);
 spike_Xaxis = -numSpikeSamples:numSpikeSamples;
@@ -67,6 +76,10 @@ selected_order_last = [];
 % place instead of triggering a full plotWaveforms redraw. The cache
 % is populated in plotWaveforms (single-plot mode) and consumed by the
 % updateScale / updateAlphaLevel / updateLineWidth fast paths.
+% Colour-index offsets for split-created units, so a new class never
+% inherits the parent's colour when the map wraps.
+splitColorShift = containers.Map('KeyType','double','ValueType','double');
+
 wfPlotCache = struct('lines', {{}}, 'unscaledY', {{}}, ...
                      'yOff', [], 'isMain', logical([]), ...
                      'rgb', zeros(0,3), 'axis', []);
@@ -106,7 +119,7 @@ DenCenters = cell(numGroups,numGroups);
 DenCounts = cell(numGroups,numGroups);
 presence_ratio = zeros(numGroups,numGroups);
 numChannels = min(length(chan_wave_inclusion),length(channel_mapping));
-selectUnits = groupList;
+selectUnits = (1:numGroups)';
 % Unit# navigation walks the shown (nonzero-rate) groups by default; a
 % channel inclusion/exclusion filter overrides it with its own set.
 chanFilterActive = false;
@@ -174,20 +187,33 @@ try
                 nUnitSaved = numel(sess.groupList);
             end
 
+            % A session saved against a different numbering must not be
+            % applied: its labels no longer name the same units. Sessions from
+            % before this field exists fall back to the count check.
+            sameNumbering = true;
+            if isfield(sess,'baseLabels')
+                sameNumbering = isequal(double(sess.baseLabels(:)), baseLabels);
+                if ~sameNumbering
+                    fprintf(['Saved curation was made against a different unit numbering ' ...
+                             '(the sort was re-run, split or repaired since) -- ignoring it.\n']);
+                end
+            end
+
             % We can apply per-unit state when nUnitSaved >= numGroups.
             % nUnitSaved > numGroups happens when the saved session
             % had Split-created units; we extend the per-unit arrays
             % with the same NaN-original markers onSplit uses.
-            if nUnitSaved >= numGroups
+            if sameNumbering && nUnitSaved >= numGroups
                 if nUnitSaved > numGroups
                     extra = nUnitSaved - numGroups;
-                    wfShape = size(originalSampleWaveform);
+                    nCh = size(originalSampleWaveform, 2);
+                    nT  = size(originalSampleWaveform, 3);
                     originalGroupList(end+1:nUnitSaved,1)   = NaN;
                     originalChannelList(end+1:nUnitSaved,1) = NaN;
                     originalSampleWaveform(end+1:nUnitSaved,:,:) = ...
-                        nan(extra, wfShape(2), wfShape(3));
+                        nan(extra, nCh, nT);
                     sampleWaveform(end+1:nUnitSaved,:,:) = ...
-                        nan(extra, wfShape(2), wfShape(3));
+                        nan(extra, nCh, nT);
                     detectblity(end+1:nUnitSaved,1)  = 0;
                     mainPolarity(end+1:nUnitSaved,1) = false;
                     sidePolarity(end+1:nUnitSaved,1) = false;
@@ -232,7 +258,7 @@ try
             % Apply per-spike arrays only when the spike count
             % matches exactly. A re-sort would change spike count,
             % in which case we keep the freshly-loaded sortedRes.
-            if nSpikeSaved == nSpikeFile && nSpikeSaved > 0
+            if sameNumbering && nSpikeSaved == nSpikeFile && nSpikeSaved > 0
                 sortedRes.unifiedLabels = sess.spikeLabels;
                 if isfield(sess,'spikeIdx')      && numel(sess.spikeIdx)      == nSpikeFile, sortedRes.spike_idx  = sess.spikeIdx;      end
                 if isfield(sess,'spikeChannels') && numel(sess.spikeChannels) == nSpikeFile, sortedRes.channelNum = sess.spikeChannels; end
@@ -1938,6 +1964,15 @@ refreshLabels();
     function recomputeDisplayedGroups()
         mask = preprocessed.firingRate(:) > 0 & ~isnan(groupList(:));
         displayedGroups = find(mask);
+        % Order by channel. A Split appends its new unit at the end of the
+        % list, which otherwise separates it from the parent it came from
+        % and makes the two impossible to compare side by side.
+        if ~isempty(displayedGroups) && numel(channelList) >= max(displayedGroups)
+            chOrd = double(channelList(displayedGroups));
+            chOrd(~isfinite(chOrd)) = inf;
+            [~, ordCh] = sort(chOrd);
+            displayedGroups = displayedGroups(ordCh);
+        end
         totalPages = max(1, ceil(numel(displayedGroups) / PAGE_SIZE));
         if currentPage > totalPages, currentPage = totalPages; end
         % Default Unit# navigation walks exactly the shown groups, in the
@@ -2389,9 +2424,11 @@ refreshLabels();
         % crashes with "Unrecognized property 'Value' for class
         % 'matlab.graphics.GraphicsPlaceholder'". chkBoxSelect
         % carries the same logical state without that hazard.
-        sel_now  = chkBoxSelect(:) & (groupList(:) == selIdx);
-        sel_orig = chkBoxSelect(:) & (originalGroupList(:) == selIdx);
-        if ~any(sel_now) && ~any(sel_orig)
+        % selIdx is a ROW index, so test the checkbox at that row. The old
+        % form compared it against groupList / originalGroupList VALUES, which
+        % agree only while label == row -- and merging duplicates labels.
+        selOK = selIdx >= 1 && selIdx <= numel(chkBoxSelect) && chkBoxSelect(selIdx);
+        if ~selOK
             uialert(parentFig,'Inconsistent merging! Merge into one of the selected groups.','Merge Error');
             return;
         end
@@ -2745,10 +2782,30 @@ refreshLabels();
                 rowsForNewLabel = allRowsK(assignment == nc);
                 if isempty(rowsForNewLabel), continue; end
 
-                newLabel = max(groupList(~isnan(groupList))) + 1;
+                % The label has to equal the row index: plotCCG / plotISI /
+                % plotDensity take a label and use it to index groupList,
+                % mergedFlag and the per-pair caches. Deriving it from
+                % max(groupList) breaks that as soon as the highest-labelled
+                % unit has been removed -- its row goes NaN, so max drops by
+                % one while numGroups does not.
                 newK     = numGroups + 1;
+                newLabel = newK;
+                if any(groupList(~isnan(groupList)) == newLabel)
+                    % Only reachable if the invariant is already broken; a
+                    % duplicate label would mis-assign spikes, so that wins.
+                    newLabel = max(groupList(~isnan(groupList))) + 1;
+                end
 
                 groupList(newK,1)              = newLabel;
+                nMapC = size(colorMapAll,1);
+                if nMapC > 1
+                    shift = 0;
+                    while shift < nMapC && ...
+                            isequal(getGroupColor(newLabel), getGroupColor(kLabel))
+                        shift = shift + 1;
+                        splitColorShift(double(newLabel)) = shift;
+                    end
+                end
                 channelList(newK,1)            = chCenter;
                 mergedFlag(newK,1)             = false;
                 unitIsolation{newK,1}          = unitIsolation{k};
@@ -2758,14 +2815,21 @@ refreshLabels();
                 detectblity(newK,1)            = detectblity(k);
                 chkBoxSelect(newK,1)           = 1;
                 chkBoxVis(newK,1)              = 1;
+                % Inclusion masks are rebuilt from numGroups-length arrays by
+                % the filter callbacks, so they have to grow with the split.
+                rateInc(newK,1)                = true;
+                isiInc(newK,1)                 = true;
+                snrInc(newK,1)                 = true;
+                polarityInc(newK,1)            = true;
                 preprocessed.firingRate(newK,1)    = 0;
                 preprocessed.isiViolation(newK,1)  = 0;
                 preprocessed.logFiringRate(newK,1) = log(eps);
                 originalGroupList(newK,1)      = NaN;
                 originalChannelList(newK,1)    = NaN;
-                wfShape = size(sampleWaveform);
-                sampleWaveform(newK,:,:)         = nan(1, wfShape(2), wfShape(3));
-                originalSampleWaveform(newK,:,:) = nan(1, wfShape(2), wfShape(3));
+                nCh = size(sampleWaveform, 2);
+                nT  = size(sampleWaveform, 3);
+                sampleWaveform(newK,:,:)         = nan(1, nCh, nT);
+                originalSampleWaveform(newK,:,:) = nan(1, nCh, nT);
                 unitNotes{newK,1}             = sprintf('Split from G%g', kLabel);
                 channelPlot(newK,:)           = chCenter + (-numChannelPlot:numChannelPlot);
 
@@ -2784,11 +2848,36 @@ refreshLabels();
                 presence_ratio(newK,:) = 0;
                 presence_ratio(:,newK) = 0;
 
+                % Every per-unit array grew to newK, so the per-page UI handle
+                % arrays must too. They are allocated gobjects(numGroups,1) at
+                % load and only filled where a row is actually rendered, so
+                % leaving them short lets a later page reference an index past
+                % the end -- an "Index must not exceed" error out of
+                % refreshLabels. gobjects placeholders keep every existing
+                % isgraphics() guard working.
+                if numel(lblGroupHandles)       < newK, lblGroupHandles(newK,1)       = gobjects(1); end
+                if numel(lblIdHandles)          < newK, lblIdHandles(newK,1)          = gobjects(1); end
+                if numel(lblChannelHandles)     < newK, lblChannelHandles(newK,1)     = gobjects(1); end
+                if numel(groupVisCheckboxes)    < newK, groupVisCheckboxes(newK,1)    = gobjects(1); end
+                if numel(groupSelectCheckboxes) < newK, groupSelectCheckboxes(newK,1) = gobjects(1); end
+                if numel(groupRadioButtons)     < newK, groupRadioButtons(newK,1)     = gobjects(1); end
+                if numel(lblIsolation)          < newK, lblIsolation(newK,1)          = gobjects(1); end
+                if numel(lblRate)               < newK, lblRate(newK,1)               = gobjects(1); end
+                if numel(lblDetectablity)       < newK, lblDetectablity(newK,1)       = gobjects(1); end
+                if numel(lblISIViolation)       < newK, lblISIViolation(newK,1)       = gobjects(1); end
+
                 numGroups   = newK;
                 recomputeDisplayedGroups();
 
                 sortedRes.unifiedLabels(rowsForNewLabel) = newLabel;
                 sortedRes.channelNum(rowsForNewLabel)    = chCenter;
+
+                % Both children get their own SNR. Copying the parent's would
+                % give the two halves of a split unit the same number.
+                dK = unitDetectability(kLabel, channelList(k));
+                dN = unitDetectability(newLabel, chCenter);
+                if isfinite(dK), detectblity(k,1)    = dK; end
+                if isfinite(dN), detectblity(newK,1) = dN; end
 
                 nSplitDone = nSplitDone + 1;
                 newSelected(end+1) = newK; %#ok<AGROW>
@@ -3967,6 +4056,13 @@ refreshLabels();
         if numel(unitNotes)        >= idx, unitNotes(idx)        = []; end
         if numel(originalGroupList)   >= idx, originalGroupList(idx)   = []; end
         if numel(originalChannelList) >= idx, originalChannelList(idx) = []; end
+        % onSplit grows these four; without the matching shrink they stay one
+        % longer than every other per-unit array and updateIncExcCheck fails on
+        % `isiInc & rateInc & snrInc & polarityInc`.
+        if numel(rateInc)     >= idx, rateInc(idx)     = []; end
+        if numel(isiInc)      >= idx, isiInc(idx)      = []; end
+        if numel(snrInc)      >= idx, snrInc(idx)      = []; end
+        if numel(polarityInc) >= idx, polarityInc(idx) = []; end
 
         % Per-unit struct arrays inside `preprocessed`.
         if isfield(preprocessed,'firingRate') && numel(preprocessed.firingRate) >= idx
@@ -4626,6 +4722,7 @@ refreshLabels();
         curatedSamples.session.unitNotes     = unitNotes;
         curatedSamples.session.detectblity   = detectblity;
         curatedSamples.session.numGroups     = numGroups;
+        curatedSamples.session.baseLabels    = baseLabels;
         curatedSamples.session.spikeLabels   = sortedRes.unifiedLabels;
         curatedSamples.session.spikeIdx      = sortedRes.spike_idx;
         curatedSamples.session.spikeChannels = sortedRes.channelNum;
@@ -4687,11 +4784,24 @@ refreshLabels();
         drawnow;
 
         function excludeSpikes()
-            % Vectorized exclusion
+            % stable_length is in SECONDS (it is written as trialLength *
+            % fraction and clamped to trialLength); spike_idx is in samples.
+            % One window per unit: the trim lines write to the first row
+            % carrying the label, so read it back the same way, or a duplicate
+            % row left by a merge ORs the whole train back in and the trim
+            % does nothing.
+            fsHz = cfg.samplingFrequency;
+            seenLbl = [];
             for i = 1:numGroups
-                idx = find(sortedRes.unifiedLabels == groupList(i));
+                lbl = groupList(i);
+                if isnan(lbl) || ismember(lbl, seenLbl), continue; end
+                seenLbl(end+1) = lbl; %#ok<AGROW>
+                idx = find(sortedRes.unifiedLabels == lbl);
+                if isempty(idx), continue; end
                 spk_idx = sortedRes.spike_idx(idx);
-                valid_idx = spk_idx <= stable_length(i, 2) & spk_idx >= stable_length(i, 1);
+                loSamp  = stable_length(i, 1) * fsHz;
+                hiSamp  = stable_length(i, 2) * fsHz;
+                valid_idx = spk_idx >= loSamp & spk_idx <= hiSamp;
                 validSpikes(idx(valid_idx)) = 1;
             end
         end
@@ -4874,8 +4984,6 @@ refreshLabels();
 
 
     function setDistVal(val,type)
-
-disimlarityScore(15,14)
         if nargin>0
             if type == 0
                 if strcmp(distanceEstType,'XCorr')
@@ -4939,6 +5047,23 @@ disimlarityScore(15,14)
         updateIncExcCheck();
     end
 
+    function d = unitDetectability(lab, ch)
+        % SNR from the unit's own spikes against its channel's detection
+        % threshold, the same quantity kiaSort_recompute_snr writes after
+        % sorting. NaN when it cannot be measured, so callers keep the old value.
+        d = NaN;
+        if isempty(chanThresh) || ~isfinite(ch) || ch < 1 || ch > numel(chanThresh)
+            return;
+        end
+        thr = chanThresh(ch);
+        if ~isfinite(thr) || thr <= 0, return; end
+        a = abs(double(sortedRes.amplitude(sortedRes.unifiedLabels == lab)));
+        a = a(isfinite(a));
+        if isempty(a), return; end
+        d = median(a) / thr - 1;
+    end
+
+
     function setSNRIncVal(val)
         snrInc = 1+detectblity > val;
         updateIncExcCheck();
@@ -4967,11 +5092,24 @@ disimlarityScore(15,14)
         end
     end
 
+    function m = fitMask(m)
+        % The four inclusion masks are rebuilt by four independent callbacks
+        % from four different sources, so one can fall out of step with
+        % numGroups. They are one-entry-per-unit by definition; normalise
+        % rather than let a stale length kill the whole panel.
+        m = logical(m(:));
+        if numel(m) > numGroups
+            m = m(1:numGroups);
+        elseif numel(m) < numGroups
+            m(end+1:numGroups, 1) = true;
+        end
+    end
+
     function updateIncExcCheck()
         chanFilterActive = chkInclusion.Value || chkExclusion.Value;
         if chkInclusion.Value
             lastUnit = 0;
-            incChan = isiInc & rateInc & snrInc & polarityInc;
+            incChan = fitMask(isiInc) & fitMask(rateInc) & fitMask(snrInc) & fitMask(polarityInc);
             selectUnits = find(incChan);
 
             visibleGroups = currentPageVisibleGroups();
@@ -4986,7 +5124,7 @@ disimlarityScore(15,14)
             end
             
             for i = visibleGroups(:)'
-                if isgraphics(groupSelectCheckboxes(i))
+                if i <= numel(groupSelectCheckboxes) && isgraphics(groupSelectCheckboxes(i))
                     groupSelectCheckboxes(i).Value = incChan(i);
                 end
                 if chkTogVis.Value && isgraphics(groupVisCheckboxes(i))
@@ -5011,7 +5149,7 @@ disimlarityScore(15,14)
 
         if chkExclusion.Value
             lastUnit = 0;
-            exChan = ~isiInc | ~rateInc | ~snrInc & polarityInc;
+            exChan = ~fitMask(isiInc) | ~fitMask(rateInc) | ~fitMask(snrInc) & fitMask(polarityInc);
             selectUnits = find(exChan);
 
             visibleGroups = currentPageVisibleGroups();
@@ -5022,7 +5160,7 @@ disimlarityScore(15,14)
                 chkBoxVis(selectUnits) = 1;
             end
             for i = visibleGroups(:)'
-                if isgraphics(groupSelectCheckboxes(i))
+                if i <= numel(groupSelectCheckboxes) && isgraphics(groupSelectCheckboxes(i))
                     groupSelectCheckboxes(i).Value = exChan(i);
                 end
                 if chkTogVis.Value && isgraphics(groupVisCheckboxes(i))
@@ -6457,6 +6595,9 @@ disimlarityScore(15,14)
 
         repositionMultiGripHandles(panel, swapBtn, resizeBtn);
 
+        % SizeChangedFcn is ignored (and warns) while AutoResizeChildren
+        % is on; the grips are positioned by hand so it has to be off.
+        try, panel.AutoResizeChildren = 'off'; catch, end
         prevFcn = panel.SizeChangedFcn;
         panel.SizeChangedFcn = @(src,evt) chainedMultiGripResize(src, evt, prevFcn, swapBtn, resizeBtn);
     end
@@ -6619,6 +6760,26 @@ disimlarityScore(15,14)
         yNorm_adj = (yNorm ) ./ minDistanceY;
     end
 
+    function r = rowOfLabel(lbl)
+        % The plot panels are driven by effLabelVec, so they hold a unit's
+        % LABEL, while every per-unit array (groupList, mergedFlag,
+        % stable_length, ...) and every per-pair cache is keyed by ROW. Those
+        % two coincide only while unified_labels.label(i) == i, which a split
+        % or a merge breaks. Resolve once, then index by row.
+        r = NaN;
+        if isempty(lbl) || ~isfinite(lbl), return; end
+        hit = find(groupList == lbl, 1);
+        if isempty(hit) && ~isempty(originalGroupList)
+            % effLabelVec resolves a removed row (groupList NaN) through its
+            % pre-curation label, so the same labels have to resolve back here
+            % or the unit silently stops drawing.
+            nCmp = min(numel(groupList), numel(originalGroupList));
+            hit  = find(isnan(groupList(1:nCmp)) & ...
+                        originalGroupList(1:nCmp) == lbl, 1);
+        end
+        if ~isempty(hit), r = hit; end
+    end
+
     function c = getGroupColor(lbl)
         if isnan(lbl)
             c = [0.6 0.6 0.6]; % gray
@@ -6632,6 +6793,9 @@ disimlarityScore(15,14)
                 return;
             end
             idx = mod(round(lbl)-1, nMap) + 1;
+            if isKey(splitColorShift, double(lbl))
+                idx = mod(idx - 1 + splitColorShift(double(lbl)), nMap) + 1;
+            end
             c   = colorMapAll(idx,:);
         end
     end
@@ -7313,21 +7477,18 @@ tic
                 % Triggered only when needed, so the fast path on
                 % high-rate units is unaffected.
                 needed = max(0, numWaveforms - numSpikes);
-                if ~plotMean && needed > 0
-                    % Split-created units have origLab = NaN; fall back
-                    % to the current sortedRes label so we can still
-                    % find their spikes.
+                if needed > 0
+                    % Same rule as the viewport query above, so the
+                    % backfill cannot pull in spikes the viewport
+                    % correctly excluded.
                     if isnan(origLab)
                         usedLocal = spike_idx(currLabels == currLab);
-                        lookupLab = currLab;
-                        useCurrent = true;
                     else
-                        usedLocal = spike_idx(origLabels == origLab);
-                        lookupLab = origLab;
-                        useCurrent = false;
+                        usedLocal = spike_idx(origLabels == origLab & ...
+                                              currLabels == currLab);
                     end
-                    [extraWf, nAdded] = readExtraWaveforms(lookupLab, ...
-                        usedLocal, needed, chPlot, xDataRange, useCurrent);
+                    [extraWf, nAdded] = readExtraWaveforms(origLab, currLab, ...
+                        usedLocal, needed, chPlot, xDataRange);
                     if nAdded > 0
                         Waveforms = cat(1, Waveforms, extraWf);
                         numSpikes = size(Waveforms, 1);
@@ -7370,10 +7531,19 @@ tic
                     min_YAx = min(min_YAx, yChan-1);
                     max_YAx = max(max_YAx, yChan+1);
                     isMainCh = (chan == channelList(k));
-                    if isMainCh
-                        hL = plot(plotAxis, t, wf', 'Color', [c, alphaLevel], 'LineWidth', lineWidth*2);
+                    % One trace per unit in Mean mode, so it is drawn heavy
+                    % and fully opaque instead of at the per-spike settings.
+                    if plotMean
+                        wAlpha = 1;
+                        wWidth = lineWidth * 5;
                     else
-                        hL = plot(plotAxis, t, wf', 'Color', [c, alphaLevel], 'LineWidth', lineWidth);
+                        wAlpha = alphaLevel;
+                        wWidth = lineWidth;
+                    end
+                    if isMainCh
+                        hL = plot(plotAxis, t, wf', 'Color', [c, wAlpha], 'LineWidth', wWidth*2);
+                    else
+                        hL = plot(plotAxis, t, wf', 'Color', [c, wAlpha], 'LineWidth', wWidth);
                     end
                     if canFastPath
                         % wfRaw already has ampScale baked in; divide it
@@ -7424,18 +7594,17 @@ tic
     toc
     end
 
-    function [extraWf, nAdded] = readExtraWaveforms(origLab, alreadyUsedLocal, needed, chPlot, xDataRangeIn, useCurrent)
+    function [extraWf, nAdded] = readExtraWaveforms(origLab, currLab, alreadyUsedLocal, needed, chPlot, xDataRangeIn)
         % Read additional spike waveforms for a low-rate unit when the
         % current viewport does not contain enough spikes. Each chunk
         % is read with a filter pad so bandpass_filter_GUI does not
         % introduce edge ringing inside the spike window. Returns an
         % (nAdded × numel(chPlot) × numel(spike_Xaxis)) array.
         %
-        % useCurrent (optional, default false): when true, search
-        % sortedRes.unifiedLabels for origLab instead of
-        % originalUnifiedLabels. Used for Split-created units, whose
-        % originalUnifiedLabels never carried the new label.
-        if nargin < 6, useCurrent = false; end
+        % Rows must still CARRY currLab, otherwise a parent that has been
+        % split pulls back the spikes it just handed to the child. Split-
+        % created units have origLab = NaN (they did not exist pre-curation)
+        % so they resolve on the current label alone.
         nAdded  = 0;
         extraWf = zeros(0, numel(chPlot), numel(spike_Xaxis));
         if needed <= 0, return; end
@@ -7450,11 +7619,11 @@ tic
         % count exceeded the viewport, this helper backfilled
         % from anywhere in the recording -- including the rows
         % the cleanup had stripped).
-        if useCurrent
-            allSpkK = sortedRes.spike_idx(sortedRes.unifiedLabels == origLab);
+        if isnan(origLab)
+            allSpkK = sortedRes.spike_idx(sortedRes.unifiedLabels == currLab);
         else
             allSpkK = sortedRes.spike_idx(originalUnifiedLabels == origLab & ...
-                                          sortedRes.unifiedLabels ~= -1);
+                                          sortedRes.unifiedLabels == currLab);
         end
         allSpkK = allSpkK(allSpkK > numSpikeSamples & ...
                           allSpkK <= num_Samples - numSpikeSamples);
@@ -7536,21 +7705,23 @@ tic
 
                     groupID_i = (plotingGroups(iCCG));
                     groupID_j = (plotingGroups(jCCG));
-                    if groupID_i>0 && groupID_j>0
-                        c = getGroupColor(groupList(groupID_i));
+                    rowI = rowOfLabel(groupID_i);
+                    rowJ = rowOfLabel(groupID_j);
+                    if groupID_i>0 && groupID_j>0 && ~isnan(rowI) && ~isnan(rowJ)
+                        c = getGroupColor(groupID_i);
 
-                        if isempty(xcorr_vals{groupID_i,groupID_j}) || mergedFlag(groupID_i) || mergedFlag(groupID_j)
+                        if isempty(xcorr_vals{rowI,rowJ}) || mergedFlag(rowI) || mergedFlag(rowJ)
                             spike_idx_i = sortedRes.spike_idx(sortedRes.unifiedLabels == groupID_i);
                             spike_idx_j = sortedRes.spike_idx(sortedRes.unifiedLabels == groupID_j);
-                            xcorr_vals{groupID_i,groupID_j} = binary_xcorr(spike_idx_i, spike_idx_j, num_Samples, cfg.samplingFrequency, 1000, ccgLag, ccgStep, smoothN);
+                            xcorr_vals{rowI,rowJ} = binary_xcorr(spike_idx_i, spike_idx_j, num_Samples, cfg.samplingFrequency, 1000, ccgLag, ccgStep, smoothN);
                             if iCCG == jCCG
-                                xcorr_vals{groupID_i,groupID_j}(ccgLag+1-2*smoothN : ccgLag+1+2*smoothN) = 0;
+                                xcorr_vals{rowI,rowJ}(ccgLag+1-2*smoothN : ccgLag+1+2*smoothN) = 0;
                             end
                         end
 
-                        tiledAX{iCCG,jCCG} = nexttile(tileforCCG);
+                        tiledAX{iCCG,jCCG} = nexttile(tileforCCG, (iCCG-1)*numCCG + jCCG);
                         applyColorScheme(tiledAX{iCCG,jCCG}, figColor);
-                        bar(tiledAX{iCCG,jCCG},-ccgLag:ccgStep:ccgLag,xcorr_vals{groupID_i,groupID_j},'facecolor',c,'edgecolor',c)
+                        bar(tiledAX{iCCG,jCCG},-ccgLag:ccgStep:ccgLag,xcorr_vals{rowI,rowJ},'facecolor',c,'edgecolor',c)
                         if groupID_i == groupID_j
                             title(tiledAX{iCCG,jCCG}, sprintf('G%g',...
                                 groupID_i),'color',1-figColor);
@@ -7601,9 +7772,11 @@ tic
 
                     groupID_i = (plotingGroups(iISI));
                     groupID_j = (plotingGroups(jISI));
-                    if groupID_i>0 && groupID_j>0
-                        c = getGroupColor(groupList(groupID_i));
-                        if isempty(isiCounts{groupID_i,groupID_j}) || mergedFlag(groupID_i) || mergedFlag(groupID_j)
+                    rowI = rowOfLabel(groupID_i);
+                    rowJ = rowOfLabel(groupID_j);
+                    if groupID_i>0 && groupID_j>0 && ~isnan(rowI) && ~isnan(rowJ)
+                        c = getGroupColor(groupID_i);
+                        if isempty(isiCounts{rowI,rowJ}) || mergedFlag(rowI) || mergedFlag(rowJ)
                             spike_idx_i = sortedRes.spike_idx(sortedRes.unifiedLabels == groupID_i);
                             spike_idx_j = sortedRes.spike_idx(sortedRes.unifiedLabels == groupID_j);
                             if iISI==jISI
@@ -7612,31 +7785,31 @@ tic
                                 spike_idx = [unique(spike_idx_i); unique(spike_idx_j)];
                             end
 
-                            [isiCounts{groupID_i,groupID_j}, isiCenters{groupID_i,groupID_j}, isiViolations(groupID_i,groupID_j)] = getISIViolations(spike_idx, cfg.samplingFrequency , thresholdISI);
+                            [isiCounts{rowI,rowJ}, isiCenters{rowI,rowJ}, isiViolations(rowI,rowJ)] = getISIViolations(spike_idx, cfg.samplingFrequency , thresholdISI);
                         end
 
-                        tiledAX{iISI,jISI} = nexttile(tileforISI);
+                        tiledAX{iISI,jISI} = nexttile(tileforISI, (iISI-1)*numISI + jISI);
                         applyColorScheme(tiledAX{iISI,jISI}, figColor);
-                        b = bar(tiledAX{iISI,jISI},isiCenters{groupID_i,groupID_j},isiCounts{groupID_i,groupID_j},...
+                        b = bar(tiledAX{iISI,jISI},isiCenters{rowI,rowJ},isiCounts{rowI,rowJ},...
                             'FaceColor','flat','edgecolor','flat');
                         b.CData(1,:) = [1 .1 .1];
-                        b.CData(2:end,:) = repmat(c,[length(isiCenters{groupID_i,groupID_j})-1,1]);
+                        b.CData(2:end,:) = repmat(c,[length(isiCenters{rowI,rowJ})-1,1]);
                         b.LineWidth = 5 * thresholdISI/1000;
 
                         if thresholdISI > 1
 
-                            if isiViolations(groupID_i,groupID_j)< 1
+                            if isiViolations(rowI,rowJ)< 1
                                 isiColor = 1-figColor;
-                            elseif isiViolations(groupID_i,groupID_j)>= 1 && isiViolations(groupID_i,groupID_j) < 2.5
+                            elseif isiViolations(rowI,rowJ)>= 1 && isiViolations(rowI,rowJ) < 2.5
                                 isiColor = [.8 .5 .15];
                             else
                                 isiColor = [.8 .15 .15];
                             end
 
                         else
-                            if isiViolations(groupID_i,groupID_j)< .25
+                            if isiViolations(rowI,rowJ)< .25
                                 isiColor = 1-figColor;
-                            elseif isiViolations(groupID_i,groupID_j)>= .25 && isiViolations(groupID_i,groupID_j) < 0.5
+                            elseif isiViolations(rowI,rowJ)>= .25 && isiViolations(rowI,rowJ) < 0.5
                                 isiColor = [.8 .5 .15];
                             else
                                 isiColor = [.8 .15 .15];
@@ -7645,10 +7818,10 @@ tic
 
                         if iISI == jISI
                             title(tiledAX{iISI,jISI}, sprintf('G%g:  %.2f%%',...
-                                groupID_i,isiViolations(groupID_i,groupID_j)),'color',isiColor);
+                                groupID_i,isiViolations(rowI,rowJ)),'color',isiColor);
                         else
                             title(tiledAX{iISI,jISI}, sprintf('%.2f%%',...
-                                isiViolations(groupID_i,groupID_j)),'color',isiColor);
+                                isiViolations(rowI,rowJ)),'color',isiColor);
                         end
                         axis(tiledAX{iISI,jISI},'tight','off')
                     end
@@ -7914,9 +8087,11 @@ tic
 
                     groupID_i = plotingGroups(iDen);
                     groupID_j = plotingGroups(jDen);
-                    if groupID_i > 0 && groupID_j > 0
-                        c = getGroupColor(groupList(groupID_i));
-                        if isempty(DenCounts{groupID_i, groupID_j}) || mergedFlag(groupID_i) || mergedFlag(groupID_j)
+                    rowI = rowOfLabel(groupID_i);
+                    rowJ = rowOfLabel(groupID_j);
+                    if groupID_i > 0 && groupID_j > 0 && ~isnan(rowI) && ~isnan(rowJ)
+                        c = getGroupColor(groupID_i);
+                        if isempty(DenCounts{rowI, rowJ}) || mergedFlag(rowI) || mergedFlag(rowJ)
                             spike_idx_i = sortedRes.spike_idx(sortedRes.unifiedLabels == groupID_i);
                             spike_idx_j = sortedRes.spike_idx(sortedRes.unifiedLabels == groupID_j);
                             if iDen == jDen
@@ -7924,29 +8099,29 @@ tic
                             else
                                 spike_idx = [unique(spike_idx_i); unique(spike_idx_j)];
                             end
-                            [DenCenters{groupID_i, groupID_j}, DenCounts{groupID_i, groupID_j}, presence_ratio(groupID_i, groupID_j)] = ...
+                            [DenCenters{rowI, rowJ}, DenCounts{rowI, rowJ}, presence_ratio(rowI, rowJ)] = ...
                                 presenceRatio(spike_idx, cfg.samplingFrequency, trialLength, max(1, round(trialLength/(2*ccgLag))), smoothN);
                         end
 
-                        tiledAX{iDen,jDen} = nexttile(tileforDen);
+                        tiledAX{iDen,jDen} = nexttile(tileforDen, (iDen-1)*numDen + jDen);
                         applyColorScheme(tiledAX{iDen,jDen}, figColor);
                         set(tiledAX{iDen,jDen}, 'Color', figColor);  % Ensure background color is figColor
 
-                        b = bar(tiledAX{iDen,jDen}, DenCenters{groupID_i, groupID_j}, DenCounts{groupID_i, groupID_j},...
+                        b = bar(tiledAX{iDen,jDen}, DenCenters{rowI, rowJ}, DenCounts{rowI, rowJ},...
                             'FaceColor', c, 'EdgeColor', c);
 
-                        if presence_ratio(groupID_i, groupID_j) > 0.9
+                        if presence_ratio(rowI, rowJ) > 0.9
                             DenColor = 1 - figColor;
-                        elseif presence_ratio(groupID_i, groupID_j) >= 0.5 && presence_ratio(groupID_i, groupID_j) < 0.9
+                        elseif presence_ratio(rowI, rowJ) >= 0.5 && presence_ratio(rowI, rowJ) < 0.9
                             DenColor = [.8 .5 .15];
                         else
                             DenColor = [.8 .15 .15];
                         end
 
                         if iDen == jDen
-                            title(tiledAX{iDen,jDen}, sprintf('G%g: %.2f', groupID_i, presence_ratio(groupID_i, groupID_j)), 'color', DenColor);
+                            title(tiledAX{iDen,jDen}, sprintf('G%g: %.2f', groupID_i, presence_ratio(rowI, rowJ)), 'color', DenColor);
                         else
-                            title(tiledAX{iDen,jDen}, sprintf('%.2f', presence_ratio(groupID_i, groupID_j)), 'color', DenColor);
+                            title(tiledAX{iDen,jDen}, sprintf('%.2f', presence_ratio(rowI, rowJ)), 'color', DenColor);
                         end
 
                         % For diagonal plots, add the interactive red vertical line
@@ -7954,8 +8129,8 @@ tic
                             hold(tiledAX{iDen,jDen}, 'on');
                             yl = get(tiledAX{iDen,jDen}, 'YLim');
                             set(tiledAX{iDen,jDen}, 'XLimMode', 'manual', 'YLimMode', 'manual');
-                            default_x1 = stable_length(groupID_i,1) * DenCenters{groupID_i, groupID_j}(end) / trialLength;
-                            default_x2 = stable_length(groupID_i,2) * DenCenters{groupID_i, groupID_j}(end) / trialLength;
+                            default_x1 = stable_length(rowI,1) * DenCenters{rowI, rowJ}(end) / trialLength;
+                            default_x2 = stable_length(rowI,2) * DenCenters{rowI, rowJ}(end) / trialLength;
                             pos1 = [default_x1, yl(1); default_x1, yl(2)];
                             pos2 = [default_x2, yl(1); default_x2, yl(2)];
                             hGreenLine = imline(tiledAX{iDen,jDen}, pos1);
@@ -7965,11 +8140,11 @@ tic
                             hLine = findobj(hRedLine, 'Type', 'line');
                             set(hLine, 'LineWidth', 2);
                             setPositionConstraintFcn(hGreenLine, @(pos) [pos(1,1) yl(1); pos(1,1) yl(2)]);
-                            addNewPositionCallback(hGreenLine, @(p) greenLineCallback(p, groupID_i));
+                            addNewPositionCallback(hGreenLine, @(p) greenLineCallback(p, rowI));
                             setPositionConstraintFcn(hRedLine, @(pos) [pos(1,1) yl(1); pos(1,1) yl(2)]);
-                            addNewPositionCallback(hRedLine, @(p) redLineCallback(p, groupID_i));
+                            addNewPositionCallback(hRedLine, @(p) redLineCallback(p, rowI));
                             hold(tiledAX{iDen,jDen}, 'off');
-                            xlim(tiledAX{iDen,jDen},[min(DenCenters{groupID_i, groupID_j})-range(DenCenters{groupID_i, groupID_j})/20 max(DenCenters{groupID_i, groupID_j})+range(DenCenters{groupID_i, groupID_j})/20]);
+                            xlim(tiledAX{iDen,jDen},[min(DenCenters{rowI, rowJ})-range(DenCenters{rowI, rowJ})/20 max(DenCenters{rowI, rowJ})+range(DenCenters{rowI, rowJ})/20]);
                             % Hide axis lines, ticks and labels.
                             % The bars, title and the interactive
                             % imlines stay visible because they're
@@ -7980,7 +8155,7 @@ tic
                             xlabel(tiledAX{iDen,jDen},'');
                             ylabel(tiledAX{iDen,jDen},'');
                         else
-                            xlim(tiledAX{iDen,jDen},[min(DenCenters{groupID_i, groupID_j})-range(DenCenters{groupID_i, groupID_j})/20 max(DenCenters{groupID_i, groupID_j})+range(DenCenters{groupID_i, groupID_j})/20]);
+                            xlim(tiledAX{iDen,jDen},[min(DenCenters{rowI, rowJ})-range(DenCenters{rowI, rowJ})/20 max(DenCenters{rowI, rowJ})+range(DenCenters{rowI, rowJ})/20]);
                             axis(tiledAX{iDen,jDen},'off')
                         end
                         set(tiledAX{iDen,jDen}, 'Color', figColor);
@@ -7991,32 +8166,39 @@ tic
         end
 
 
-        function greenLineCallback(pos, group_idx)
+        function greenLineCallback(pos, rowIdx)
+            % rowIdx is a ROW, not a label: stable_length and the density
+            % caches are row-keyed, and plotDensity resolves the label for us.
             new_x = pos(1,1);
-            fprintf('New x position for group %d: %f\n', group_idx, new_x);
-            if new_x > DenCenters{group_idx, group_idx}(end)
-                new_x = DenCenters{group_idx, group_idx}(end);
+            fprintf('New x position for row %d: %f\n', rowIdx, new_x);
+            if new_x > DenCenters{rowIdx, rowIdx}(end)
+                new_x = DenCenters{rowIdx, rowIdx}(end);
             end
-            stable_length(group_idx,1) = trialLength * (new_x-DenCenters{group_idx, group_idx}(1)) / DenCenters{group_idx, group_idx}(end);
+            % Must invert exactly what the redraw does (default_x1 =
+            % stable_length * DenCenters(end) / trialLength). Subtracting the
+            % first bin centre here but not adding it back there shifted the
+            % line left by DenCenters(1) on every redraw. Red is the correct
+            % pairing; green now matches it.
+            stable_length(rowIdx,1) = trialLength * new_x / DenCenters{rowIdx, rowIdx}(end);
 
-            if stable_length(group_idx,1) > trialLength
-                stable_length(group_idx,1) = trialLength;
-            elseif stable_length(group_idx,1) < 1
-                stable_length(group_idx,1) = 1;
+            if stable_length(rowIdx,1) > trialLength
+                stable_length(rowIdx,1) = trialLength;
+            elseif stable_length(rowIdx,1) < 1
+                stable_length(rowIdx,1) = 1;
             end
         end
 
-        function redLineCallback(pos, group_idx)
+        function redLineCallback(pos, rowIdx)
             new_x = pos(1,1);
-            fprintf('New x position for group %d: %f\n', group_idx, new_x);
-            if new_x > DenCenters{group_idx, group_idx}(end)
-                new_x = DenCenters{group_idx, group_idx}(end);
+            fprintf('New x position for row %d: %f\n', rowIdx, new_x);
+            if new_x > DenCenters{rowIdx, rowIdx}(end)
+                new_x = DenCenters{rowIdx, rowIdx}(end);
             end
-            stable_length(group_idx,2) = trialLength * new_x / DenCenters{group_idx, group_idx}(end);
-            if stable_length(group_idx,2) > trialLength
-                stable_length(group_idx,2) = trialLength;
-            elseif stable_length(group_idx,2) < 1
-                stable_length(group_idx,2) = 1;
+            stable_length(rowIdx,2) = trialLength * new_x / DenCenters{rowIdx, rowIdx}(end);
+            if stable_length(rowIdx,2) > trialLength
+                stable_length(rowIdx,2) = trialLength;
+            elseif stable_length(rowIdx,2) < 1
+                stable_length(rowIdx,2) = 1;
             end
         end
 

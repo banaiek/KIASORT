@@ -189,7 +189,7 @@ try
         if ch_idx == 1
             batch_idx = 1;
             start_ch = channel_idx(batch_idx);
-            end_ch = batch_idx * batch_ch_size;
+            end_ch = min(batch_idx * batch_ch_size, num_channels);
 
             try
                 selected_data = batch_extract(m, chunk_limits, start_ch, end_ch, channel_mapping, channel_inclusion, cfg);
@@ -219,7 +219,7 @@ try
         elseif any(channel_idx == last_batch_channel) && last_batch_channel~=num_channels
             batch_idx = find(channel_idx == last_batch_channel);
             start_ch = channel_idx(batch_idx);
-            end_ch = batch_idx * batch_ch_size;
+            end_ch = min(batch_idx * batch_ch_size, num_channels);
 
             try
                 selected_data = batch_extract(m, chunk_limits, start_ch, end_ch, channel_mapping, channel_inclusion, cfg);

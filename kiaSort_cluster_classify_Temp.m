@@ -51,6 +51,19 @@ ampVals = waveform(:,midChannel,spike_length+1);
 
 snr_vals = abs(ampVals./data.channel_thresholds_pos(midChannel));
 
+sinkSnr    = cfgGet(cfg, 'noiseSinkSnr', 1.25);
+enableSink = cfgGet(cfg, 'enableNoiseSink', true);
+thrPosMid  = abs(data.channel_thresholds_pos(midChannel));
+if isempty(data.channel_thresholds_neg) || numel(data.channel_thresholds_neg) < midChannel
+    thrNegMid = thrPosMid;
+else
+    thrNegMid = abs(data.channel_thresholds_neg(midChannel));
+end
+sinkClassLabels = [];
+% Margin around each class's own 1-99 percentile amplitude range.
+ampBandLo = cfgGet(cfg, 'ampBandLowFactor',  0.5);
+ampBandHi = cfgGet(cfg, 'ampBandHighFactor', Inf);
+
 channel_Var = var(waveform,[],[1,3]);
 informative_Chans = (channel_Var./max(channel_Var) > 0.05);
 
@@ -135,14 +148,94 @@ labels = -ones(size(initialLabels));
 globalCluster = 0;
 uniqueLabels = unique(initialLabels);
 initNumClasses = max(uniqueLabels);
+splitLog = [];
 for i = 1:length(uniqueLabels)
     if uniqueLabels(i)==-1, continue; end
     idx = find(initialLabels==uniqueLabels(i));
-    [labels, globalCluster] = processCluster(idx, labels, fs, globalCluster, dataAll, spk_idx_full, cfg, 0, minPtsEnd, minPtsStart, sample_dur, numPt,initNumClasses, snr_vals);
+    [labels, globalCluster, splitLog] = processCluster(idx, labels, fs, globalCluster, dataAll, spk_idx_full, cfg, 0, minPtsEnd, minPtsStart, sample_dur, numPt,initNumClasses, snr_vals, splitLog);
 end
 
 if ~any(labels>=1)
     labels(:) = 1;
+end
+
+% Resolve the provisional ISI rejects. A cluster only becomes noise if it is
+% above the keep gate AND its polarity still has another class; otherwise it
+% is retained so low-amplitude noise has somewhere to go at sort time. The
+% existing 1.25 amplitude gate keeps it out of the final units.
+rejTags = unique(labels(labels <= -2));
+if ~isempty(rejTags)
+    jitGap = ceil(cfg.spikeDistance * fs / 1000);
+    cIdx   = spike_length + 1;
+    wStart = max(1, cIdx - jitGap);
+    wEnd   = min(T, cIdx + jitGap);
+
+    for r = 1:numel(rejTags)
+        m   = labels == rejTags(r);
+        pol = mode(spk_ID_full(m));
+        if pol < 0, thr_p = thrNegMid; else, thr_p = thrPosMid; end
+
+        wf      = reshape(mean(waveform(m, midChannel, :), 1, 'omitmissing'), 1, []);
+        ampHigh = max(abs(wf(wStart:wEnd))) > sinkSnr * thr_p;
+
+        nPol = 0;
+        accepted = unique(labels(labels >= 1));
+        for k = 1:numel(accepted)
+            if mode(spk_ID_full(labels == accepted(k))) == pol
+                nPol = nPol + 1;
+            end
+        end
+
+        if enableSink && (~ampHigh || nPol < 2)
+            globalCluster = globalCluster + 1;
+            labels(m) = globalCluster;
+            if ~ampHigh
+                sinkClassLabels(end+1,1) = globalCluster; %#ok<AGROW>
+            end
+        else
+            labels(m) = -1;
+        end
+    end
+end
+
+% Amplitude bimodality: a class holding a noise band plus a genuinely
+% larger unit shows two amplitude modes that coexist in time. Drift also
+% splits the amplitude histogram, but its modes are consecutive, so the
+% same temporal-overlap veto separates the two cases.
+if cfgGet(cfg, 'enableBimodalSplit', false)
+    ampAcc = unique(labels(labels >= 1));
+    nAmpSplit = 0;
+    for a = 1:numel(ampAcc)
+        if nAmpSplit >= cfgGet(cfg, 'ampSplitMaxPerChannel', 1), break; end
+        m   = find(labels == ampAcc(a));
+        if numel(m) < 4*cfgGet(cfg,'peelMinLowCount',20), continue; end
+        v   = abs(double(ampVals(m)));
+        [thrA, ~, ~, etaA] = kiaSort_otsu_split1d(v, cfgGet(cfg,'bimodalNumBins',64));
+        if isnan(thrA) || etaA < cfgGet(cfg,'ampSplitSeparability',0.75)
+            continue;
+        end
+        % The Otsu cut only locates the boundary; refine it so spikes near
+        % the edge are assigned by proximity to the two modes rather than by
+        % a bin edge. Modes here have unequal spread (tight noise band vs a
+        % broader unit), which a raw histogram cut splits poorly.
+        thrA = kiaSort_refine_1d_2means(v, thrA);
+        lo = m(v <= thrA);  hi = m(v > thrA);
+        minA = max(cfgGet(cfg,'peelMinLowCount',20), ...
+                   ceil(cfgGet(cfg,'ampSplitMinChildFrac',0.15) * numel(m)));
+        if numel(lo) < minA || numel(hi) < minA, continue; end
+
+        tl = double(spk_idx_full(lo)); th = double(spk_idx_full(hi));
+        ql = prctile(tl,[5 95]);       qh = prctile(th,[5 95]);
+        spanA = min(ql(2)-ql(1), qh(2)-qh(1));
+        if spanA <= 0, continue; end
+        if (min(ql(2),qh(2)) - max(ql(1),qh(1)))/spanA < cfgGet(cfg,'bimodalMinTimeOverlap',0.5)
+            continue;
+        end
+
+        globalCluster = globalCluster + 1;
+        labels(lo)    = globalCluster;
+        nAmpSplit     = nAmpSplit + 1;
+    end
 end
 
 uniqueLabels = unique(labels);
@@ -181,7 +274,7 @@ end
 % Drop small clusters whose per-spike maxima are concentrated on one
 % channel but scattered in time -- likely formed from overlapping spikes
 % of other (larger) classes.
-sizes_valid = clusterSampleCounts(uniqueLabels >= 0);
+sizes_valid = clusterSampleCounts(uniqueLabels >= 0 & ~ismember(uniqueLabels, sinkClassLabels));
 if ~isempty(sizes_valid)
     sizeThr       = 0.10 * max(sizes_valid);
     chanFracThr   = 0.80;
@@ -189,7 +282,7 @@ if ~isempty(sizes_valid)
 
     for i = 1:numUniqueClusters
         L = uniqueLabels(i);
-        if L < 0 || clusterSampleCounts(i) >= sizeThr, continue; end
+        if L < 0 || clusterSampleCounts(i) >= sizeThr || ismember(L, sinkClassLabels), continue; end
         idx = find(labels == L);
         if numel(idx) < 5, continue; end
         [maxPerCh, maxTimePerCh] = max(abs(waveform(idx, :, :)), [], 3);
@@ -215,6 +308,10 @@ if ~isempty(sizes_valid)
         end
         labels      = newLbls;
         trainingLbl = newTraining;
+    if ~isempty(sinkClassLabels)
+        [~, sinkLoc] = ismember(sinkClassLabels, survivingLbls);
+        sinkClassLabels = sinkLoc(sinkLoc > 0);
+    end
 
         uniqueLabels        = unique(labels);
         numUniqueClusters   = length(uniqueLabels);
@@ -245,26 +342,40 @@ for i = 1:numUniqueClusters
     end
 
     idx = find(labels == uniqueLabels(i));
+
+    % A sink spans heterogeneous noise; the full variant count would give it
+    % enough reach to win matches against real units.
+    if ismember(uniqueLabels(i), sinkClassLabels)
+        nT = max(1, min(numTemplatesPerCluster, cfgGet(cfg,'noiseSinkTemplates',3)));
+        capPts = cfgGet(cfg,'noiseSinkMaxTemplatePts',5000);
+        if numel(idx) > capPts
+            idx = idx(round(linspace(1, numel(idx), capPts)));
+        end
+    else
+        nT = numTemplatesPerCluster;
+    end
+
     clusterWaveforms = waveform(idx,:,:);
     clusterPCAscores = PCA_score(idx,:);
 
-    if length(idx) >= numTemplatesPerCluster 
-        [templates, weights] = generateMultipleTemplates(clusterWaveforms, numTemplatesPerCluster, clusterPCAscores);
-        templateWaveforms(i,:,:,:) = templates;
-        templateWeights(i,:) = weights;
+    if length(idx) >= nT
+        [templates, weights] = generateMultipleTemplates(clusterWaveforms, nT, clusterPCAscores);
+        templateWaveforms(i,1:nT,:,:) = templates;
+        templateWeights(i,1:nT) = weights;
     else
-        meanWF = squeeze(meanClusterWaveform(i,:,:));
-        for t = 1:numTemplatesPerCluster
+        meanWF = reshape(meanClusterWaveform(i,:,:), size(meanClusterWaveform,2), []);
+        for t = 1:nT
             templateWaveforms(i,t,:,:) = meanWF;
         end
-        templateWeights(i,:) = 1/numTemplatesPerCluster;
+        templateWeights(i,1:nT) = 1/nT;
     end
 end
 
 [clusterSpikeDensity, ~, ~] = cluster_spike_density(spk_idx_full, labels, cfg);
 
+sinkMask = ismember(uniqueLabels, sinkClassLabels);
 [clusterRelabeling]  = kiaSort_process_clusters(meanClusterWaveform, clusterSpikeDensity, ...
-    uniqueLabels, labels, PCA, spk_idx_full, mean_side_waveforms, cfg);
+    uniqueLabels, labels, PCA, spk_idx_full, mean_side_waveforms, cfg, sinkMask);
 
 clusterRelabeling.originalLabels = uniqueLabels;
 clusterRelabeling.mean_side_waveforms = mean_side_waveforms;
@@ -285,6 +396,7 @@ perRatio = clusterRelabeling.perRatio(uniqLblID);
 clusterSelection.classLabels = uniqueNewLabels;
 
 clusterStatus = zeros(length(uniqueNewLabels), 1);
+isNoiseSink = false(length(uniqueNewLabels), 1);
 contaminationRate = zeros(length(uniqueNewLabels), 1);
 
 ACG_R_CLEAN = 0.10;   % ratio threshold for "clean"
@@ -315,8 +427,18 @@ for iMerged = 1:length(uniqueNewLabels)
         [~, ~, isv2] = getISIViolations(spk_in_merged, fs, 2);
 
         if isv1 > ISI_BACKUP_THR1 || isv2 > ISI_BACKUP_THR2
-            clusterStatus(iMerged) = -4;
-            clusterSelection.keep(iMerged) = 0;
+            % Same rule as the iterative reject: only discard when the class
+            % clears the keep gate and its polarity has another class left.
+            ampLow = isfield(clusterSelection, 'lowAmpNotKept') && ...
+                     numel(clusterSelection.lowAmpNotKept) >= iMerged && ...
+                     clusterSelection.lowAmpNotKept(iMerged);
+            polSelf = clusterSelection.mainNegativePolarity(iMerged);
+            nPol    = sum(clusterSelection.mainNegativePolarity(:) == polSelf & ...
+                          uniqueNewLabels(:) ~= -1);
+            if ~ampLow && nPol >= 2
+                clusterStatus(iMerged) = -4;
+                clusterSelection.keep(iMerged) = 0;
+            end
         end
     end
 
@@ -340,7 +462,25 @@ if isfield(clusterSelection, 'lowAmpNotKept') && any(clusterSelection.lowAmpNotK
     end
 end
 
+% A sink exists to absorb noise, never to be reported as a unit.
+if ~isempty(sinkClassLabels)
+    sinkRows = find(ismember(uniqueLabels, sinkClassLabels));
+    for sR = 1:numel(sinkRows)
+        idxS = find(uniqueNewLabels == clusterRelabeling.newLabels(sinkRows(sR)), 1);
+        if isempty(idxS), continue; end
+        isNoiseSink(idxS) = true;
+        clusterSelection.keep(idxS) = 0;
+        if clusterStatus(idxS) == 0
+            if class_polarity(sinkRows(sR)) == -1
+                clusterStatus(idxS) = -3;
+            else
+                clusterStatus(idxS) = -2;
+            end
+        end
+    end
+end
 clusterSelection.clusterStatus = clusterStatus;
+clusterSelection.isNoiseSink = isNoiseSink;
 clusterSelection.contaminationRate = contaminationRate;
 clusterRelabeling.clusterStatus = clusterStatus;
 
@@ -362,12 +502,29 @@ for i = 1:length(uniqueLabels)
     highPrc = prctile(ampVals(class_idx), 99);
     trainingLbl(labels==uniqueLabels(i) & (ampVals < lowPrc | ampVals > highPrc)) = -1;
 
-    if class_polarity(i) == 1
-        low_thr(i)  = max(0.5 * lowPrc,  0);
-        high_thr(i) = max(2   * highPrc, 0);
+    % The sink owns the band below sinkSnr; the generic widening would let
+    % it claim spikes well above its own distribution.
+    if ismember(uniqueLabels(i), sinkClassLabels)
+        low_thr(i) = 0;
+        if class_polarity(i) == 1
+            high_thr(i) =  sinkSnr * thrPosMid;
+        else
+            high_thr(i) = -sinkSnr * thrNegMid;
+        end
+    elseif class_polarity(i) == 1
+        low_thr(i) = max(ampBandLo * lowPrc, 0);
+        if isfinite(ampBandHi)
+            high_thr(i) = max(ampBandHi * highPrc, 0);
+        else
+            high_thr(i) = Inf;      % no upper cap for a positive class
+        end
     else
-        low_thr(i)  = min(0.5 * highPrc, 0);
-        high_thr(i) = min(2   * lowPrc,  0);
+        low_thr(i) = min(ampBandLo * highPrc, 0);
+        if isfinite(ampBandHi)
+            high_thr(i) = min(ampBandHi * lowPrc, 0);
+        else
+            high_thr(i) = -Inf;     % no upper cap for a negative class
+        end
     end
 end
 
@@ -498,6 +655,8 @@ out.clusteringInfo.numPt            = numPt;
 out.clusteringInfo.clusterRelabeling = clusterRelabeling;
 out.clusteringInfo.clusterSelection = clusterSelection;
 out.clusteringInfo.classLabels      = uniqueLabels;
+out.clusteringInfo.bimodalSplitLog  = splitLog;
+out.clusteringInfo.noiseSinkLabels  = sinkClassLabels;
 
 out.classifierInfo.valAccuracy      = classifierAccuracy;
 out.classifierInfo.classLabels      = uniqueLabels;
@@ -521,14 +680,20 @@ out.waveformInfo.informative_Chan   = informative_Chans;
 out.cfg                             = cfg;
 end
 
-function [labels, globalCluster] = processCluster(idx, labels, fs, globalCluster, dataAll, spk_idx_full, cfg, depth, maxClusterPoints, minClusterPoints, sample_dur, numPt, initNumClasses, snr_vals)
+function [labels, globalCluster, splitLog] = processCluster(idx, labels, fs, globalCluster, dataAll, spk_idx_full, cfg, depth, maxClusterPoints, minClusterPoints, sample_dur, numPt, initNumClasses, snr_vals, splitLog)
 [~,~,isi_viol] = getISIViolations(spk_idx_full(idx), fs, 2);
 factor = length(idx)/size(dataAll,1);
 if ((isi_viol<= 0.1 && depth >= 0)  && (initNumClasses>10 || depth > 0)) || depth >= 3
-    globalCluster = globalCluster + 1;
-    labels(idx) = globalCluster;
+    [parts, splitLog] = splitIfBimodal(idx, dataAll, spk_idx_full, fs, isi_viol, sample_dur, cfg, depth, splitLog);
+    for p = 1:numel(parts)
+        globalCluster = globalCluster + 1;
+        labels(parts{p}) = globalCluster;
+    end
 elseif isi_viol> 1 && length(idx) < minClusterPoints/2 && depth > 1
-    labels(idx) = -1;
+    % Provisional reject. Whether it really becomes noise depends on its
+    % amplitude and on how many classes its polarity has, neither of which
+    % is known until the recursion finishes, so tag it and resolve later.
+    labels(idx) = min([-1; labels(labels <= -2)]) - 1;
 else
     [epsilon, ~] = estimate_dbscan_par(dataAll(idx,:));
     numPt = max(min([ max(factor*numPt,size(dataAll,2)) , factor*maxClusterPoints+5]),factor*minClusterPoints+5);
@@ -542,7 +707,7 @@ else
             labels(idx(subLabels==uniqueSub(j))) = -1;
         else
             subIdx = idx(subLabels==uniqueSub(j));
-            [labels, globalCluster] = processCluster(subIdx, labels, fs, globalCluster, dataAll, spk_idx_full, cfg, depth+1, maxClusterPoints, minClusterPoints, sample_dur, numPt, initNumClasses, snr_vals);
+            [labels, globalCluster, splitLog] = processCluster(subIdx, labels, fs, globalCluster, dataAll, spk_idx_full, cfg, depth+1, maxClusterPoints, minClusterPoints, sample_dur, numPt, initNumClasses, snr_vals, splitLog);
         end
     end
 end
@@ -628,3 +793,97 @@ end
 weights = weights / sum(weights);
 end
 
+
+
+function v = cfgGet(cfg, name, dflt)
+if isstruct(cfg) && isfield(cfg, name) && ~isempty(cfg.(name))
+    v = cfg.(name);
+else
+    v = dflt;
+end
+end
+
+
+function [parts, splitLog] = splitIfBimodal(idx, dataAll, spk_idx_full, fs, isiParent, sample_dur, cfg, depth, splitLog)
+% A cluster with clean ISI can still hold two neurons: a merged train of two
+% cells that rarely co-fire looks refractory. Split only on a clear density
+% valley, and only when the two sides overlap in time -- a drifting single
+% unit also looks bimodal but its halves are consecutive, not interleaved.
+parts = {idx};
+if ~cfgGet(cfg, 'enableBimodalSplit', false), return; end
+if ~isempty(splitLog) && sum([splitLog.split]) >= cfgGet(cfg, 'bimodalMaxSplits', 1), return; end
+
+n        = numel(idx);
+minUnit  = max(20, round(sample_dur * cfgGet(cfg, 'minRate', 0.15)));
+minChild = max(minUnit, ceil(cfgGet(cfg, 'bimodalMinChildFrac', 0.20) * n));
+if n < 2*minChild, return; end
+
+% UMAP block only; the trailing 3 PCA columns are amplitude-dominated and
+% carry the drift axis, which would cut a drifting unit in half.
+dU = size(dataAll,2) - 3;
+if dU < 2, return; end
+
+maxTest = cfgGet(cfg, 'bimodalMaxTestPoints', 5000);
+if n > maxTest
+    sub = round(linspace(1, n, maxTest))';
+else
+    sub = (1:n)';
+end
+U  = dataAll(idx, 1:dU);
+mu = mean(U(sub,:), 1);
+Xc = U(sub,:) - mu;
+
+[V, D] = eig(Xc'*Xc);
+[~, k] = max(diag(D));
+w = V(:,k);
+t = Xc * w;
+
+[thr, sep, valley, eta] = kiaSort_otsu_split1d(t, cfgGet(cfg, 'bimodalNumBins', 64));
+rec = struct('n', n, 'depth', depth, 'sep', sep, 'valley', valley, 'eta', eta, ...
+             'timeOverlap', NaN, 'medShift', NaN, 'isiParent', isiParent, ...
+             'isiChild', [NaN NaN], 'split', false);
+
+if isnan(thr) || eta < cfgGet(cfg,'bimodalSeparability',0.75)
+    splitLog = appendSplitLog(splitLog, rec); return;
+end
+
+side = ((U - mu) * w) <= thr;
+i1 = idx(side);  i2 = idx(~side);
+if numel(i1) < minChild || numel(i2) < minChild
+    splitLog = appendSplitLog(splitLog, rec); return;
+end
+
+t1 = double(spk_idx_full(i1));  t2 = double(spk_idx_full(i2));
+q1 = prctile(t1, [5 95]);       q2 = prctile(t2, [5 95]);
+span = min(q1(2)-q1(1), q2(2)-q2(1));
+if span <= 0
+    splitLog = appendSplitLog(splitLog, rec); return;
+end
+rec.timeOverlap = (min(q1(2),q2(2)) - max(q1(1),q2(1))) / span;
+rec.medShift    = abs(median(t1) - median(t2)) / max(1, sample_dur*fs);
+if rec.timeOverlap < cfgGet(cfg,'bimodalMinTimeOverlap',0.5) || ...
+   rec.medShift    > cfgGet(cfg,'bimodalMaxMedianShift',0.3)
+    splitLog = appendSplitLog(splitLog, rec); return;
+end
+
+isiCap = min(max(0.1, isiParent), 1);
+[~,~,v1] = getISIViolations(spk_idx_full(i1), fs, 2);
+[~,~,v2] = getISIViolations(spk_idx_full(i2), fs, 2);
+rec.isiChild = [v1 v2];
+if v1 > isiCap || v2 > isiCap
+    splitLog = appendSplitLog(splitLog, rec); return;
+end
+
+rec.split = true;
+splitLog  = appendSplitLog(splitLog, rec);
+parts = {i1, i2};
+end
+
+
+function splitLog = appendSplitLog(splitLog, rec)
+if isempty(splitLog)
+    splitLog = rec;
+else
+    splitLog(end+1) = rec;
+end
+end
