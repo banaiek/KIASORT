@@ -729,41 +729,81 @@ if isfield(cfg,'postHocProcessing')
             doMerge  = ~isfield(cfg,'postHocMerging')    || cfg.postHocMerging;
             doRemove = ~isfield(cfg,'postHocRemoval')    || cfg.postHocRemoval;
 
+            % The chunk loop closed the log before this block. Re-open it:
+            % every pass below used to fail silently, and a pass that never
+            % ran is indistinguishable from one that ran and changed nothing.
+            pfid = fopen(logFile, 'a');
+            if pfid < 0
+                warning('kiaSort:postHocLog', ...
+                    'Could not re-open %s; post-hoc passes will not be logged.', logFile);
+                pfid = 1;      % fall back to stdout rather than skipping the passes
+            end
+            fprintf(pfid, '\n=============================\n');
+            fprintf(pfid, 'Post-hoc processing started at %s\n', datestr(now));
+
+            % Each pass is independent: one failing must not cancel the
+            % others. The drift merge used to run unguarded, so an error
+            % there (e.g. no channel geometry) skipped the split, the
+            % merge/removal and the SNR recompute as well.
             if doDrift
-                kiaSort_drift_merge_posthoc_iterative(outputPath, ...
-                    'overwrite', true, ...
-                    'verbose',   false, ...
-                    'mainArgs',  {'debugFigs', false});
+                try
+                    kiaSort_drift_merge_posthoc_iterative(outputPath, ...
+                        'overwrite', true, ...
+                        'verbose',   false, ...
+                        'mainArgs',  {'debugFigs', false});
+                    fprintf(pfid, 'Drift merge: done.\n');
+                catch ME
+                    fprintf(pfid, 'Drift merge FAILED (continuing): %s\n', ME.message);
+                    warning('kiaSort:driftMerge', 'Drift merge skipped: %s', ME.message);
+                end
+            else
+                fprintf(pfid, 'Drift merge: disabled.\n');
             end
             % Split before merging, so the merge pass gets the final set of
             % units and can rejoin anything the split separated too eagerly.
             if isfield(cfg,'posthocSplit') && cfg.posthocSplit
                 try
-                    kiaSort_posthoc_split(outputPath, 'verbose', false);
-                catch
-
+                    sr = kiaSort_posthoc_split(outputPath, 'verbose', false);
+                    fprintf(pfid, 'Bimodal split: %d of %d units split (changed=%d).\n', ...
+                        sr.nSplit, sr.nTested, sr.changed);
+                catch ME
+                    fprintf(pfid, 'Bimodal split FAILED (continuing): %s\n', ME.message);
+                    warning('kiaSort:posthocSplit', 'Post-hoc split skipped: %s', ME.message);
                 end
+            else
+                fprintf(pfid, 'Bimodal split: disabled.\n');
             end
             if doMerge || doRemove
                 try
-                    kiaSort_post_sort_curate(outputPath, ...
+                    pr = kiaSort_post_sort_curate(outputPath, ...
                         'ccg_cleaning',    doRemove, ...
                         'overlap_removal', doRemove, ...
                         'merging',         doMerge, ...
                         'xcorrThreshold',  0.9, ...
                         'verbose',         false);
-                catch
-
+                    fprintf(pfid, ['Post-sort curate: %d merges, %d CCG strips, ' ...
+                        '%d overlap drops, %d overlap strips.\n'], ...
+                        pr.nMerge, pr.nClean, pr.nOverlapDrop, pr.nOverlapStrip);
+                catch ME
+                    fprintf(pfid, 'Post-sort curate FAILED (continuing): %s\n', ME.message);
+                    warning('kiaSort:postSortCurate', 'Post-sort curate skipped: %s', ME.message);
                 end
+            else
+                fprintf(pfid, 'Post-sort curate: disabled.\n');
             end
             % Last, so SNR reflects the units that actually survived. The
             % sample-stage detectblity is keyed by labelInChannel and is
             % wrong for any unit that shares a sample entry with another.
             try
                 kiaSort_recompute_snr(outputPath, 'verbose', false);
+                fprintf(pfid, 'SNR recompute: done.\n');
             catch ME
+                fprintf(pfid, 'SNR recompute FAILED: %s\n', ME.message);
                 warning('kiaSort:snrRecompute', 'SNR recompute skipped: %s', ME.message);
             end
+
+            fprintf(pfid, 'Post-hoc processing finished at %s\n', datestr(now));
+            if pfid > 2, fclose(pfid); end
         end
     end
 end

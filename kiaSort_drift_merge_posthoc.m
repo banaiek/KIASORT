@@ -147,7 +147,17 @@ if opt.verbose, fprintf('Loading channel info...\n'); end
 chInfo = load(channelInfoPath, 'channel_locations', 'channel_inclusion', 'num_samples');
 channel_locations = chInfo.channel_locations;
 if isempty(channel_locations) || size(channel_locations, 2) < 2
-    error('channel_locations must be (numChannels x 3) with x in col 1, y in col 2.');
+    % Every gate in this pass is geometric, so with no coordinates there is
+    % nothing it can decide. Skipping is the honest answer -- raising here
+    % used to abort the whole post-hoc chain (split, merge, SNR) with it.
+    warning('kiaSort:driftMerge:noGeometry', ...
+        ['No channel_locations in %s (run without a channel map); ' ...
+         'drift merge skipped.'], channelInfoPath);
+    driftReport = struct('opt', opt, 'pairs', [], ...
+        'groups', {{}}, 'labelRemap', containers.Map('KeyType','double','ValueType','double'), ...
+        'primarySummary', zeros(0,4), 'nUnitsBefore', 0, 'nUnitsAfter', 0, ...
+        'skipped', true);
+    return;
 end
 if isfield(chInfo, 'num_samples') && ~isempty(chInfo.num_samples)
     num_samples = double(chInfo.num_samples);

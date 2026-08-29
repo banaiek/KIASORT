@@ -875,7 +875,21 @@ end
 % ---- Write back if anything changed ------------------------------------
 changed = (nClean > 0) || (nMerge > 0) || spkChanged || ...
           (nOverlapDrop > 0) || (nOverlapStrip > 0);
+nRemoved   = 0;
+compactMap = containers.Map('KeyType','double','ValueType','double');
 if changed
+    % Merging and dropping move spikes off a unit but left its row in the
+    % table, so the two outputs disagreed: the GUI sizes itself from
+    % numel(label) and showed the leftovers as empty units. Compact here,
+    % while both are still in hand, so they are written in agreement.
+    [unif, lbl_all, nRemoved, compactMap] = kiaSort_compact_unit_table(unif, lbl_all);
+
+    % The labels and the unit table are separate files. Back both up so a
+    % failure between the two writes can be rolled back rather than leaving
+    % spike labels that disagree with the table.
+    bk = kiaSort_backup_results(outputPath, 'postcurate', ...
+        {unifiedLabelsH5, spikeIdxH5, sortedSamplesPath});
+
     try
         if exist(unifiedLabelsH5, 'file')
             delete(unifiedLabelsH5);
@@ -890,9 +904,17 @@ if changed
             h5create(spikeIdxH5, '/spike_idx', size(spk_all), 'Datatype', 'double');
             h5write(spikeIdxH5,  '/spike_idx', spk_all);
         end
+
+        if nRemoved > 0
+            crossChannelStats.unified_labels = unif;
+            save(sortedSamplesPath, 'crossChannelStats', '-append');
+        end
     catch ME
         if opt.verbose
-            fprintf('Post-sort curate: H5 write failed (%s).\n', ME.message);
+            fprintf('Post-sort curate: write failed (%s).\n', ME.message);
+        end
+        if isstruct(bk) && isfield(bk, 'ok') && bk.ok
+            kiaSort_restore_results(bk);
         end
         postSortReport.nClean        = nClean;
         postSortReport.nMerge        = nMerge;
@@ -909,12 +931,15 @@ postSortReport.nMerge        = nMerge;
 postSortReport.nOverlapDrop  = nOverlapDrop;
 postSortReport.nOverlapStrip = nOverlapStrip;
 postSortReport.droppedLabels = droppedLabels;
+postSortReport.nEmptyRemoved = nRemoved;
+postSortReport.compactRemap  = compactMap;
 postSortReport.changed       = changed;
 postSortReport.ok            = true;
 
 if opt.verbose
-    fprintf('Post-sort curate: %d overlap drops, %d overlap strips, %d CCG strips, %d merges (changed=%d).\n', ...
-        nOverlapDrop, nOverlapStrip, nClean, nMerge, changed);
+    fprintf(['Post-sort curate: %d overlap drops, %d overlap strips, %d CCG strips, ' ...
+             '%d merges, %d empty table rows removed (changed=%d).\n'], ...
+        nOverlapDrop, nOverlapStrip, nClean, nMerge, nRemoved, changed);
 end
 
 end
@@ -1389,4 +1414,3 @@ else
 end
 if all(~isfinite(mw(:))) || all(mw(:) == 0), mw = []; end
 end
-

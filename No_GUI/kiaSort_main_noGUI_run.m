@@ -24,5 +24,6 @@ cfg_overrides.sort_only            = false;
 cfg_overrides.useGPU               = true;
 cfg_overrides.parallelProcessing   = false;
 cfg_overrides.extractWaveform      = false;
+cfg_overrides.posthocSplit         = true;
 
 run_kiasort_nogui(dataFilePath, outputFolder, channelMapFile, cfg_overrides);

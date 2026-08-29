@@ -12,8 +12,7 @@ end
 if nargin < 3, channelMapFile = []; end
 if nargin < 4 || isempty(cfg_overrides), cfg_overrides = struct(); end
 
-% Run the headless auto-curation after sorting and write the curated
-% outputs (RES_Sorted/*_curated.h5, curated_sample.mat, curated_metrics.csv).
+% writes RES_Sorted/*_curated.h5, curated_sample.mat, curated_metrics.csv
 run_auto_curation = false;
 
 if ~exist(dataFilePath, 'file')
@@ -51,6 +50,15 @@ end
 
 cfg.num_channel_extract = derive_num_channel_extract(channel_locations, ...
     cfg.waveform_radius, cfg.num_channel_extract);
+
+% Without coordinates the post-hoc drift merge has nothing to work with and
+% skips itself. Sorting is unaffected, but say so rather than letting a
+% silently-skipped pass look like one that ran and found nothing.
+if isempty(channel_locations)
+    warning('kiaSort:noChannelLocations', ...
+        ['No channel coordinates (channelMapFile empty or unreadable). ' ...
+         'Sorting proceeds; the post-hoc drift merge will be skipped.']);
+end
 
 fprintf('Input: %s\nOutput: %s\nChannels: %d, fs: %d Hz, dtype: %s, BP: [%d %d]\n', ...
     dataFilePath, outputFolder, cfg.numChannels, cfg.samplingFrequency, ...
