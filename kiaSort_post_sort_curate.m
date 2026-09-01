@@ -182,12 +182,49 @@ catch ME
     if opt.verbose, fprintf('Post-sort curate: channel_info load failed (%s).\n', ME.message); end
     return;
 end
-if ~isfield(chInfo, 'channel_locations') || isempty(chInfo.channel_locations) ...
-        || size(chInfo.channel_locations, 2) < 2
-    if opt.verbose, fprintf('Post-sort curate: channel_locations missing.\n'); end
-    return;
+
+% Peeked at ahead of the full sortedSamples load below, because the geometry
+% fallback needs duplicateSearchChannels to size its neighbourhood.
+cfgRaw0 = struct();
+try
+    ssPeek = load(sortedSamplesPath, 'sortedSamples');
+    for iP = 1:numel(ssPeek.sortedSamples)
+        if ~isempty(ssPeek.sortedSamples{iP}) && isfield(ssPeek.sortedSamples{iP}, 'cfg')
+            cfgRaw0 = ssPeek.sortedSamples{iP}.cfg; break;
+        end
+    end
+    clear ssPeek
+catch
 end
-ylocs = chInfo.channel_locations(:, 2);
+% Geometry is used for one thing only: deciding which unit pairs are close
+% enough to be worth comparing. Returning without it meant a run with no
+% channel map got NO merging and NO overlap removal at all -- and since the
+% split pass has no such dependency, the result was a silently over-split
+% output. Fall back to pairing by channel index instead, which is the right
+% neighbourhood anyway when num_channel_extract is 0 (one channel per unit).
+geomFallback = ~isfield(chInfo, 'channel_locations') || isempty(chInfo.channel_locations) ...
+        || size(chInfo.channel_locations, 2) < 2;
+if geomFallback
+    nChTot = numel(chInfo.channel_inclusion);
+    if nChTot < 1, nChTot = max(chn_all(~isnan(chn_all))); end
+    ylocs  = (1:nChTot)';
+    % In fallback the units are channel indices, not micrometres, so the
+    % micrometre radius cannot apply. duplicateSearchChannels is the
+    % existing knob for exactly this case.
+    yRadius = 2;
+    if isfield(cfgRaw0, 'duplicateSearchChannels') && ~isempty(cfgRaw0.duplicateSearchChannels)
+        yRadius = double(cfgRaw0.duplicateSearchChannels);
+    end
+    warning('kiaSort:postSortCurate:noGeometry', ...
+        ['No channel_locations (run without a channel map); pairing units by ' ...
+         'channel index within +-%g instead of %g um.'], yRadius, opt.coincYUm);
+    if opt.verbose
+        fprintf('Post-sort curate: no geometry, pairing by channel index (+-%g).\n', yRadius);
+    end
+else
+    ylocs   = chInfo.channel_locations(:, 2);
+    yRadius = opt.coincYUm;
+end
 
 % ---- Load sortedSamples (for cfg + mean waveforms) ----------------------
 try
@@ -366,7 +403,7 @@ for b = 1:numel(boundaries)-1
     end
 end
 
-% ---- Build neighbour list (pairs within coincYUm in y) -----------------
+% ---- Build neighbour list (pairs within yRadius in y) ------------------
 % We do this once, up front, so both phases share the same candidate set.
 yArr = [unitInfo.ny];
 yArr = yArr(:);
@@ -378,7 +415,7 @@ if numel(candIdx) < 2
     return;
 end
 
-% Build pair list: every (k1, k2) with k1 < k2 and |yk1 - yk2| <= coincYUm.
+% Build pair list: every (k1, k2) with k1 < k2 and |yk1 - yk2| <= yRadius.
 % Vectorise the distance check so this stays fast even with hundreds of
 % units. Pre-allocate to the upper bound (n choose 2) and trim once.
 nC = numel(candIdx);
@@ -390,7 +427,7 @@ for ii = 1:nC-1
     yi  = yArr(ki);
     rest = candIdx(ii+1:end);
     dy   = abs(yArr(rest) - yi);
-    near = rest(dy <= opt.coincYUm);
+    near = rest(dy <= yRadius);
     if isempty(near), continue; end
     blk = numel(near);
     pairList(nPairs+1:nPairs+blk, 1) = ki;
@@ -423,7 +460,7 @@ if opt.overlap_removal
         for kj = 1:nUnits
             if kj == ki || droppedMask(kj), continue; end
             if isnan(unitInfo(kj).ny), continue; end
-            if abs(unitInfo(kj).ny - unitInfo(ki).ny) > opt.coincYUm, continue; end
+            if abs(unitInfo(kj).ny - unitInfo(ki).ny) > yRadius, continue; end
             snr_j = 1 + unitInfo(kj).detectability;
             if isnan(snr_j), snr_j = 0; end
             if snr_j < snr_i * opt.overlapSnrRatio, continue; end

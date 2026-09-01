@@ -741,17 +741,44 @@ if isfield(cfg,'postHocProcessing')
             fprintf(pfid, '\n=============================\n');
             fprintf(pfid, 'Post-hoc processing started at %s\n', datestr(now));
 
+            % Both the drift merge and the merge/removal pass key their pair
+            % candidates off probe geometry. Say so once, up front: a run with
+            % no channel map still splits but merges on a weaker neighbourhood,
+            % and that combination is what produces an over-split output.
+            hasGeom = false;
+            try
+                ciChk = load(fullfile(outputPath,'RES_Samples','channel_info.mat'), ...
+                             'channel_locations');
+                hasGeom = isfield(ciChk,'channel_locations') && ...
+                          ~isempty(ciChk.channel_locations) && ...
+                          size(ciChk.channel_locations,2) >= 2;
+            catch
+            end
+            if ~hasGeom
+                fprintf(pfid, ['WARNING: no channel_locations (run had no channel map). ' ...
+                    'Drift merge is skipped and post-sort curate pairs by channel index.\n']);
+            end
+
             % Each pass is independent: one failing must not cancel the
             % others. The drift merge used to run unguarded, so an error
             % there (e.g. no channel geometry) skipped the split, the
             % merge/removal and the SNR recompute as well.
             if doDrift
                 try
-                    kiaSort_drift_merge_posthoc_iterative(outputPath, ...
+                    dRep = kiaSort_drift_merge_posthoc_iterative(outputPath, ...
                         'overwrite', true, ...
                         'verbose',   false, ...
                         'mainArgs',  {'debugFigs', false});
-                    fprintf(pfid, 'Drift merge: done.\n');
+                    if ~hasGeom
+                        fprintf(pfid, 'Drift merge: SKIPPED (no channel geometry).\n');
+                    else
+                        nAbs = 0;
+                        for iD = 1:numel(dRep)
+                            nAbs = nAbs + (dRep{iD}.nUnitsBefore - dRep{iD}.nUnitsAfter);
+                        end
+                        fprintf(pfid, 'Drift merge: %d committed passes, %d units absorbed.\n', ...
+                            numel(dRep), nAbs);
+                    end
                 catch ME
                     fprintf(pfid, 'Drift merge FAILED (continuing): %s\n', ME.message);
                     warning('kiaSort:driftMerge', 'Drift merge skipped: %s', ME.message);
