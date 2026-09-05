@@ -92,6 +92,12 @@ else
     waveform_bp = zeros(num_spikes, num_channels, spikeDuration);
 end
 
+% Must be defined on every path: the assignment below sits inside
+% `if num_spikes > 0`, but out.waveform_raw is written unconditionally at the
+% end of the function. A channel with no detected spikes therefore reached
+% that line with waveform_bp_raw undefined and aborted the whole sort.
+waveform_bp_raw = [];
+
 
 if num_spikes > 0
     extraction_idx = main_spk_inds + (1:spikeDuration) - midPoint;
