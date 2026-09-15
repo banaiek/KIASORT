@@ -347,13 +347,28 @@ try
                 
                 % extracting waveforms that are absent on the main channel
                 side_ch = (floor(half_window/2));
+                % Near the probe edges this channel window is CLIPPED, because
+                % ch_indices_mapped is bounded by [1, num_channels]. On a heavily masked
+                % probe the clipped sub-windows below can then contain no included channel
+                % at all, find() returns empty, and `spk_idx_all_channels{[], 1}` aborts the
+                % ENTIRE probe with "Unable to perform assignment with 0 elements on the
+                % right-hand side". This side pass only adds spikes that neighbouring
+                % channels saw but the main channel missed, so a degenerate neighbourhood
+                % must skip it -- exactly as the side_ch == 0 branch already does -- rather
+                % than kill the probe. Hit Wotan S112 probeD (38/128 channels included):
+                % channel 128's window clipped to entries 123:128 with inclusion
+                % [0 0 0 0 0 1], so find(inclusion(1:end-2), 1, 'last') was empty.
+                ch_m1 = []; ch_m3 = []; ch_start = []; ch_end = [];
                 if side_ch
                     ch_m1 = find(inputWF.inclusion(side_ch+1:end), 1, 'first') + side_ch -1;
                     ch_m3 = find(inputWF.inclusion(1:end-side_ch), 1, 'last');
-                    idx_m1 = inputWF.spk_idx_all_channels{ch_m1, 1};
-                    idx_m3 = inputWF.spk_idx_all_channels{ch_m3, 1};
                     ch_start = find(inputWF.inclusion, 1, 'first');
                     ch_end = find(inputWF.inclusion, 1, 'last');
+                end
+                if side_ch && ~isempty(ch_m1) && ~isempty(ch_m3) ...
+                        && ~isempty(ch_start) && ~isempty(ch_end)
+                    idx_m1 = inputWF.spk_idx_all_channels{ch_m1, 1};
+                    idx_m3 = inputWF.spk_idx_all_channels{ch_m3, 1};
                     idx_start = inputWF.spk_idx_all_channels{ch_start, 1};
                     idx_end = inputWF.spk_idx_all_channels{ch_end, 1};
                     idx_middle = inputWF.spk_idx_all_channels{current_channel_idx, 1};

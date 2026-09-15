@@ -77,6 +77,18 @@ for i = 1:N
     end
 end
 
+% Initialise every output field BEFORE the loop. `unified` used to be created
+% only by the inner assignment at `unified.label(idCount,1) = ...`, so a probe
+% where no channel yields a surviving cluster left it undefined and MATLAB threw
+% "Output argument unified not assigned" instead of returning an empty result.
+% That is a legitimate outcome, not an error: Wotan 111 D has 12 usable channels
+% of 128 (the rest carry stimulation artefact) and produces no clusters at all.
+% A probe with nothing to report should report nothing.
+unified = struct('label', zeros(0,1), 'channelID', zeros(0,1), ...
+                 'labelInChannel', zeros(0,1), 'meanWaveforms', [], ...
+                 'detectblity', zeros(0,1), 'mainNegativePolarity', zeros(0,1), ...
+                 'sideNegativePolarity', zeros(0,1));
+
 idCount = 0;
 for i = 1:N
     if isempty(sortedSamples{i}), continue; end

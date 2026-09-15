@@ -85,9 +85,24 @@ chInfo = load(chInfoPath);
 ss     = load(sortSampPath, 'crossChannelStats');
 unif          = ss.crossChannelStats.unified_labels;
 
-spk_idx = double(h5read(fullfile(resFolder,'spike_idx.h5'),      '/spike_idx'));
-lbl     = double(h5read(fullfile(resFolder,'unifiedLabels.h5'),  '/unifiedLabels'));
-chn     = double(h5read(fullfile(resFolder,'channelNum.h5'),     '/channelNum'));
+% A probe on which no spike was detected writes no spike h5 files at all, and
+% reading them unconditionally turned "this probe is silent" into a hard error.
+% That is a real outcome rather than a fault: Wotan 112 D yielded a single unit
+% at 3 channels and none at 5, because 51 of its 128 channels carry stimulation
+% artefact and what remains is nearly silent. Treat the absent files as zero
+% spikes and let curation return an empty result.
+spkFile = fullfile(resFolder,'spike_idx.h5');
+lblFile = fullfile(resFolder,'unifiedLabels.h5');
+chnFile = fullfile(resFolder,'channelNum.h5');
+if ~exist(spkFile,'file') || ~exist(lblFile,'file') || ~exist(chnFile,'file')
+    warning('kiaSort_auto_curate_nogui:noSpikes', ...
+        'No spike files under %s - treating as zero detected spikes.', resFolder);
+    spk_idx = zeros(0,1); lbl = zeros(0,1); chn = zeros(0,1);
+else
+    spk_idx = double(h5read(spkFile, '/spike_idx'));
+    lbl     = double(h5read(lblFile, '/unifiedLabels'));
+    chn     = double(h5read(chnFile, '/channelNum'));
+end
 spk_idx = spk_idx(:); lbl = lbl(:); chn = chn(:);
 if numel(spk_idx) ~= numel(lbl) || numel(spk_idx) ~= numel(chn)
     error('kiaSort_auto_curate_nogui:h5Mismatch', 'spike h5 lengths disagree.');
