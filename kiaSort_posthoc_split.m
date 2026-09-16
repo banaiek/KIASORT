@@ -54,6 +54,17 @@ function splitReport = kiaSort_posthoc_split(outputPath, varargin)
 %                                         the cut is kept
 %       'minPresence'     (scalar, 0.8)   each child must appear in this
 %                                         fraction of the parent's active bins
+%       'presenceMaxOverlap' (scalar, 0.75) minPresence is waived when the two
+%                                         children's ACTIVE BINS overlap by more
+%                                         than this, measured against whichever
+%                                         child is present in fewer bins
+%       'presenceRateKeep' (scalar, 0.6)  ...and only if the other child keeps
+%                                         firing while the minority child is
+%                                         active: its rate inside that window
+%                                         over its rate outside. One cell whose
+%                                         amplitude drifts hands its spikes to
+%                                         the other child, so the ratio drops;
+%                                         two cells firing together leave it ~1.
 %       'nBins'           (scalar, 20)    bins used for that test
 %       'minBinSpikes'    (scalar, 5)     parent spikes for a bin to count
 %       'verbose'         (logical, false)
@@ -72,6 +83,8 @@ p.addParameter('maxSplits',    Inf,  @(x) isscalar(x) && isnumeric(x));
 p.addParameter('fitCap',       3000, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('assignMaxSpikes', 200000, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minPresence',  0.8,  @(x) isscalar(x) && isnumeric(x));
+p.addParameter('presenceMaxOverlap', 0.75, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('presenceRateKeep',   0.6,  @(x) isscalar(x) && isnumeric(x));
 p.addParameter('ccgIndepMin',    [], @(x) isempty(x) || isscalar(x));
 p.addParameter('ccgMinExpected', [], @(x) isempty(x) || isscalar(x));
 p.addParameter('ccgBandMs', [1 2],   @(x) isnumeric(x) && numel(x)==2);
@@ -203,6 +216,7 @@ for u = 1:numel(labels)
                  'timeOverlap', NaN, 'medShift', NaN, 'waveAgree', NaN, ...
                  'sep', sepA, 'isiChild', [NaN NaN], 'presence', [NaN NaN], ...
                  'ccgRatio', NaN, 'ccgExpected', NaN, 'assignAgree', NaN, ...
+                 'presOverlap', NaN, 'presRateKeep', NaN, ...
                  'assignSource', 'amplitude', 'split', false);
     nTested = nTested + 1;
     % Detection only -- the waveform, drift and stability gates below decide.
@@ -262,9 +276,23 @@ for u = 1:numel(labels)
     % Both children have to fire throughout the parent's span. A child that
     % only exists over part of it is an epoch of the same cell, not a second
     % cell, so the split is reverted.
-    rec.presence = localPresence(spk_all(rows), t1, t2, opt.nBins, opt.minBinSpikes);
+    [rec.presence, rec.presOverlap, rec.presRateKeep] = ...
+        localPresence(spk_all(rows), t1, t2, opt.nBins, opt.minBinSpikes);
     if any(rec.presence < opt.minPresence)
-        splitLog = appendRec(splitLog, rec); continue;
+        % A low presence score alone does not prove an epoch. It is also what
+        % a small second cell looks like next to a continuously active one:
+        % the big child fills every bin, so the small one can never score high
+        % however interleaved it is. Waive the veto only when the children are
+        % genuinely co-active -- their active bins overlap AND the other child
+        % keeps its firing rate while the minority child is on. The rate test
+        % is what separates the two cases: a single cell drifting into a higher
+        % amplitude moves its own spikes across the cut, so the other child is
+        % depleted exactly when the minority child appears.
+        coActive = rec.presOverlap  > opt.presenceMaxOverlap && ...
+                   rec.presRateKeep >= opt.presenceRateKeep;
+        if ~coActive
+            splitLog = appendRec(splitLog, rec); continue;
+        end
     end
 
     % Accepted. Assign on the WAVEFORMS, not the amplitude threshold: the
@@ -585,9 +613,14 @@ ratio = cnt / max(expc, 1e-9);
 end
 
 
-function pres = localPresence(tParent, t1, t2, nBins, minBinSpikes)
-% Fraction of the parent's populated bins in which each child also fires.
-pres = [0 0];
+function [pres, binOverlap, rateKeep] = localPresence(tParent, t1, t2, nBins, minBinSpikes)
+% pres        fraction of the parent's populated bins in which each child fires
+% binOverlap  shared active bins over the count for the child active in fewer
+%             of them (1.0 whenever one child fills every bin)
+% rateKeep    the MAJORITY child's rate inside the minority child's active
+%             window, over its rate outside. ~1 means both cells fire together;
+%             well below 1 means the spikes moved, i.e. one drifting cell.
+pres = [0 0]; binOverlap = NaN; rateKeep = NaN;
 lo = min(tParent); hi = max(tParent);
 if ~isfinite(lo) || ~isfinite(hi) || hi <= lo, return; end
 edges = linspace(lo, hi, max(2, round(nBins)) + 1);
@@ -596,7 +629,23 @@ use = hp >= minBinSpikes;
 if ~any(use), return; end
 h1 = histcounts(t1, edges);
 h2 = histcounts(t2, edges);
-pres = [mean(h1(use) > 0), mean(h2(use) > 0)];
+b1 = h1(use) > 0;
+b2 = h2(use) > 0;
+pres = [mean(b1), mean(b2)];
+
+n1 = sum(b1); n2 = sum(b2);
+if min(n1, n2) > 0
+    binOverlap = sum(b1 & b2) / min(n1, n2);
+end
+
+% Majority child = the one present in more bins; the window is where the
+% other one is active. Both sides need bins or the ratio is meaningless.
+if n1 >= n2, hMaj = h1(use); act = b2; else, hMaj = h2(use); act = b1; end
+if any(act) && any(~act)
+    rIn  = sum(hMaj(act))  / sum(act);
+    rOut = sum(hMaj(~act)) / sum(~act);
+    if rOut > 0, rateKeep = rIn / rOut; end
+end
 end
 
 

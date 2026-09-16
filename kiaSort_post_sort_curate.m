@@ -100,7 +100,7 @@ p.addParameter('overlapMergeSim',          0.9, @(x) isscalar(x) && isnumeric(x)
 p.addParameter('looseCorr',                0.8, @(x) isscalar(x) && isnumeric(x));   % pass-1 prefilter on the clustering means
 p.addParameter('spikeCapN',               5000, @(x) isscalar(x) && isnumeric(x));   % spikes drawn per unit for pass 2
 p.addParameter('minSpikesForMerge',         50, @(x) isscalar(x) && isnumeric(x));   % below this, fall back to the means
-p.addParameter('mergeMaxSeparability',    0.85, @(x) isscalar(x) && isnumeric(x));   % cloud-overlap gate (0.5 = chance)
+p.addParameter('mergeMaxSeparability',    0.92, @(x) isscalar(x) && isnumeric(x));   % cloud-overlap gate (0.5 = chance)
 p.addParameter('mergedIsiMax',            0.20, @(x) isscalar(x) && isnumeric(x));   % refractory cap on the MERGED train
 p.addParameter('wfCacheMB',                512, @(x) isscalar(x) && isnumeric(x));   % cap on the per-unit waveform cache
 p.addParameter('overlap_removal', true, @(x) islogical(x) || isnumeric(x));
@@ -861,6 +861,13 @@ if opt.merging
             % separates them on alignment alone, which is not evidence of two
             % neurons (a 1-sample offset scores identical populations at 1.00,
             % and 39% of correlation-passing pairs here carry a lag).
+            %
+            % The cut sits at 0.92, not 0.85: these clusters were produced by a
+            % clusterer, so another clusterer can usually re-find the boundary
+            % it drew. Measured on a Utah recording, a pair that is one neuron
+            % by every other measure (corr 0.958, amplitude difference 0.031,
+            % merged-train ISI 0.006%) still scored 0.905 here and was refused.
+            % Above ~0.92 the two clouds really are distinct populations.
             if ~isempty(sepWI)
                 sepAcc = local_cloudSeparability(sepWI, sepWJ, sepLag);
                 if isfinite(sepAcc) && sepAcc > opt.mergeMaxSeparability, continue; end
