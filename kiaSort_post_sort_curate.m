@@ -794,6 +794,9 @@ if opt.merging
             spkI_now = spk_all(lbl_all == labI);
             spkJ_now = spk_all(lbl_all == labJ);
             if numel(spkI_now) < 1 || numel(spkJ_now) < 1, continue; end
+            % Shared-refractory verdict, evaluated at most once per pair and
+            % reused by both gates that can be overridden. -1 = not yet asked.
+            ccgShared = -1;
             ok = local_checkMergedISI(spkI_now, spkJ_now, ...
                 fs, opt.thresholdISIms, opt.thrIsiAbs, opt.thrIsiBudget, opt.mergedIsiMax);
             if ~ok, continue; end
@@ -839,7 +842,8 @@ if opt.merging
                     [simScore, bestLag] = max_half_corr(eI, eJ, 1, Me, max(1,round(Me/4)), 0);
                     if ~isfinite(simScore) || simScore < opt.xcorrThreshold, continue; end
                     ampDiff = local_ampSimilarity(eI, eJ);
-                    if ~local_ampOk(ampDiff, opt, spkI_now, spkJ_now, fs), continue; end
+                    [ampOk, ccgShared] = local_ampOk(ampDiff, opt, spkI_now, spkJ_now, fs, ccgShared);
+                    if ~ampOk, continue; end
                     % Two clouds that a clusterer cannot tell apart are one
                     % neuron. Recovery near chance -> merge; well separated
                     % -> two neurons, refuse.
@@ -849,12 +853,14 @@ if opt.merging
                     % the mean-waveform gates rather than merging blind
                     if simScore < opt.xcorrThreshold, continue; end
                     ampDiff = local_ampSimilarity(mw1(:)', mw2(:)');
-                    if ~local_ampOk(ampDiff, opt, spkI_now, spkJ_now, fs), continue; end
+                    [ampOk, ccgShared] = local_ampOk(ampDiff, opt, spkI_now, spkJ_now, fs, ccgShared);
+                    if ~ampOk, continue; end
                 end
             else
                 if simScore < opt.xcorrThreshold, continue; end
                 ampDiff = local_ampSimilarity(mw1(:)', mw2(:)');
-                if ~local_ampOk(ampDiff, opt, spkI_now, spkJ_now, fs), continue; end
+                [ampOk, ccgShared] = local_ampOk(ampDiff, opt, spkI_now, spkJ_now, fs, ccgShared);
+                if ~ampOk, continue; end
             end
 
             ok = local_checkPCDistance(wfI, wfJ, chI, chJ, sortedSamples, ...
@@ -875,7 +881,17 @@ if opt.merging
             % Above ~0.92 the two clouds really are distinct populations.
             if ~isempty(sepWI)
                 sepAcc = local_cloudSeparability(sepWI, sepWJ, sepLag);
-                if isfinite(sepAcc) && sepAcc > opt.mergeMaxSeparability, continue; end
+                if isfinite(sepAcc) && sepAcc > opt.mergeMaxSeparability
+                    % Same override as thrAmp, and for the same reason: this
+                    % gate asks whether a clusterer can tell the two clouds
+                    % apart, but these clouds were DRAWN by a clusterer, so it
+                    % usually can. Two trains that never fire inside each
+                    % other's refractory period are one neuron whatever the
+                    % waveforms allow, so that evidence outranks it.
+                    [shared, ccgShared] = local_sharedRefractory(opt, ...
+                        spkI_now, spkJ_now, fs, ccgShared);
+                    if ~shared, continue; end
+                end
             end
 
             nI = numel(spkI_now);
@@ -1465,7 +1481,7 @@ if all(~isfinite(mw(:))) || all(mw(:) == 0), mw = []; end
 end
 
 
-function ok = local_ampOk(ampDiff, opt, spkA, spkB, fs)
+function [ok, ccgShared] = local_ampOk(ampDiff, opt, spkA, spkB, fs, ccgShared)
 %LOCAL_AMPOK  thrAmp, waived when the two trains share a refractory period.
 %
 % thrAmp exists to stop a big unit swallowing a small one. But amplitude is
@@ -1474,19 +1490,37 @@ function ok = local_ampOk(ampDiff, opt, spkA, spkB, fs)
 % channel, different scale. Two spike trains that are really one neuron
 % cannot fire inside each other's refractory period, and that is evidence
 % thrAmp cannot see, so it is allowed to override.
+ok = isfinite(ampDiff) && ampDiff <= opt.thrAmp;
+if ok, return; end
+if ~isfinite(ampDiff), return; end          % flat template: no evidence either way
+[ok, ccgShared] = local_sharedRefractory(opt, spkA, spkB, fs, ccgShared);
+end
+
+
+function [shared, ccgShared] = local_sharedRefractory(opt, spkA, spkB, fs, ccgShared)
+%LOCAL_SHAREDREFRACTORY  Do these two trains avoid each other beyond chance?
+%
+% One neuron cut in two cannot fire inside its own refractory period, so the
+% halves coincide far below chance; two real neurons coincide at roughly
+% chance or above. Cached per pair, since two gates consult it.
 %
 % Measured on a 96-channel Utah recording: of 24 pairs blocked by thrAmp
 % alone with enough coincidence power, the ratios were 0.09 then a gap to
 % 0.67 and up to 2.80 (median 1.44 across all same-channel pairs). The cut
-% at 0.5 sits inside that gap, so it admits the one genuine over-split
-% (corr 0.993, thrAmp missed by 0.011, merged-train ISI 0.09%) and nothing else.
-ok = isfinite(ampDiff) && ampDiff <= opt.thrAmp;
-if ok || ~opt.ampCcgOverride, return; end
-if ~isfinite(ampDiff), return; end          % flat template: no evidence either way
+% at 0.5 sits inside that gap, so it admits the genuine over-splits and
+% nothing else -- unlike a waveform threshold, which has no such gap.
+if nargin >= 5 && ~isempty(ccgShared) && ccgShared >= 0
+    shared = logical(ccgShared);
+    return;
+end
+shared = false;
+if ~opt.ampCcgOverride, ccgShared = 0; return; end
 [ratio, expc] = local_pairCoincidence(spkA, spkB, fs, opt.ampCcgBandMs);
 % Abstain without power: a small expected count makes "observed few" mean nothing.
-if ~isfinite(expc) || expc < opt.ampCcgMinExpected, return; end
-ok = isfinite(ratio) && ratio < opt.ampCcgMax;
+if isfinite(expc) && expc >= opt.ampCcgMinExpected
+    shared = isfinite(ratio) && ratio < opt.ampCcgMax;
+end
+ccgShared = double(shared);
 end
 
 
