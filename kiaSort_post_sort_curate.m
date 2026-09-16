@@ -102,6 +102,10 @@ p.addParameter('spikeCapN',               5000, @(x) isscalar(x) && isnumeric(x)
 p.addParameter('minSpikesForMerge',         50, @(x) isscalar(x) && isnumeric(x));   % below this, fall back to the means
 p.addParameter('mergeMaxSeparability',    0.92, @(x) isscalar(x) && isnumeric(x));   % cloud-overlap gate (0.5 = chance)
 p.addParameter('mergedIsiMax',            0.20, @(x) isscalar(x) && isnumeric(x));   % refractory cap on the MERGED train
+p.addParameter('ampCcgOverride',         true, @(x) islogical(x) || isnumeric(x));  % waive thrAmp on shared refractoriness
+p.addParameter('ampCcgMax',               0.5, @(x) isscalar(x) && isnumeric(x));   % coincidence over chance below which the pair is one cell
+p.addParameter('ampCcgMinExpected',        20, @(x) isscalar(x) && isnumeric(x));   % abstain below this expected count
+p.addParameter('ampCcgBandMs',      [0.4 2.0], @(x) isnumeric(x) && numel(x)==2);   % lag band: above the detector dead time, inside the refractory period
 p.addParameter('wfCacheMB',                512, @(x) isscalar(x) && isnumeric(x));   % cap on the per-unit waveform cache
 p.addParameter('overlap_removal', true, @(x) islogical(x) || isnumeric(x));
 p.addParameter('overlapHighFrac', 0.50, @(x) isscalar(x) && isnumeric(x));
@@ -115,6 +119,7 @@ p.parse(outputPath, varargin{:});
 opt = p.Results;
 opt.ccg_cleaning    = logical(opt.ccg_cleaning);
 opt.merging         = logical(opt.merging);
+opt.ampCcgOverride  = logical(opt.ampCcgOverride);
 opt.overlap_removal = logical(opt.overlap_removal);
 opt.verbose         = logical(opt.verbose);
 
@@ -834,7 +839,7 @@ if opt.merging
                     [simScore, bestLag] = max_half_corr(eI, eJ, 1, Me, max(1,round(Me/4)), 0);
                     if ~isfinite(simScore) || simScore < opt.xcorrThreshold, continue; end
                     ampDiff = local_ampSimilarity(eI, eJ);
-                    if ~isfinite(ampDiff) || ampDiff > opt.thrAmp, continue; end
+                    if ~local_ampOk(ampDiff, opt, spkI_now, spkJ_now, fs), continue; end
                     % Two clouds that a clusterer cannot tell apart are one
                     % neuron. Recovery near chance -> merge; well separated
                     % -> two neurons, refuse.
@@ -844,12 +849,12 @@ if opt.merging
                     % the mean-waveform gates rather than merging blind
                     if simScore < opt.xcorrThreshold, continue; end
                     ampDiff = local_ampSimilarity(mw1(:)', mw2(:)');
-                    if ~isfinite(ampDiff) || ampDiff > opt.thrAmp, continue; end
+                    if ~local_ampOk(ampDiff, opt, spkI_now, spkJ_now, fs), continue; end
                 end
             else
                 if simScore < opt.xcorrThreshold, continue; end
                 ampDiff = local_ampSimilarity(mw1(:)', mw2(:)');
-                if ~isfinite(ampDiff) || ampDiff > opt.thrAmp, continue; end
+                if ~local_ampOk(ampDiff, opt, spkI_now, spkJ_now, fs), continue; end
             end
 
             ok = local_checkPCDistance(wfI, wfJ, chI, chJ, sortedSamples, ...
@@ -1457,4 +1462,58 @@ else
     mw = reshape(MW(u,:), 1, []);
 end
 if all(~isfinite(mw(:))) || all(mw(:) == 0), mw = []; end
+end
+
+
+function ok = local_ampOk(ampDiff, opt, spkA, spkB, fs)
+%LOCAL_AMPOK  thrAmp, waived when the two trains share a refractory period.
+%
+% thrAmp exists to stop a big unit swallowing a small one. But amplitude is
+% also what the post-hoc split separates on, so a 10% match tolerance refuses
+% to rejoin exactly the fragments that pass creates -- same shape, same
+% channel, different scale. Two spike trains that are really one neuron
+% cannot fire inside each other's refractory period, and that is evidence
+% thrAmp cannot see, so it is allowed to override.
+%
+% Measured on a 96-channel Utah recording: of 24 pairs blocked by thrAmp
+% alone with enough coincidence power, the ratios were 0.09 then a gap to
+% 0.67 and up to 2.80 (median 1.44 across all same-channel pairs). The cut
+% at 0.5 sits inside that gap, so it admits the one genuine over-split
+% (corr 0.993, thrAmp missed by 0.011, merged-train ISI 0.09%) and nothing else.
+ok = isfinite(ampDiff) && ampDiff <= opt.thrAmp;
+if ok || ~opt.ampCcgOverride, return; end
+if ~isfinite(ampDiff), return; end          % flat template: no evidence either way
+[ratio, expc] = local_pairCoincidence(spkA, spkB, fs, opt.ampCcgBandMs);
+% Abstain without power: a small expected count makes "observed few" mean nothing.
+if ~isfinite(expc) || expc < opt.ampCcgMinExpected, return; end
+ok = isfinite(ratio) && ratio < opt.ampCcgMax;
+end
+
+
+function [ratio, expc] = local_pairCoincidence(tA, tB, fs, bandMs)
+%LOCAL_PAIRCOINCIDENCE  Coincidences in a lag band over what chance predicts.
+%
+% The band starts above the detector dead time (spikeDistance), where any two
+% units on one channel are suppressed whatever their identity -- measuring
+% from zero makes every same-channel pair look mutually exclusive.
+ratio = NaN; expc = NaN;
+tA = unique(sort(double(tA(:))));
+tB = unique(sort(double(tB(:))));
+if numel(tA) < 20 || numel(tB) < 20, return; end
+if numel(tA) > numel(tB), tmp = tA; tA = tB; tB = tmp; end
+span = max([tA; tB]) - min([tA; tB]);
+if span <= 0, return; end
+rB = numel(tB) / (span / fs);
+lo = bandMs(1) * 1e-3 * fs;
+hi = bandMs(2) * 1e-3 * fs;
+j  = max(min(interp1(tB, 1:numel(tB), tA, 'nearest', 'extrap'), numel(tB)), 1);
+cnt = 0;
+for i = 1:numel(tA)
+    i1 = max(1, j(i) - 60);
+    i2 = min(numel(tB), j(i) + 60);
+    d  = abs(tB(i1:i2) - tA(i));
+    cnt = cnt + sum(d > lo & d <= hi);
+end
+expc  = numel(tA) * rB * 2 * (bandMs(2) - bandMs(1)) * 1e-3;
+ratio = cnt / max(expc, 1e-9);
 end
