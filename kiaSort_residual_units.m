@@ -62,7 +62,8 @@ function report = kiaSort_residual_units(outputPath, varargin)
 %       'ccgBandMs'     ([0.4 2]) lag band, above the detector dead time
 %       'nBins'         (20)    bins for the coexistence test
 %       'minBinSpikes'  (5)     host spikes for a bin to count
-%       'maxPerUnit'    (1)     promotions per host unit
+%       'maxPerUnit'    (2)     promotions per host unit, so a pool that
+%                               splits cleanly can yield both halves
 %       'spikeCap'      (4000)  waveforms read per pool
 %       'verbose'       (false)
 
@@ -81,7 +82,7 @@ p.addParameter('ccgIndepMin',   0.5, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('ccgBandMs', [0.4 2], @(x) isnumeric(x) && numel(x)==2);
 p.addParameter('nBins',          20, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minBinSpikes',    5, @(x) isscalar(x) && isnumeric(x));
-p.addParameter('maxPerUnit',      1, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('maxPerUnit',      2, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('spikeCap',     4000, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('verbose',     false, @(x) islogical(x) || isnumeric(x));
 p.parse(outputPath, varargin{:});
@@ -279,7 +280,13 @@ end
 % =========================================================================
 
 function c = local_poolCandidates(a, minN)
-%LOCAL_POOLCANDIDATES  The pool as a whole, plus a clean amplitude split.
+%LOCAL_POOLCANDIDATES  What to offer the adjudicator, in priority order.
+%
+% A pool can hold more than one thing -- a steady foreign cell plus a later
+% amplitude event, say. When the pool's own amplitude splits cleanly, the
+% HALVES are offered and the whole is not: promoting the whole first would
+% hand back a unit as bimodal as the one the pass exists to clean up
+% (measured: promoting intact gave a new unit at eta 0.92).
 c = {(1:numel(a))'};
 if numel(a) < 2*minN, return; end
 try
@@ -289,8 +296,13 @@ catch
 end
 if isnan(thr) || eta < 0.75, return; end
 lo = find(a <= thr); hi = find(a > thr);
-if numel(lo) >= minN, c{end+1} = lo; end
-if numel(hi) >= minN, c{end+1} = hi; end
+if numel(lo) >= minN && numel(hi) >= minN
+    c = {lo, hi};                 % clean split: the halves replace the whole
+elseif numel(lo) >= minN
+    c = {lo, c{1}};
+elseif numel(hi) >= minN
+    c = {hi, c{1}};
+end
 end
 
 
