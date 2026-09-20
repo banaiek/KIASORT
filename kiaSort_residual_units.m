@@ -65,6 +65,17 @@ function report = kiaSort_residual_units(outputPath, varargin)
 %       'maxPerUnit'    (2)     promotions per host unit, so a pool that
 %                               splits cleanly can yield both halves
 %       'spikeCap'      (4000)  waveforms read per pool
+%       'rejectOutliers'(true)  unassign lone spikes far outside their unit's
+%                               amplitude range once the pools are settled
+%       'outlierFactor' (3)     multiple of the unit's 99th percentile. Only
+%                               applied when there are fewer than
+%                               minPoolSpikes of them, so a drifting
+%                               population -- always many spikes -- can never
+%                               be rejected this way. Measured here: 54 such
+%                               spikes in 7.09M, median 1 per unit, never more
+%                               than 2, i.e. isolated events rather than a
+%                               population. They are set to -1 (unassigned),
+%                               not removed: the row stays in every H5 output
 %       'verbose'       (false)
 
 p = inputParser;
@@ -84,12 +95,15 @@ p.addParameter('nBins',          20, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minBinSpikes',    5, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('maxPerUnit',      2, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('spikeCap',     4000, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('rejectOutliers', true, @(x) islogical(x) || isnumeric(x));
+p.addParameter('outlierFactor',    3, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('verbose',     false, @(x) islogical(x) || isnumeric(x));
 p.parse(outputPath, varargin{:});
 opt = p.Results;
 opt.verbose = logical(opt.verbose);
+opt.rejectOutliers = logical(opt.rejectOutliers);
 
-report = struct('nPromoted', 0, 'nTested', 0, 'newLabels', [], ...
+report = struct('nPromoted', 0, 'nTested', 0, 'nOutliers', 0, 'newLabels', [], ...
                 'changed', false, 'ok', false, 'log', []);
 
 outputPath = char(outputPath);
@@ -191,7 +205,12 @@ for u = 1:numel(labels)
         if nProm >= opt.maxPerUnit, break; end
         sub  = poolIdx(cands{ci});
         pRow = rows(sub);
-        hRow = rows(~ismember((1:numel(rows))', sub));
+        % The comparison is against the unit's CORE, i.e. every pool spike
+        % removed -- not merely this candidate. Leaving the other half of a
+        % split pool in the host inflates its 95th percentile and the gap
+        % test then rejects a candidate that is plainly separated from the
+        % core, so only one half of a two-component pool ever got promoted.
+        hRow = rows(~pool);
         [okProm, rec] = local_adjudicate(pRow, hRow, spk, amp, chn, fs, wfSrc, opt);
         rec.label  = lab;
         rec.nPool  = numel(pRow);
@@ -223,8 +242,37 @@ for u = 1:numel(labels)
     end
 end
 
+% ---- lone amplitude outliers ------------------------------------------
+% Template matching is argmin with no reject option, so a spike that belongs
+% to nothing lands on the least-bad template however absurd the fit. Those
+% survive the pool logic because there are only ever one or two of them per
+% unit -- far below the count needed to argue they are a cell. Run AFTER the
+% promotions, so the percentile they are judged against is the host's own
+% once any real population has been lifted out.
+outRows = [];
+if opt.rejectOutliers
+    for u = 1:numel(labels)
+        rows = find(newLbl == labels(u));
+        if numel(rows) < 20, continue; end
+        a  = abs(amp(rows));
+        cut = opt.outlierFactor * prctile(a, 99);
+        bad = rows(a > cut);
+        % Many of them would be a population, and a drifting unit is always a
+        % population. Leave those to the pool logic above.
+        if isempty(bad) || numel(bad) >= opt.minPoolSpikes, continue; end
+        outRows = [outRows; bad(:)]; %#ok<AGROW>
+    end
+end
+if ~isempty(outRows)
+    newLbl(outRows) = -1;
+    report.nOutliers = numel(outRows);
+    if opt.verbose
+        fprintf('Residual units: %d lone amplitude outliers unassigned.\n', numel(outRows));
+    end
+end
+
 report.log = lg;
-if report.nPromoted == 0
+if report.nPromoted == 0 && report.nOutliers == 0
     report.ok = true;
     if opt.verbose, fprintf('Residual units: nothing promoted (%d pools tested).\n', report.nTested); end
     return;
@@ -242,6 +290,7 @@ try
     for k = 1:numel(addRows)
         unif = local_appendUnit(unif, addRows(k).parent, addRows(k).label, addRows(k).meanWave);
     end
+    if isempty(addRows), addRows = struct('parent',{},'label',{},'meanWave',{}); end
     [unif, newLbl, ~, remap] = kiaSort_compact_unit_table(unif, newLbl);
     if exist(paths.lbl, 'file'), delete(paths.lbl); end
     h5create(paths.lbl, ['/' H.lbl], size(newLbl), 'Datatype', 'double');
@@ -270,7 +319,8 @@ end
 report.changed = true;
 report.ok      = true;
 if opt.verbose
-    fprintf('Residual units: %d promoted from %d pools.\n', report.nPromoted, report.nTested);
+    fprintf('Residual units: %d promoted from %d pools, %d outliers unassigned.\n', ...
+        report.nPromoted, report.nTested, report.nOutliers);
 end
 end
 
