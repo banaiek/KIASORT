@@ -55,6 +55,16 @@ function report = kiaSort_residual_units(outputPath, varargin)
 %                               tail of their host, not a separate cell. Only
 %                               a pool that clears the host's distribution is
 %                               promoted.
+%       'evidenceAmpGap'  (0.9)  second, evidence-backed route to promotion:
+%       'evidenceAmpRatio'(1.7)  a weaker amplitude separation is accepted
+%       'evidenceCcgMin'  (50)   when the independence test has real power
+%                               (expected count at least evidenceCcgMin) and
+%                               passes. Amplitude separation is a proxy for
+%                               "two cells"; an independent firing pattern is
+%                               direct evidence, so it earns a looser proxy.
+%                               Measured: the strict bar alone missed four
+%                               pools of 3000-7800 spikes with expected counts
+%                               55-316, one of them short of the bar by 0.01.
 %       'maxPoolIsi'    (1.0)   pool's own ISI violation cap (%, at 2 ms)
 %       'minCoherence'  (0.85)  mean correlation of pool spikes to the pool
 %                               mean, when waveforms are available
@@ -87,6 +97,9 @@ p.addParameter('driftCorr',    -0.5, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('driftSlope',   -0.3, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minAmpRatio',   2.0, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minAmpGap',     1.2, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('evidenceAmpGap',  0.9, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('evidenceAmpRatio',1.7, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('evidenceCcgMin',   50, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('maxPoolIsi',    1.0, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minCoherence', 0.85, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('ccgIndepMin',   0.5, @(x) isscalar(x) && isnumeric(x));
@@ -409,10 +422,6 @@ if isDrift
 end
 
 rec.ampGap = prctile(ap, 10) / max(prctile(ah, 95), eps);
-if ~isfinite(rec.ampRatio) || rec.ampRatio < opt.minAmpRatio || ...
-        ~isfinite(rec.ampGap) || rec.ampGap < opt.minAmpGap
-    rec.why = "amplitude not separated"; return;
-end
 
 try
     [~, ~, rec.poolIsi] = getISIViolations(tp, fs, 2);
@@ -428,6 +437,20 @@ end
 if isfinite(rec.ccgExpected) && rec.ccgExpected >= 20 && ...
         isfinite(rec.ccgRatio) && rec.ccgRatio < opt.ccgIndepMin
     rec.why = "not independent of host"; return;   % same cell, not a new one
+end
+
+% ---- amplitude separation, by either route ------------------------------
+% Amplitude separation is only a proxy for "two cells". An independent
+% firing pattern is direct evidence, so when the coincidence test has real
+% power and passes it earns a looser proxy.
+strict = isfinite(rec.ampRatio) && rec.ampRatio >= opt.minAmpRatio && ...
+         isfinite(rec.ampGap)   && rec.ampGap   >= opt.minAmpGap;
+evidenced = isfinite(rec.ampRatio) && rec.ampRatio >= opt.evidenceAmpRatio && ...
+            isfinite(rec.ampGap)   && rec.ampGap   >= opt.evidenceAmpGap && ...
+            isfinite(rec.ccgExpected) && rec.ccgExpected >= opt.evidenceCcgMin && ...
+            isfinite(rec.ccgRatio)    && rec.ccgRatio    >= opt.ccgIndepMin;
+if ~strict && ~evidenced
+    rec.why = "amplitude not separated"; return;
 end
 
 % ---- the pool has to be one thing --------------------------------------

@@ -806,8 +806,9 @@ if isfield(cfg,'postHocProcessing')
             if isfield(cfg,'residualUnits') && cfg.residualUnits
                 try
                     rr = kiaSort_residual_units(outputPath, 'verbose', false);
-                    fprintf(pfid, 'Residual units: %d promoted from %d pools (changed=%d).\n', ...
-                        rr.nPromoted, rr.nTested, rr.changed);
+                    fprintf(pfid, ['Residual units: %d promoted from %d pools, ' ...
+                        '%d lone outliers unassigned (changed=%d).\n'], ...
+                        rr.nPromoted, rr.nTested, rr.nOutliers, rr.changed);
                 catch ME
                     fprintf(pfid, 'Residual units FAILED (continuing): %s\n', ME.message);
                     warning('kiaSort:residualUnits', 'Residual units skipped: %s', ME.message);
