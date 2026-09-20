@@ -800,6 +800,21 @@ if isfield(cfg,'postHocProcessing')
             else
                 fprintf(pfid, 'Bimodal split: disabled.\n');
             end
+            % After the split (so a bimodal unit is already separated where
+            % it can be) and before the merge pass (so anything promoted here
+            % still gets checked against its neighbours).
+            if isfield(cfg,'residualUnits') && cfg.residualUnits
+                try
+                    rr = kiaSort_residual_units(outputPath, 'verbose', false);
+                    fprintf(pfid, 'Residual units: %d promoted from %d pools (changed=%d).\n', ...
+                        rr.nPromoted, rr.nTested, rr.changed);
+                catch ME
+                    fprintf(pfid, 'Residual units FAILED (continuing): %s\n', ME.message);
+                    warning('kiaSort:residualUnits', 'Residual units skipped: %s', ME.message);
+                end
+            else
+                fprintf(pfid, 'Residual units: disabled.\n');
+            end
             if doMerge || doRemove
                 try
                     pr = kiaSort_post_sort_curate(outputPath, ...
