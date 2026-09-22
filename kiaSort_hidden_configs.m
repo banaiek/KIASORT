@@ -36,7 +36,7 @@ extra_cfg = struct(...
     'keepAmpSnr',               1.25, ...           % Class is dropped if its template peak is below this x channel threshold
     'postHocRemoval',           true, ...            % Post-hoc: overlap/duplicate removal
     'postHocDriftMerge',        true, ...           % Post-hoc: drift-aware merge pass
-    'residualUnits',            false ...           % Post-hoc: recover units hidden in poorly-fitting spikes (off by default)
+    'residualUnits',            true ...            % Post-hoc: recover units hidden in poorly-fitting spikes
     );
 
 % Append any missing fields from extra_cfg to cfg

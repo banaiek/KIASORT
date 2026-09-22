@@ -29,7 +29,7 @@ function report = kiaSort_residual_units(outputPath, varargin)
 %
 %   NOTHING IS EVER DELETED. The pass only moves flagged spikes from an
 %   existing unit into a new one, so the worst case is an extra unit, never
-%   lost data. It is off unless cfg.residualUnits is set.
+%   lost data. It runs by default; set cfg.residualUnits = false to skip it.
 %
 %   Name/Value:
 %       'zDefer'        (5)     fit-outlier cut, in robust sd of the unit's
