@@ -790,9 +790,14 @@ if isfield(cfg,'postHocProcessing')
             % units and can rejoin anything the split separated too eagerly.
             if isfield(cfg,'posthocSplit') && cfg.posthocSplit
                 try
-                    sr = kiaSort_posthoc_split(outputPath, 'verbose', false);
-                    fprintf(pfid, 'Bimodal split: %d of %d units split (changed=%d).\n', ...
-                        sr.nSplit, sr.nTested, sr.changed);
+                    % One cut per unit per pass, so a unit holding three
+                    % populations keeps a bimodal child; repeat until stable.
+                    for iPass = 1:3
+                        sr = kiaSort_posthoc_split(outputPath, 'verbose', false);
+                        fprintf(pfid, 'Bimodal split pass %d: %d of %d units split (changed=%d).\n', ...
+                            iPass, sr.nSplit, sr.nTested, sr.changed);
+                        if sr.nSplit == 0, break; end
+                    end
                 catch ME
                     fprintf(pfid, 'Bimodal split FAILED (continuing): %s\n', ME.message);
                     warning('kiaSort:posthocSplit', 'Post-hoc split skipped: %s', ME.message);

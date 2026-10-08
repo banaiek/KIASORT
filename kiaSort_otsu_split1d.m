@@ -3,6 +3,14 @@ function [thr, sep, valley, eta] = kiaSort_otsu_split1d(t, nb)
 % over the total variance. It measures how well the best possible split
 % distinguishes the two modes, so no valley depth has to be assumed.
 thr = NaN; sep = 0; valley = 1; eta = 0;
+% Histogram over a robust range. With min..max edges a handful of artifact
+% spikes stretch the axis until both real modes share one or two bins, the
+% best cut isolates the outliers, and a clearly bimodal unit reports sep 0.
+t = t(:);
+q = prctile(t, [0.1 99.9]);
+if all(isfinite(q)) && q(2) - q(1) > eps
+    t = min(max(t, q(1)), q(2));
+end
 tmin = min(t); tmax = max(t);
 if ~isfinite(tmin) || ~isfinite(tmax) || (tmax - tmin) <= eps, return; end
 edges = linspace(tmin, tmax, nb+1);

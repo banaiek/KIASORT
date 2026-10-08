@@ -228,7 +228,8 @@ for u = 1:numel(labels)
     if isnan(thrA) || (etaA < sepThr && sepA < sepMinDist)
         splitLog = appendRec(splitLog, rec); continue;
     end
-    thrA = kiaSort_refine_1d_2means(a, thrA);
+    qa = prctile(a, [0.1 99.9]);
+    thrA = kiaSort_refine_1d_2means(min(max(a, qa(1)), qa(2)), thrA);
 
     lowSide = a <= thrA;
     minChild = max(opt.minChildSpikes, ceil(childFr * numel(rows)));
