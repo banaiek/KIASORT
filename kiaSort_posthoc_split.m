@@ -73,8 +73,15 @@ function splitReport = kiaSort_posthoc_split(outputPath, varargin)
 %                                         (default 2 x minChildSpikes)
 %       'maxSplits'       (scalar, Inf)   cap on accepted splits per run
 %       'fitCap'          (scalar, 3000)  waveforms read when extracting raw
-%       'assignMaxSpikes' (scalar, 2e5)   above this, fall back to the amplitude
-%                                         cut rather than read every waveform
+%       'assignMaxSpikes' (scalar, 5e4)   waveforms read for the final
+%                                         assignment; spikes beyond the cap
+%                                         keep the amplitude side. Reading
+%                                         every spike of a 200k unit cost a
+%                                         raw read per spike for no gain
+%       'onlyLabels'      ([])            test only these labels. A later pass
+%                                         uses it with the previous pass's
+%                                         touchedLabels: an untouched unit
+%                                         gives the same answer again
 %       'ccgIndepMin'     (scalar, 0.5)   children must fire independently:
 %                                         coincidence over chance in ccgBandMs
 %       'ccgMinExpected'  (scalar, 20)    below this the test abstains -- with a
@@ -117,7 +124,8 @@ p.addParameter('waveGain',      0.05, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minSpikes',    [],   @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
 p.addParameter('maxSplits',    Inf,  @(x) isscalar(x) && isnumeric(x));
 p.addParameter('fitCap',       3000, @(x) isscalar(x) && isnumeric(x));
-p.addParameter('assignMaxSpikes', 200000, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('assignMaxSpikes', 50000, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('onlyLabels',      [],    @(x) isempty(x) || isnumeric(x));
 p.addParameter('minPresence',  0.8,  @(x) isscalar(x) && isnumeric(x));
 p.addParameter('presenceMaxOverlap', 0.75, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('presenceRateKeep',   0.6,  @(x) isscalar(x) && isnumeric(x));
@@ -133,7 +141,7 @@ opt = p.Results;
 opt.verbose = logical(opt.verbose);
 
 splitReport = struct('nSplit', 0, 'nTested', 0, 'newLabels', [], ...
-                     'changed', false, 'ok', false, 'log', []);
+                     'touchedLabels', [], 'changed', false, 'ok', false, 'log', []);
 
 outputPath       = char(outputPath);
 resSortedFolder  = fullfile(outputPath, 'RES_Sorted');
@@ -260,6 +268,7 @@ nTested   = 0;
 for u = 1:numel(labels)
     if nSplit >= opt.maxSplits, break; end
     lab  = labels(u);
+    if ~isempty(opt.onlyLabels) && ~ismember(lab, opt.onlyLabels), continue; end
     rows = find(newLbl == lab);
     if numel(rows) < opt.minSpikes, continue; end
 
@@ -369,9 +378,9 @@ for u = 1:numel(labels)
     % passed every gate pay for the full read -- kmeans on the leading PCs,
     % seeded from the amplitude cut so it stays deterministic.
     side = lowSide;
-    if numel(rows) <= opt.assignMaxSpikes
-        if numel(wRows) == numel(rows)
-            Wall = W; iAll = wRows;                 % capped read already covered it
+    if true
+        if numel(wRows) == numel(rows) || numel(wRows) >= opt.assignMaxSpikes
+            Wall = W; iAll = wRows;                 % the confirmation read already covers it
         else
             try
                 [Wall, iAll] = localUnitWaveforms(rows, wf, raw, spk_all, chn_all, ...
@@ -448,6 +457,8 @@ splitReport.nTested   = nTested;
 splitReport.nSplit    = nSplit;
 splitReport.log       = splitLog;
 splitReport.newLabels = [addRows.label];
+touched = unique([reshape(labels([addRows.parent]), [], 1); reshape([addRows.label], [], 1)]);
+splitReport.touchedLabels = reshape(touched, 1, []);
 
 if nSplit == 0
     splitReport.ok = true;
@@ -486,6 +497,8 @@ good = ~isnan(m);
 newLbl(sel(good)) = m(good);
 unif.label = (1:nU)';
 splitReport.newLabels = reshape(lut([addRows.label]), 1, []);
+tl = lut(touched(touched >= 1 & touched <= maxOld));
+splitReport.touchedLabels = reshape(tl(~isnan(tl)), 1, []);
 
 % The labels and the unit table are two files. Back them up first and roll
 % back if the second write fails, so the pair is never left disagreeing.

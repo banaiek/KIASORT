@@ -52,7 +52,8 @@ function report = kiaSort_echo_units(outputPath, varargin)
 %       'minChanceRatio'  (3)     ...and at least this many times chance
 %       'leaderChannels'  ([])    channel radius for leaders; default
 %                                 cfg.duplicateSearchChannels, else 2
-%       'capN'            (600)   waveforms read per unit
+%       'capN'            (300)   waveforms read per unit (a mean; the
+%                                 timing test uses every spike)
 %       'minSpikes'       (50)    smaller units are left alone
 %       'apply'           (true)  false = report only, nothing written
 %       'verbose'         (false)
@@ -69,7 +70,7 @@ p.addParameter('lagTolMs',       0.3, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minEchoFrac',    0.3, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minChanceRatio',   3, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('leaderChannels',  [], @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
-p.addParameter('capN',           600, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('capN',           300, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minSpikes',       50, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('apply',         true, @(x) islogical(x) || isnumeric(x));
 p.addParameter('verbose',      false, @(x) islogical(x) || isnumeric(x));

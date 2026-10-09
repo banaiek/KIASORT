@@ -811,12 +811,16 @@ if isfield(cfg,'postHocProcessing')
                     % Later passes confirm on shape only: the remainder of a
                     % unit that just lost a sparse cell is easily re-cut on
                     % amplitude alone, and those cuts were one cell in two.
+                    % Passes 2 and 3 re-test only the units the previous pass
+                    % touched; an untouched unit would give the same answer.
+                    touched = [];
                     for iPass = 1:3
                         sr = kiaSort_posthoc_split(outputPath, 'verbose', false, ...
-                            'requireShape', iPass > 1);
+                            'requireShape', iPass > 1, 'onlyLabels', touched);
                         fprintf(pfid, 'Bimodal split pass %d: %d of %d units split (changed=%d).\n', ...
                             iPass, sr.nSplit, sr.nTested, sr.changed);
-                        if sr.nSplit == 0, break; end
+                        if sr.nSplit == 0 || isempty(sr.touchedLabels), break; end
+                        touched = sr.touchedLabels;
                     end
                 catch ME
                     fprintf(pfid, 'Bimodal split FAILED (continuing): %s\n', ME.message);
