@@ -57,6 +57,14 @@ function splitReport = kiaSort_posthoc_split(outputPath, varargin)
 %       'maxMedianShift'  (scalar, cfg.bimodalMaxMedianShift)  drift veto
 %       'clusterSim'      (scalar, 0.6)   route a: min agreement of two-means
 %                                         with the amplitude cut
+%       'requireShape'    (logical, false) disable route a, so only a shape
+%                                         difference confirms. The pipeline
+%                                         sets it on passes 2 and 3: once a
+%                                         sparse cell has been cut out, the
+%                                         remainder's eta rises and two-means
+%                                         would cut it again on amplitude
+%                                         alone (measured: 911/636 spikes at
+%                                         206/306 with shape score 0.70).
 %       'waveSim'         (scalar, 0.75)  route b: min balanced accuracy of the
 %                                         shape classifier against the cut
 %       'waveGain'        (scalar, 0.05)  ...and by how much it must beat the
@@ -103,6 +111,7 @@ p.addParameter('minChildFloor',  [], @(x) isempty(x) || (isscalar(x) && isnumeri
 p.addParameter('minTimeOverlap', [], @(x) isempty(x) || isscalar(x));
 p.addParameter('maxMedianShift', [], @(x) isempty(x) || isscalar(x));
 p.addParameter('clusterSim',    0.6,  @(x) isscalar(x) && isnumeric(x));
+p.addParameter('requireShape', false, @(x) islogical(x) || isnumeric(x));
 p.addParameter('waveSim',       0.75, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('waveGain',      0.05, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('minSpikes',    [],   @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
@@ -311,7 +320,7 @@ for u = 1:numel(labels)
     shapeOK = isfinite(rec.shapeAcc) && rec.shapeAcc >= opt.waveSim && ...
               (~isfinite(rec.shapeNull) || rec.shapeAcc - rec.shapeNull >= opt.waveGain);
     clusterOK = false;
-    if etaA >= sepThrStrong || sepA >= sepMinDistStrong
+    if ~opt.requireShape && (etaA >= sepThrStrong || sepA >= sepMinDistStrong)
         cl = localTwoCluster(W, lowSide(wRows));
         if ~isempty(cl)
             agree = mean(cl(:) == lowSide(wRows));

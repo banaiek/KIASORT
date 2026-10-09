@@ -808,8 +808,12 @@ if isfield(cfg,'postHocProcessing')
                 try
                     % One cut per unit per pass, so a unit holding three
                     % populations keeps a bimodal child; repeat until stable.
+                    % Later passes confirm on shape only: the remainder of a
+                    % unit that just lost a sparse cell is easily re-cut on
+                    % amplitude alone, and those cuts were one cell in two.
                     for iPass = 1:3
-                        sr = kiaSort_posthoc_split(outputPath, 'verbose', false);
+                        sr = kiaSort_posthoc_split(outputPath, 'verbose', false, ...
+                            'requireShape', iPass > 1);
                         fprintf(pfid, 'Bimodal split pass %d: %d of %d units split (changed=%d).\n', ...
                             iPass, sr.nSplit, sr.nTested, sr.changed);
                         if sr.nSplit == 0, break; end
