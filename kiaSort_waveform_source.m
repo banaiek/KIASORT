@@ -1,7 +1,10 @@
-function src = kiaSort_waveform_source(outputPath, cfg, verbose)
+function src = kiaSort_waveform_source(outputPath, cfg, verbose, forceRaw)
 %KIASORT_WAVEFORM_SOURCE  Resolve where per-spike waveforms can be read from.
 %
-%   src = kiaSort_waveform_source(outputPath, cfg, verbose)
+%   src = kiaSort_waveform_source(outputPath, cfg, verbose, forceRaw)
+%
+%   forceRaw (false) skips the saved file and goes to the raw recording,
+%   for a caller that needs a wider window than the one that was saved.
 %
 %   Prefers RES_Sorted/waveforms*.h5, whose rows are aligned with the other
 %   H5 outputs, so a unit's spikes can be pulled straight out. Falls back to
@@ -18,12 +21,14 @@ src = struct('ok', false, 'mode', '', 'half', 0, ...
              'file', '', 'dset', '', 'sz', [], 'is3d', false, 'nT', 0, ...
              'map', [], 'chanMap', [], 'nSamp', 0, 'cfg', cfg);
 if nargin < 3, verbose = false; end
+if nargin < 4, forceRaw = false; end
 if ~isstruct(cfg) || ~isfield(cfg, 'samplingFrequency'), return; end
 
 src.half = round((cfg.spikeDuration/2) * cfg.samplingFrequency / 1000);
 
 resSorted = fullfile(char(outputPath), 'RES_Sorted');
 d = dir(fullfile(resSorted, 'waveforms*.h5'));
+if forceRaw, d = []; end
 for i = 1:numel(d)
     f = fullfile(resSorted, d(i).name);
     try

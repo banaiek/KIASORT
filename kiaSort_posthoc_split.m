@@ -14,10 +14,22 @@ function splitReport = kiaSort_posthoc_split(outputPath, varargin)
 %        (separability) -- no valley depth is assumed.
 %     2) Veto drift: the two sides must overlap in time. A drifting single
 %        unit is also bimodal but its halves are consecutive, not interleaved.
-%     3) Re-cluster the waveforms of the two sides and keep the split only if
-%        the waveforms agree with the amplitude cut. Child ISI is recorded
-%        but not gated: splitting a cell out of noise leaves a dirty child
-%        by design.
+%     3) Confirm on the waveforms, by either of two routes:
+%        a) a unit nominated at the strong thresholds (cfg.bimodalSeparability
+%           / bimodalMinSepDistance, 0.75 / 1.75) passes when two-means on
+%           the leading PCs agrees with the amplitude cut (clusterSim). This
+%           is the original test, kept so that the balanced splits it made
+%           before are still made.
+%        b) any nominated unit passes on SHAPE: every waveform is scaled to
+%           its own peak so amplitude carries no information, and a linear
+%           classifier on the leading shape PCs must recover the amplitude
+%           cut (cross-validated balanced accuracy, 0.5 = chance) and beat
+%           the same classifier run within the low side alone. Two-means
+%           ignores a small second population (on a 3-28%% minority it agreed
+%           with the cut at 0.53-0.59, chance), so this is the route that
+%           lets a short recording split out a sparse foreign cell.
+%        Child ISI is recorded but not gated: splitting a cell out of noise
+%        leaves a dirty child by design.
 %     4) Require both children to be stable across the recording. A child
 %        confined to part of the parent's span is an epoch, not a cell, and
 %        the split is reverted.
@@ -30,16 +42,27 @@ function splitReport = kiaSort_posthoc_split(outputPath, varargin)
 %   least one split is accepted.
 %
 %   Name/Value:
-%       'separability'    (scalar, cfg.bimodalSeparability)    Otsu eta gate
-%       'minSepDistance'  (scalar, 1.75)  alternative detection: mode distance
-%                                         in pooled sd, for unbalanced splits
+%       'separability'    (scalar, cfg.posthocSeparability, 0.70)  Otsu eta
+%                                         nomination; the shape, drift and
+%                                         presence gates do the confirming
+%       'minSepDistance'  (scalar, cfg.posthocMinSepDistance, 1.6)  alternative
+%                                         nomination: mode distance in pooled
+%                                         sd, for unbalanced splits
 %       'minChildFrac'    (scalar, 0)     optional extra bar as a fraction of the unit
-%       'minChildSpikes'  (scalar, 200)   absolute min child size
+%       'minChildSpikes'  (scalar, [])    min child size; default derives from
+%                                         minChildRateHz x duration, floored at
+%                                         minChildFloor (cfg posthocMinRateHz /
+%                                         posthocMinSpikesFloor: 0.03 Hz, 50)
 %       'minTimeOverlap'  (scalar, cfg.bimodalMinTimeOverlap)  drift veto
 %       'maxMedianShift'  (scalar, cfg.bimodalMaxMedianShift)  drift veto
-%       'waveSim'         (scalar, 0.6)   min agreement between the waveform
-%                                         clustering and the amplitude cut
-%       'minSpikes'       (scalar, 200)   skip units smaller than this
+%       'clusterSim'      (scalar, 0.6)   route a: min agreement of two-means
+%                                         with the amplitude cut
+%       'waveSim'         (scalar, 0.75)  route b: min balanced accuracy of the
+%                                         shape classifier against the cut
+%       'waveGain'        (scalar, 0.05)  ...and by how much it must beat the
+%                                         within-side null
+%       'minSpikes'       (scalar, [])    skip units smaller than this
+%                                         (default 2 x minChildSpikes)
 %       'maxSplits'       (scalar, Inf)   cap on accepted splits per run
 %       'fitCap'          (scalar, 3000)  waveforms read when extracting raw
 %       'assignMaxSpikes' (scalar, 2e5)   above this, fall back to the amplitude
@@ -74,11 +97,15 @@ p.addRequired('outputPath', @(x) ischar(x) || isstring(x));
 p.addParameter('separability',   [], @(x) isempty(x) || isscalar(x));
 p.addParameter('minSepDistance', [], @(x) isempty(x) || isscalar(x));
 p.addParameter('minChildFrac',    0, @(x) isscalar(x) && isnumeric(x));
-p.addParameter('minChildSpikes', 200, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('minChildSpikes', [], @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
+p.addParameter('minChildRateHz', [], @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
+p.addParameter('minChildFloor',  [], @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
 p.addParameter('minTimeOverlap', [], @(x) isempty(x) || isscalar(x));
 p.addParameter('maxMedianShift', [], @(x) isempty(x) || isscalar(x));
-p.addParameter('waveSim',      0.6,  @(x) isscalar(x) && isnumeric(x));
-p.addParameter('minSpikes',    200,  @(x) isscalar(x) && isnumeric(x));
+p.addParameter('clusterSim',    0.6,  @(x) isscalar(x) && isnumeric(x));
+p.addParameter('waveSim',       0.75, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('waveGain',      0.05, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('minSpikes',    [],   @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
 p.addParameter('maxSplits',    Inf,  @(x) isscalar(x) && isnumeric(x));
 p.addParameter('fitCap',       3000, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('assignMaxSpikes', 200000, @(x) isscalar(x) && isnumeric(x));
@@ -160,7 +187,10 @@ end
 if isempty(cfgRaw) || ~isfield(cfgRaw, 'samplingFrequency'), return; end
 fs = cfgRaw.samplingFrequency;
 
-sepThr   = pick(opt.separability,   cfgRaw, 'bimodalSeparability',   0.75);
+sepThr   = pick(opt.separability,   cfgRaw, 'posthocSeparability',   0.70);
+% Strong nomination: the thresholds the two-means route (a) is calibrated at.
+sepThrStrong     = pick([], cfgRaw, 'bimodalSeparability',   0.75);
+sepMinDistStrong = pick([], cfgRaw, 'bimodalMinSepDistance', 1.75);
 % Absolute count only. A fractional bar scales with the PARENT, so the better
 % sampled a unit is the harder it becomes to find a small contaminant inside
 % it -- backwards. Measured here it blocked three units whose waveform
@@ -170,7 +200,7 @@ childFr  = opt.minChildFrac;
 minOvlp  = pick(opt.minTimeOverlap, cfgRaw, 'bimodalMinTimeOverlap', 0.5);
 maxShift = pick(opt.maxMedianShift, cfgRaw, 'bimodalMaxMedianShift', 0.3);
 numBins  = pick([],                 cfgRaw, 'bimodalNumBins',        64);
-sepMinDist = pick(opt.minSepDistance, cfgRaw, 'bimodalMinSepDistance', 1.75);
+sepMinDist = pick(opt.minSepDistance, cfgRaw, 'posthocMinSepDistance', 1.6);
 ccgMin   = pick(opt.ccgIndepMin,    cfgRaw, 'bimodalCcgIndepMin',    0.5);
 ccgNeed  = pick(opt.ccgMinExpected, cfgRaw, 'bimodalCcgMinExpected',  20);
 assignAgr = pick(opt.assignMinAgree, cfgRaw, 'bimodalAssignMinAgree', 0.75);
@@ -196,6 +226,20 @@ if isfield(cfgRaw, 'num_samples') && ~isempty(cfgRaw.num_samples)
     recLen = double(cfgRaw.num_samples);
 end
 
+% Child floor as a rate, not a count. A fixed 200 was calibrated on a
+% 118-min recording (0.028 Hz); on a 32-min one it demands 0.1 Hz and
+% blocked three units whose second population was 130-177 spikes with a
+% clean amplitude gap. A rate keeps the bar the same across recording
+% lengths, with an absolute floor below which a child is not a unit.
+childRate  = pick(opt.minChildRateHz, cfgRaw, 'posthocMinRateHz',      0.03);
+childFloor = pick(opt.minChildFloor,  cfgRaw, 'posthocMinSpikesFloor', 50);
+if isempty(opt.minChildSpikes)
+    opt.minChildSpikes = max(childFloor, ceil(childRate * recLen / fs));
+end
+if isempty(opt.minSpikes)
+    opt.minSpikes = 2 * opt.minChildSpikes;   % fewer than two children cannot split
+end
+
 labels    = unif.label(:);
 newLbl    = lbl_all;
 nextLabel = max([labels(:); lbl_all(:)]);
@@ -214,6 +258,7 @@ for u = 1:numel(labels)
     [thrA, sepA, ~, etaA] = kiaSort_otsu_split1d(a, numBins);
     rec = struct('label', lab, 'n', numel(rows), 'eta', etaA, ...
                  'timeOverlap', NaN, 'medShift', NaN, 'waveAgree', NaN, ...
+                 'shapeAcc', NaN, 'shapeNull', NaN, ...
                  'sep', sepA, 'isiChild', [NaN NaN], 'presence', [NaN NaN], ...
                  'ccgRatio', NaN, 'ccgExpected', NaN, 'assignAgree', NaN, ...
                  'presOverlap', NaN, 'presRateKeep', NaN, ...
@@ -249,8 +294,11 @@ for u = 1:numel(labels)
         splitLog = appendRec(splitLog, rec); continue;
     end
 
-    % Confirm on the waveforms: cluster them into two and require that the
-    % partition matches the amplitude cut.
+    % Confirm on waveform shape, with amplitude scaled out: does the
+    % amplitude cut correspond to a shape difference a classifier can
+    % recover? Scored against the same classifier on the low side alone,
+    % cut at its own median, which carries the one confound this has
+    % (smaller spikes are noisier after scaling).
     try
         [W, wRows] = localUnitWaveforms(rows, wf, raw, spk_all, chn_all, half, opt.fitCap);
     catch
@@ -259,11 +307,19 @@ for u = 1:numel(labels)
     if isempty(W) || size(W,1) < 2*20
         splitLog = appendRec(splitLog, rec); continue;
     end
-    cl = localTwoCluster(W, lowSide(wRows));
-    if isempty(cl), splitLog = appendRec(splitLog, rec); continue; end
-    agree = mean(cl(:) == lowSide(wRows));
-    rec.waveAgree = max(agree, 1-agree);
-    if rec.waveAgree < opt.waveSim
+    [rec.shapeAcc, rec.shapeNull] = localShapeSeparability(W, lowSide(wRows), a(wRows));
+    shapeOK = isfinite(rec.shapeAcc) && rec.shapeAcc >= opt.waveSim && ...
+              (~isfinite(rec.shapeNull) || rec.shapeAcc - rec.shapeNull >= opt.waveGain);
+    clusterOK = false;
+    if etaA >= sepThrStrong || sepA >= sepMinDistStrong
+        cl = localTwoCluster(W, lowSide(wRows));
+        if ~isempty(cl)
+            agree = mean(cl(:) == lowSide(wRows));
+            rec.waveAgree = max(agree, 1-agree);
+            clusterOK = rec.waveAgree >= opt.clusterSim;
+        end
+    end
+    if ~shapeOK && ~clusterOK
         splitLog = appendRec(splitLog, rec); continue;
     end
 
@@ -424,8 +480,14 @@ splitReport.newLabels = reshape(lut([addRows.label]), 1, []);
 
 % The labels and the unit table are two files. Back them up first and roll
 % back if the second write fails, so the pair is never left disagreeing.
-bk = kiaSort_backup_results(outputPath, 'presplit', ...
-    {unifiedLabelsH5, sortedSamplesPath});
+% The 'presplit' record is written once, by the first pass; a later pass
+% backs up under 'split' (its own rollback copy), so the state before any
+% split is not overwritten by the state after pass 1.
+if exist(fullfile(outputPath, 'Backup', 'presplit', 'unifiedLabels.h5'), 'file')
+    bk = kiaSort_backup_results(outputPath, 'split', {unifiedLabelsH5, sortedSamplesPath});
+else
+    bk = kiaSort_backup_results(outputPath, 'presplit', {unifiedLabelsH5, sortedSamplesPath});
+end
 if ~bk.ok
     if opt.verbose, fprintf('Post-hoc split: backup failed, not writing.\n'); end
     return;
@@ -674,6 +736,57 @@ for i = 1:numel(brk)-1
     runs(i,1) = idx(brk(i));
     runs(i,2) = brk(i+1) - brk(i);
 end
+end
+
+
+function [acc, accNull] = localShapeSeparability(W, isLow, aW)
+% Cross-validated balanced accuracy of a linear classifier on the leading
+% PCs of peak-scaled waveforms, recovering the amplitude side; and the same
+% for the low side cut at its own median amplitude (the within-cell null).
+acc = NaN; accNull = NaN;
+isLow = logical(isLow(:));
+if ~any(isLow) || ~any(~isLow), return; end
+pk = max(abs(W), [], 2);
+pk(~(pk > 0)) = 1;
+Xn = W ./ pk;
+Xn(~isfinite(Xn)) = 0;
+nComp = min(6, min(size(Xn)) - 1);
+if nComp < 1, return; end
+try
+    [~, F] = pca(Xn - mean(Xn, 1), 'Algorithm', 'svd', 'NumComponents', nComp);
+catch
+    return;
+end
+acc = localCvBalancedAcc(F, ~isLow);
+lo  = find(isLow);
+if numel(lo) >= 40
+    aL = aW(lo);
+    accNull = localCvBalancedAcc(F(lo,:), aL(:) > median(aL));
+end
+end
+
+
+function acc = localCvBalancedAcc(F, y)
+% 5-fold, fixed draw, uniform prior; NaN when a class is too small to test.
+acc = NaN;
+y = logical(y(:));
+if sum(y) < 10 || sum(~y) < 10, return; end
+rs  = RandStream('threefry', 'Seed', 20240911);
+k   = 5;
+fold = mod(randperm(rs, numel(y)) - 1, k);
+accs = nan(k, 1);
+for f = 1:k
+    te = fold == f-1; tr = ~te;
+    if sum(y(tr)) < 2 || sum(~y(tr)) < 2 || ~any(y(te)) || ~any(~y(te)), continue; end
+    try
+        mdl = fitcdiscr(F(tr,:), y(tr), 'Prior', 'uniform', 'DiscrimType', 'pseudoLinear');
+        yp  = logical(predict(mdl, F(te,:)));
+    catch
+        continue;
+    end
+    accs(f) = (mean(yp(y(te))) + mean(~yp(~y(te)))) / 2;
+end
+if any(isfinite(accs)), acc = mean(accs, 'omitnan'); end
 end
 
 

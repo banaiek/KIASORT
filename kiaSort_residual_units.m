@@ -34,7 +34,10 @@ function report = kiaSort_residual_units(outputPath, varargin)
 %   Name/Value:
 %       'zDefer'        (5)     fit-outlier cut, in robust sd of the unit's
 %                               own match distances (see below)
-%       'minPoolSpikes' (200)   pool smaller than this is never promoted
+%       'minPoolSpikes' ([])    pool smaller than this is never promoted;
+%                               default max(minPoolFloor, minPoolRateHz x
+%                               duration) from cfg posthocMinSpikesFloor /
+%                               posthocMinRateHz (50, 0.03 Hz)
 %       'rateKeepMin'   (0.6)   host rate inside the pool's window over
 %                               outside; below this the host was depleted,
 %                               i.e. drift, and the pool is left alone.
@@ -91,7 +94,9 @@ function report = kiaSort_residual_units(outputPath, varargin)
 p = inputParser;
 p.addRequired('outputPath', @(x) ischar(x) || isstring(x));
 p.addParameter('zDefer',          5, @(x) isscalar(x) && isnumeric(x));
-p.addParameter('minPoolSpikes', 200, @(x) isscalar(x) && isnumeric(x));
+p.addParameter('minPoolSpikes',  [], @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
+p.addParameter('minPoolRateHz',  [], @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
+p.addParameter('minPoolFloor',   [], @(x) isempty(x) || (isscalar(x) && isnumeric(x)));
 p.addParameter('rateKeepMin',   0.6, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('driftCorr',    -0.5, @(x) isscalar(x) && isnumeric(x));
 p.addParameter('driftSlope',   -0.3, @(x) isscalar(x) && isnumeric(x));
@@ -174,6 +179,15 @@ for i = 1:numel(ssData.sortedSamples)
 end
 if isempty(cfgRaw) || ~isfield(cfgRaw, 'samplingFrequency'), return; end
 fs = cfgRaw.samplingFrequency;
+
+% Pool floor as a rate x duration (same rule as kiaSort_posthoc_split), so a
+% short recording does not demand a higher firing rate of a hidden unit.
+if isempty(opt.minPoolSpikes)
+    durSec    = double(max(spk)) / fs;
+    poolRate  = local_cfgGet(cfgRaw, 'posthocMinRateHz',      opt.minPoolRateHz, 0.03);
+    poolFloor = local_cfgGet(cfgRaw, 'posthocMinSpikesFloor', opt.minPoolFloor,  50);
+    opt.minPoolSpikes = max(poolFloor, ceil(poolRate * durSec));
+end
 
 wfSrc = struct('ok', false);
 try
@@ -554,4 +568,11 @@ end
 
 function lg = local_append(lg, rec)
 if isempty(lg), lg = rec; else, lg(end+1) = rec; end
+end
+
+function v = local_cfgGet(cfg, name, override, default)
+% Explicit name/value wins, then the stored cfg, then the default.
+if ~isempty(override), v = override; return; end
+if isstruct(cfg) && isfield(cfg, name) && ~isempty(cfg.(name)), v = cfg.(name); return; end
+v = default;
 end

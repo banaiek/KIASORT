@@ -75,11 +75,16 @@ flat_umapWaveforms = reshape(umapWaveforms, N2, C2*T2);
 
 
 flattend_waveform = reshape(waveform, N, C*T);
-hamWin = hamming(size(flattend_waveform,2)).^2;
-hamWin = reshape(hamWin,C,T);
-hamWin = hamWin(find(informative_Chans),:);
-hamWin = reshape(hamWin, 1, C2*T2);
-flat_umapWaveforms = flat_umapWaveforms.*hamWin;
+% Squared Hamming over the clustering window. With a single channel this
+% leaves weight below 0.25 beyond ~8 samples from centre, so UMAP sees the
+% trough and little of the repolarisation; switchable to test that.
+if cfgGet(cfg, 'useHammingTaper', true)
+    hamWin = hamming(size(flattend_waveform,2)).^2;
+    hamWin = reshape(hamWin,C,T);
+    hamWin = hamWin(find(informative_Chans),:);
+    hamWin = reshape(hamWin, 1, C2*T2);
+    flat_umapWaveforms = flat_umapWaveforms.*hamWin;
+end
 
 if isfield(data.side_waveforms, 'waveform')
     if size(data.side_waveforms.waveform,3)>50
@@ -114,7 +119,7 @@ nPCAcompEff  = max(1, min(nPCAcomp, size(PCA_waveform,2)));
 warning('off', 'stats:pca:ColRankDefX');
 warning('off', 'MATLAB:class:DynPropDuplicatesMethod');
 
-umap_out = pythonUMAP(flat_umapWaveforms,nComp);
+umap_out = pythonUMAP(flat_umapWaveforms,nComp,cfgGet(cfg,'umapSeed',[]));
 [PCA.coeff,PCA.score,PCA.latent,PCA.tsquared,PCA.explained,PCA.mu] = pca(PCA_waveform,'Algorithm','svd','NumComponents',nPCAcompEff);
 warning(warning);
 

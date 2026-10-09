@@ -788,6 +788,22 @@ if isfield(cfg,'postHocProcessing')
             end
             % Split before merging, so the merge pass gets the final set of
             % units and can rejoin anything the split separated too eagerly.
+            % Before the split: an echo unit (detections on the later
+            % deflection of a neighbour's spike) is bimodal junk that the
+            % split pass would otherwise spend its reads on, and its parent
+            % is the unit the split should be looking at.
+            if ~isfield(cfg,'echoUnits') || cfg.echoUnits
+                try
+                    er = kiaSort_echo_units(outputPath, 'verbose', false);
+                    fprintf(pfid, 'Echo units: %d of %d dropped (changed=%d).\n', ...
+                        er.nDropped, er.nTested, er.changed);
+                catch ME
+                    fprintf(pfid, 'Echo units FAILED (continuing): %s\n', ME.message);
+                    warning('kiaSort:echoUnits', 'Echo units skipped: %s', ME.message);
+                end
+            else
+                fprintf(pfid, 'Echo units: disabled.\n');
+            end
             if isfield(cfg,'posthocSplit') && cfg.posthocSplit
                 try
                     % One cut per unit per pass, so a unit holding three
